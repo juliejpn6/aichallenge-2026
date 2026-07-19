@@ -70,6 +70,8 @@ zenoh:
 dev: SIM_MODE := dev
 dev: simulator autoware-simulator
 	@echo "Start dev simulation (AWSIM + Autoware)"
+	LOG_DIR=$(LOG_DIR) ROS_DOMAIN_ID=1 BAG_TAG=dev docker compose up -d bag-recorder
+	@echo "Recording ego rosbag (ROS_DOMAIN_ID=1) -> aichallenge/workspace/bag/run_dev_*"
 	@echo "To stop: make down  (docker compose down --remove-orphans)"
 
 dev2: SIM_MODE := dev2
