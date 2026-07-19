@@ -94,6 +94,10 @@ services:
     <<: *autoware-base
     command: ["bash", "-lc", "cd ${CMD_WORKDIR:-/aichallenge} && exec bash -lc \"${CMD:-}\""]
 
+  bag-recorder:
+    <<: *autoware-base
+    command: ["bash", "-lc", "exec /aichallenge/utils/record_dev_bag.bash ${BAG_TAG:-dev} > \"${LOG_DIR:-/output}/rosbag.log\" 2>&1"]
+
   autoware-simulator-evaluation:
     <<: *autoware-eval-base
     image: "aichallenge-2025-eval"
