@@ -11,7 +11,7 @@ cleanup() {
     fi
     if kill -0 "${PID}" 2>/dev/null; then
         echo "Rosbag recording cleanup... (PID/PGID=${PID})"
-        kill -TERM -- "-${PID}" 2>/dev/null || kill -TERM "${PID}" 2>/dev/null || true
+        kill -INT -- "-${PID}" 2>/dev/null || kill -INT "${PID}" 2>/dev/null || true
         wait "${PID}" 2>/dev/null || true
     fi
 }
