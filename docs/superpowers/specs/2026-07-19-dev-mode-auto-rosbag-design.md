@@ -173,3 +173,11 @@ LOG_DIR="${log_dir}" \
   生成されていることを確認。
   `./run_parallel_submissions.bash down` 実行後、同様に `metadata.yaml`
   と `output/<run_id>/d1/rosbag.log` のクリーンな終了ログを確認。
+  注意: `bag-recorder` は常に `autoware-base`(`aichallenge-2025-dev`
+  イメージ)を使うため、この経路単独で使う場合でも事前に
+  `aichallenge-2025-dev` イメージがビルド済みである必要がある
+  (`make autoware-build` 等)。
+- 自動テストはこの機能の根幹(SIGINTが実際に`ros2 bag record`まで届き、
+  mcapが正常にfinalizeされること)をサンドボックス制約により検証できない
+  (Task 1参照)。したがって上記の手動統合テストは省略可能なオプションでは
+  なく、本機能をマージ・運用する前に必ず一度は実行して結果を確認すること。
