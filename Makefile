@@ -79,6 +79,8 @@ dev2 dev3 dev4: simulator
 	@N=$(@:dev%=%); \
 	echo "Start $$N-vehicle dev (autoware on ROS_DOMAIN_ID 1..$$N via docker compose -p)"; \
 	for p in $$(seq 1 $$N); do LOG_DIR=$(LOG_DIR) ROS_DOMAIN_ID=$$p docker compose -p $$p up -d autoware; done; \
+	LOG_DIR=$(LOG_DIR) ROS_DOMAIN_ID=1 BAG_TAG=$@ docker compose -p 1 up -d bag-recorder; \
+	echo "Recording ego rosbag (ROS_DOMAIN_ID=1) -> aichallenge/workspace/bag/run_$@_*"; \
 	echo "To Stop: make down"
 
 gate1: SIM_MODE := gate1
