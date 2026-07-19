@@ -9,6 +9,13 @@
 2. `run_parallel_submissions.bash` — 提出tar.gz(最大4件)を評価用に
    並行実行するモード
 
+これに加えて、単一車両のローカル開発モード `make dev` がある。`dev`は
+`autoware-simulator`(`docker compose up -d autoware`、`-p`なし)を使い、
+`ROS_DOMAIN_ID`を明示指定しないため `autoware-base` アンカーの既定値
+`ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1}` によりego(domain 1)として動く。
+つまり`dev2`/`dev3`/`dev4`と全く同じ意味でのegoが単独で走るモードであり、
+同じ`bag-recorder`サービスをそのまま流用できる。
+
 現状、走行データのrosbag収集はどちらの経路でも `docker exec` で
 コンテナに入り `aichallenge/workspace/src/aichallenge_tools/record_run.sh`
 を手動実行する運用になっている。
@@ -79,6 +86,27 @@ dev2 dev3 dev4: simulator
 がそのまま project 1 の `bag-recorder` コンテナにも SIGTERM
 (`stop_grace_period: 10s` 猶予)→SIGKILL を送るため、**Makefileの
 `down` ターゲット自体は変更不要**。
+
+### Makefile: `dev` レシピ拡張
+
+単一車両モード。`dev`は`autoware-simulator`(`-p`なし、ROS_DOMAIN_ID省略
+= 既定値1)を使うため、`dev2/3/4`と同じくegoがdomain 1で動く。同じ
+`bag-recorder`を`-p`なし・`--force-recreate`なしで起動するだけでよい。
+
+```
+dev: SIM_MODE := dev
+dev: simulator autoware-simulator
+	@echo "Start dev simulation (AWSIM + Autoware)"
+	LOG_DIR=$(LOG_DIR) ROS_DOMAIN_ID=1 BAG_TAG=dev docker compose up -d bag-recorder
+	@echo "Recording ego rosbag (ROS_DOMAIN_ID=1) -> aichallenge/workspace/bag/run_dev_*"
+	@echo "To stop: make down  (docker compose down --remove-orphans)"
+```
+
+`make down`の`docker compose down --remove-orphans`(project指定なし)が
+そのままこの`bag-recorder`もグレースフルに停止するため、`down`側の変更は
+不要。bagディレクトリ名は`run_dev_<timestamp>/`(`BAG_TAG=dev`)、
+プロセスログは`dev2/3/4`と同じくトップレベルの
+`output/<timestamp>/rosbag.log`。
 
 ### run_parallel_submissions.bash への統合
 
@@ -153,12 +181,17 @@ LOG_DIR="${log_dir}" \
 
 1. 新規: `aichallenge/utils/record_dev_bag.bash`
 2. 変更: `docker-compose.yml` (`bag-recorder` サービス追加)
-3. 変更: `Makefile` (`dev2 dev3 dev4` レシピ拡張)
+3. 変更: `Makefile` (`dev2 dev3 dev4` レシピ拡張、および `dev` レシピ拡張)
 4. 変更: `run_parallel_submissions.bash` (`autoware-d1..dN` 起動後に
    `bag-recorder` 起動を1呼び出し追加)
 
 ## テスト方針
 
+- `make dev` 実行後、`docker compose ps` で `bag-recorder` コンテナが
+  起動していることを確認。`aichallenge/workspace/bag/run_dev_*/` に
+  mcap ファイルが生成されていることを確認。`make down` 実行後、同様に
+  `metadata.yaml` と `output/<timestamp>/rosbag.log` のクリーンな
+  終了ログを確認。
 - `make dev3` 実行後、`docker compose -p 1 ps` で `bag-recorder`
   コンテナが起動していることを確認。
   `aichallenge/workspace/bag/run_dev3_*/` に mcap ファイルが
