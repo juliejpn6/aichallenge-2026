@@ -19,10 +19,13 @@ class V2XVehicleTracker:
     """Tracks the latest two samples per ``vehicle_id`` and exposes
     constant-velocity predictions over a caller-provided time grid."""
 
-    def __init__(self, v_max_safety: float, position_jump_threshold: float, warn_callback=None):
+    def __init__(self, v_max_safety: float, position_jump_threshold: float,
+                 warn_callback=None, speed_window: int = 6):
         self._v_max_safety = float(v_max_safety)
         self._jump_thresh = float(position_jump_threshold)
         self._warn = warn_callback if warn_callback is not None else (lambda _msg: None)
+        # 速度平滑窓: 2サンプル差分は 27km/h級のスパイクを出す(v2x ~13Hz)。窓端点差で平滑化。
+        self._speed_window = max(2, int(speed_window))
         self._samples: Dict[str, Deque[Tuple[float, float, float]]] = {}
         self._velocities: Dict[str, Tuple[float, float]] = {}
         self._active: List[str] = []
@@ -34,7 +37,7 @@ class V2XVehicleTracker:
             t = _stamp_to_seconds(v.header.stamp)
             x = float(v.position.x)
             y = float(v.position.y)
-            buf = self._samples.setdefault(vid, deque(maxlen=2))
+            buf = self._samples.setdefault(vid, deque(maxlen=self._speed_window))
 
             # Detect a position jump against the previous sample (if any).
             jumped = False
@@ -52,8 +55,9 @@ class V2XVehicleTracker:
             if jumped or len(buf) < 2:
                 self._velocities[vid] = (0.0, 0.0)
             else:
+                # 窓の端点(最古〜最新)で差分 → スパイク耐性のある平滑速度
                 t0, x0, y0 = buf[0]
-                t1, x1, y1 = buf[1]
+                t1, x1, y1 = buf[-1]
                 dt = t1 - t0
                 if dt > 0.0:
                     vx = (x1 - x0) / dt
@@ -72,6 +76,11 @@ class V2XVehicleTracker:
 
     def velocity(self, vehicle_id: str) -> Tuple[float, float]:
         return self._velocities.get(vehicle_id, (0.0, 0.0))
+
+    def is_settled(self, vehicle_id: str) -> bool:
+        """速度推定が落ち着いているか(窓が満杯=平滑が効いている)。速度マップの採否に使う。"""
+        buf = self._samples.get(vehicle_id)
+        return buf is not None and len(buf) >= self._speed_window
 
     def predict_positions(
         self, vehicle_id: str, t_samples
@@ -105,5 +114,51 @@ def predictions_to_obstacles(predictions, vehicle_radius: float, obstacle_cls=No
     out = []
     for _vid, points in predictions.items():
         for x, y in points:
+            out.append(obstacle_cls(cx=x, cy=y, radius=vehicle_radius))
+    return out
+
+
+def predictions_to_obstacles_capsule(predictions, vehicle_radius: float,
+                                      headings, half_length: float,
+                                      obstacle_cls=None):
+    """``predictions_to_obstacles`` の全長考慮版(2026-07-20、131-6節②
+    「寸法モデルの一元化」対処)。
+
+    背景: 相手車1台につき円1個(半径vehicle_radius、実質半幅ベース)を
+    等速外挿した将来位置ごとにスタンプする方式では、(a) 停止/低速車
+    (vopp≈0)は将来サンプルが現在位置とほぼ重なり全長方向の広がりが
+    一切表現されない、(b) 予測は未来方向のみで、egoが追い越し中に
+    最接近する「相手の後端」側は速度に関わらず一度も表現されない、
+    という2つの盲点があった(128節footprint_riskが実測で確認した
+    「space=3.12mなのにfwd_dlat=0.198m」という矛盾の一因)。
+
+    現在位置(t=0、points[0])のみ、進行方向(headings[vid]、呼び出し元が
+    速度ベクトルまたは走行不能時は参照経路接線からフォールバック算出)に
+    沿って前後 ``half_length - vehicle_radius`` だけオフセットした2個の円へ
+    分割する。half_lengthは既存along_min_length/2(両車半長合計の片側分)を
+    再利用し、新規パラメータは導入しない。
+
+    将来サンプル(t>0)は従来通り1個のまま変更しない
+    ([[mpc-cost-doubles-with-obstacles]]、過去に障害物点数を2倍化した際に
+    MPC発散・22Hzまでの制御レート低下を実測した経緯があるため、点数増加を
+    近傍車1台あたり+1個(t=0のみ1→2個)に抑える設計とした)。
+    """
+    if obstacle_cls is None:
+        from multi_purpose_mpc_ros.core.map import Obstacle as obstacle_cls
+    offset = max(0.0, half_length - vehicle_radius)
+    out = []
+    for vid, points in predictions.items():
+        if not points:
+            continue
+        x0, y0 = points[0]
+        if offset > 0.0:
+            heading = headings.get(vid, 0.0)
+            dx = offset * math.cos(heading)
+            dy = offset * math.sin(heading)
+            out.append(obstacle_cls(cx=x0 + dx, cy=y0 + dy, radius=vehicle_radius))
+            out.append(obstacle_cls(cx=x0 - dx, cy=y0 - dy, radius=vehicle_radius))
+        else:
+            out.append(obstacle_cls(cx=x0, cy=y0, radius=vehicle_radius))
+        for x, y in points[1:]:
             out.append(obstacle_cls(cx=x, cy=y, radius=vehicle_radius))
     return out

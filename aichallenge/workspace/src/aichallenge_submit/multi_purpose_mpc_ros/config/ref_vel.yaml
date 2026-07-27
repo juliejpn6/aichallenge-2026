@@ -1,31 +1,35 @@
+# 区間別の参照速度[km/h]。wp_id をキーに、現在wpが属する区間の速度を返す(純正機構)。
+# 実速度 = min(この区間値, mpc.v_max, 曲率制限 sqrt(ay_max/kappa))。
+# 高速化実験(2026-06-30): 直線 30→35、コーナー小幅UP(s4/s6 22→25, s8 25→28)。v_max=35 併用。
+# 破綻箇所の切り分け用。元値: 直線30, s4=22, s6=22, s8=25。
 ref_vel_configulator:
   s1:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 1
   s1_1:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 30
   s2:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 55
   s3:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 100
   s4:
-    ref_vel: 22.0
+    ref_vel: 25.0
     wp_id: 155
   s5:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 190
   s6:
-    ref_vel: 22.0
+    ref_vel: 25.0
     wp_id: 265
   s7:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 290
   s8:
-    ref_vel: 25.0
+    ref_vel: 28.0
     wp_id: 320
   s9:
-    ref_vel: 30.0
+    ref_vel: 35.0
     wp_id: 335

@@ -210,7 +210,18 @@ class ReferencePath:
         self.path_constraints: Optional[List[np.ndarray]] = None
         self.border_cells = BorderCells()
 
+        # [案X corridor debug] 直近 update_path_constraints での free-segment 検出数
+        self.dbg_nseg0 = 0   # 空き区間が0本(=通れる隙間なし)のwaypoint数
+        self.dbg_nseg1 = 0   # 1本のwaypoint数
+        self.dbg_nseg2 = 0   # 2本以上のwaypoint数
+
         self.COUNT = 0
+
+        # 2026-07-26追加(190-3節): コリドー境界ラチェット(下記add_constraint内)の
+        #   拡大方向レートリミット[m/周期]。既定はinf(=無制限、従来と完全に同一の挙動)。
+        #   mpc_controller.py側がconfig(corridor_widen_rate_mps/control_rate)から
+        #   実値を設定する。縮小方向は常に無制限のまま(安全側は変更しない)。
+        self.corridor_widen_step_m = float('inf')
 
     def set_path_constraints(self, upper_bounds: List[float], lower_bounds: List[float], n_rows, n_cols) -> None:
         self.path_constraints = [
@@ -665,8 +676,12 @@ class ReferencePath:
         :return: segment candidates as list of tuples (ub_cell, lb_cell)
         """
 
-        # Candidate segments
+        # Candidate segments (min_width以上のもののみ)
         free_segments = []
+        # 2026-07-18追加(101節続報、根本原因対処): min_width未満も含む、
+        # ラスタ上に実在した全区間。free_segmentsが空だった場合のみ、
+        # ここから最幅の区間を拾うフォールバック用(下記参照)。
+        all_segments = []
 
         # Get waypoint's border cells in map coordinates
         ub_p = self.map.w2m(wp.static_border_cells[0][0],
@@ -704,6 +719,8 @@ class ReferencePath:
                 # Transform upper and lower bound cells to world coordinates
                 ub_o = self.map.m2w(ub_o[0], ub_o[1])
                 lb_o = self.map.m2w(lb_o[0], lb_o[1])
+                # 2026-07-18追加(101節続報): 幅に関わらずまず全区間として記録する。
+                all_segments.append((ub_o, lb_o))
                 # If segment larger than threshold, add to candidates
                 if ((ub_o[0]-lb_o[0])**2 + (ub_o[1]-lb_o[1])**2) > min_width**2:
                     free_segments.append((ub_o, lb_o))
@@ -713,6 +730,25 @@ class ReferencePath:
             elif cell_value == 0 and not free_cells:
                 ub_o = (x, y)
                 lb_o = (x, y)
+
+        # 2026-07-18追加(101節続報、根本原因対処、ユーザー承認済み設計):
+        # min_width以上の区間が1本も無い場合でも、all_segmentsに何らかの
+        # 区間が実在すれば、その中で最も幅の広いものを返す。呼び出し元
+        # (update_path_constraints)はfree_segments=[]を「候補ゼロ」と判定し、
+        # waypoint自身の座標(幅ゼロの一点)へ境界を潰すフォールバックを持つが、
+        # これは「壁+相手車に挟まれ生の空きがカート幅よりわずかに狭い」という
+        # 正当な状況でも、幅ゼロという最も厳しい制約へ一気に跳ぶ荒すぎる応答
+        # だった(0718-01実測、131回連続発生、101節参照)。min_width未満でも
+        # 実在する最幅の区間を返す方が、幅ゼロの一点より緩やかで有意な制約になる。
+        # 安全マージン込みの最終判定は既存のadd_constraint側(segment_length_sm
+        # <min_segment_lengthなら既存のwp.ub/wp.lb静的境界へフォールバックする
+        # 仕組みが既にある)にそのまま委ねる(新規のフォールバック機構は追加しない)。
+        # ラスタ上に区間が1本も無い(all_segments自体が空、=完全に塞がれている)
+        # 場合は、従来通り呼び出し元の幅ゼロフォールバックへ委ねる(変更なし)。
+        if not free_segments and all_segments:
+            free_segments = [max(
+                all_segments,
+                key=lambda seg: (seg[0][0]-seg[1][0])**2 + (seg[0][1]-seg[1][1])**2)]
 
         return free_segments
 
@@ -856,10 +892,14 @@ class ReferencePath:
             ub_sm = ub - safety_margin
             lb_sm = lb + safety_margin
 
+            # 2026-07-26追加(190-3節): 縮小方向(wp.ub_sm/lb_smより新値が狭い)は従来通り
+            #   即座に反映する(安全側、無変更)。拡大方向(新値の方が広い)のみ
+            #   corridor_widen_step_mで1周期あたりの回復量を制限し、rebuild_deadband
+            #   解除の瞬間に蓄積された狭まり分が一気に解消される不連続ジャンプを防ぐ。
             if wp.ub_sm < ub_sm:
-              ub_sm = wp.ub_sm
+              ub_sm = min(ub_sm, wp.ub_sm + self.corridor_widen_step_m)
             if wp.lb_sm > lb_sm:
-              lb_sm = wp.lb_sm
+              lb_sm = max(lb_sm, wp.lb_sm - self.corridor_widen_step_m)
 
             # Check feasibility of the path after subtracting safety margin
             if ub_sm < lb_sm:
@@ -918,6 +958,11 @@ class ReferencePath:
             free_segments = self._compute_free_segments(wp, min_width)
             free_segments_hor.append(free_segments)
             self.free_segs.extend(free_segments)
+
+        # [案X corridor debug] horizon内で free-segment が何本見つかったかの内訳
+        self.dbg_nseg0 = sum(1 for fs in free_segments_hor if len(fs) == 0)
+        self.dbg_nseg1 = sum(1 for fs in free_segments_hor if len(fs) == 1)
+        self.dbg_nseg2 = sum(1 for fs in free_segments_hor if len(fs) >= 2)
 
         # Iterate over horizon
         n = 0

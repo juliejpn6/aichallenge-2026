@@ -21,8 +21,12 @@ trap cleanup_rosbag EXIT SIGINT SIGTERM
 source "/aichallenge/workspace/install/setup.bash"
 
 # Topics with data (excluding 0-message topics from original bag)
+# 2026-07-26追加: アクチュエータ遅延特性(純粋遅延か一次遅れか)の実測診断に
+#   /vehicle/status/steering_status(実操舵角)が必須のため追加。
+#   /control/command/control_cmd(指令値)との時系列比較で遅延波形の形を特定する。
 TOPICS=(
     "/control/command/control_cmd"
+    "/vehicle/status/steering_status"
     "/clock"
     "/localization/acceleration"
     "/localization/kinematic_state"

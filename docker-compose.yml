@@ -50,6 +50,24 @@ x-autoware-eval-base: &autoware-eval-base
     - /dev/dri:/dev/dri
     - ${XAUTHORITY}:${XAUTHORITY}:rw
 
+# 2026-07-24: 提出(予選/決勝)環境の実測リソース制約(Autowareコンテナに約3 vCPU・約12GBメモリ、
+#   当時の推定値)をローカルでも再現するための共通リソース制限として cpus=3/mem=12g を導入した。
+#   Autowareコンテナ(制御本体)にのみ適用し、simulator(AWSIM)やビルドは制限しない(提出環境でも
+#   Autoware以外は制限されていないため)。
+# 2026-07-25単独実験(179節続報): CPU競合ノイズを除去する目的で一時的にcpus=8/mem=24gへ緩めた。
+# 2026-07-25再校正(180節、実測データに基づく本校正): 実際の予選ログ(0725-01)を計装(mpc_setup/
+#   solve/linearize/corridor分離、PERF-RUSAGE)付きで実測した結果、超過率は平均1.5%(0-7.8%)・
+#   work avg平均10.2msと、ローカルdev3(cpus=3/mem=12g)で観測していた超過率29.5-52.75%・
+#   work avg21.7-38.6msを大幅に下回っていた。つまり2026-07-24時点の「約3vCPU」という推定値は
+#   過大に厳しく、実環境の負荷を大幅に過大評価していたと判明した。ホスト実機(16コア/30GB、
+#   179節でdocker stats実測済み)に対しdev3(3台自己対戦)が同時起動することを踏まえ、
+#   cpus=4/mem=8g(3台合計12コア/24GB、host比75-80%、simulator/OS分の余裕を残す)へ再校正する。
+#   これは実測データに基づく第一次校正であり、次回dev3ログの超過率が実環境の1.5%程度に
+#   近づくか確認し、必要なら追加調整すること。
+x-autoware-resource-limits: &autoware-resource-limits
+  cpus: "4"
+  mem_limit: "8g"
+
 x-racing_kart_interface-base: &racing_kart_interface-base
   image: "ghcr.io/tier4/racing_kart_interface:latest-experiment"
   privileged: true
@@ -78,7 +96,7 @@ x-racing_kart_interface-base: &racing_kart_interface-base
 services:
   # Autoware service
   autoware:
-    <<: *autoware-base
+    <<: [*autoware-base, *autoware-resource-limits]
     command: ["bash", "-lc", "exec /aichallenge/run_autoware.bash ${RUN_MODE:-awsim} ${ROS_DOMAIN_ID:-1} ${LOG_DIR:-}"]
 
   # Autoware service
@@ -102,6 +120,27 @@ services:
     <<: *autoware-eval-base
     image: "aichallenge-2025-eval"
     command: ["bash", "-lc", "exec /aichallenge/run_evaluation.bash"]
+
+### Autoware Service For Parallel Execution ###
+  autoware-d1:
+    <<: [*autoware-eval-base, *autoware-resource-limits]
+    image: "autoware-d1"
+    command: ["bash", "-lc", "exec env ROS_DOMAIN_ID=1 ros2 launch aichallenge_system_launch aichallenge_system.launch.xml simulation:=true use_sim_time:=true run_rviz:=true domain_id:=1 > \"${LOG_DIR:-/output}/autoware.log\" 2>&1"]
+
+  autoware-d2:
+    <<: [*autoware-eval-base, *autoware-resource-limits]
+    image: "autoware-d2"
+    command: ["bash", "-lc", "exec env ROS_DOMAIN_ID=2 ros2 launch aichallenge_system_launch aichallenge_system.launch.xml simulation:=true use_sim_time:=true run_rviz:=true domain_id:=2 > \"${LOG_DIR:-/output}/autoware.log\" 2>&1"]
+
+  autoware-d3:
+    <<: [*autoware-eval-base, *autoware-resource-limits]
+    image: "autoware-d3"
+    command: ["bash", "-lc", "exec env ROS_DOMAIN_ID=3 ros2 launch aichallenge_system_launch aichallenge_system.launch.xml simulation:=true use_sim_time:=true run_rviz:=true domain_id:=3 > \"${LOG_DIR:-/output}/autoware.log\" 2>&1"]
+
+  autoware-d4:
+    <<: [*autoware-eval-base, *autoware-resource-limits]
+    image: "autoware-d4"
+    command: ["bash", "-lc", "exec env ROS_DOMAIN_ID=4 ros2 launch aichallenge_system_launch aichallenge_system.launch.xml simulation:=true use_sim_time:=true run_rviz:=true domain_id:=4 > \"${LOG_DIR:-/output}/autoware.log\" 2>&1"]
 
 #### vehicle specific services can be added here ####
   # Zenoh service

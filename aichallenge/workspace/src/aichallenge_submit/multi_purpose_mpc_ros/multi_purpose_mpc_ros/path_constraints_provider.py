@@ -183,8 +183,8 @@ class PathConstraintsProvider(Node):
                 cfg_mpc.control_rate)
 
             state_constraints = {
-                "xmin": np.array([-np.inf, -np.inf, -np.inf]),
-                "xmax": np.array([np.inf, np.inf, np.inf])}
+                "xmin": np.array([-np.inf, -np.inf, -np.inf, -np.inf]),
+                "xmax": np.array([np.inf, np.inf, np.inf, np.inf])}
             input_constraints = {
                 "umin": np.array([0.0, -np.tan(mpc_cfg.delta_max) / car.length]),
                 "umax": np.array([mpc_cfg.v_max, np.tan(mpc_cfg.delta_max) / car.length])}

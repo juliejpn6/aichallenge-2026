@@ -113,6 +113,33 @@ def test_velocity_above_safety_cap_is_zeroed():
     assert tracker.velocity("d2") == (0.0, 0.0)
 
 
+def test_retroactive_0715_01_implausible_vopp_now_clamped_with_config_value():
+    """遡及検証(2026-07-15、v_max_safetyの是正): 0715-01実測ログでは、全カート
+    15km/h(4.17m/s)キャップの本競技において、vopp(相手速度推定)が6〜16m/sという
+    物理的に不可能な値を頻発していた。旧config値(v_max_safety=30.0)ではこの
+    サニティクランプが一度も発動していなかったことを確認したうえで、是正後の値
+    (config.yaml、6.0)で同じ入力を再生するとクランプが正しく発動することを確認する。
+    実測相当: 12m離れた2点間を0.8秒で移動(=15m/s相当)。"""
+    old_tracker = V2XVehicleTracker(v_max_safety=30.0, position_jump_threshold=200.0)
+    old_tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    old_tracker.update(_msg(0.8, [("d2", 12.0, 0.0)]))
+    assert old_tracker.velocity("d2") == pytest.approx((15.0, 0.0))  # 旧値では素通し(バグ実測を再現)
+
+    new_tracker = V2XVehicleTracker(v_max_safety=6.0, position_jump_threshold=200.0)
+    new_tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    new_tracker.update(_msg(0.8, [("d2", 12.0, 0.0)]))
+    assert new_tracker.velocity("d2") == (0.0, 0.0)  # 是正後は正しくゼロへクランプ
+
+
+def test_genuine_top_speed_kart_not_clamped_regression():
+    """回帰: 本競技の最高速度(15km/h=4.1667m/s)相当の正当な速度は、是正後の
+    v_max_safety(6.0)でもクランプされない(誤検知しない余裕を持たせている)。"""
+    tracker = V2XVehicleTracker(v_max_safety=6.0, position_jump_threshold=200.0)
+    tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    tracker.update(_msg(1.0, [("d2", 4.1667, 0.0)]))
+    assert tracker.velocity("d2") == pytest.approx((4.1667, 0.0))
+
+
 def test_two_vehicles_tracked_independently():
     tracker = V2XVehicleTracker(v_max_safety=30.0, position_jump_threshold=20.0)
     tracker.update(_msg(0.0, [("d2", 0.0, 0.0), ("d3", 10.0, 10.0)]))
@@ -172,6 +199,115 @@ def test_predictions_to_obstacles_empty_input():
     from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles
     assert predictions_to_obstacles(
         {}, vehicle_radius=0.5, obstacle_cls=_StubObstacle) == []
+
+
+# --- predictions_to_obstacles_capsule (131-6節②、寸法モデルの一元化, 2026-07-20) ---
+# 背景: 相手車1台=円1個(半径vehicle_radius)を将来位置ごとにスタンプする方式では、
+# 停止/低速車(将来サンプルが現在位置とほぼ重なる)の全長方向が一切表現されず、また
+# 予測は未来方向のみのため「相手の後端」側(egoが追い越し中に最も接近する側)が
+# 速度に関わらず一度も表現されない盲点があった。現在位置(t=0)のみ進行方向へ前後
+# 分割する。
+
+
+def test_capsule_splits_t0_into_two_circles_along_heading():
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    predictions = {"d3": [(0.0, 0.0)]}
+    obstacles = predictions_to_obstacles_capsule(
+        predictions, vehicle_radius=0.8, headings={"d3": 0.0},
+        half_length=1.0, obstacle_cls=_StubObstacle)
+
+    centers = sorted((round(o.cx, 6), round(o.cy, 6), o.radius) for o in obstacles)
+    assert centers == sorted([
+        (0.2, 0.0, 0.8),
+        (-0.2, 0.0, 0.8),
+    ])
+
+
+def test_capsule_offset_uses_official_vehicle_spec_derived_values():
+    """遡及検証: 実際のconfig値(along_min_length/2=1.00, vehicle_radius=0.8)を
+    使った場合、オフセットが0.20mになることを確認する(公式車両仕様: 全長200cm由来)。"""
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    predictions = {"d3": [(10.0, 5.0)]}
+    obstacles = predictions_to_obstacles_capsule(
+        predictions, vehicle_radius=0.8, headings={"d3": 0.0},
+        half_length=1.0, obstacle_cls=_StubObstacle)
+
+    xs = sorted(round(o.cx, 6) for o in obstacles)
+    assert xs == [9.8, 10.2]
+
+
+def test_capsule_future_samples_stay_single_circle_no_cpu_doubling():
+    """[[mpc-cost-doubles-with-obstacles]]対策: t>0(将来予測)は従来通り1個のまま、
+    t=0のみ2個になることを確認する(近傍車1台あたり+1個に抑える設計)。"""
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    predictions = {"d3": [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]}
+    obstacles = predictions_to_obstacles_capsule(
+        predictions, vehicle_radius=0.8, headings={"d3": 0.0},
+        half_length=1.0, obstacle_cls=_StubObstacle)
+
+    assert len(obstacles) == 4  # t=0→2個 + t=1,2→各1個
+    future = sorted((round(o.cx, 6), o.radius) for o in obstacles if o.cx in (1.0, 2.0))
+    assert future == [(1.0, 0.8), (2.0, 0.8)]
+
+
+def test_capsule_offset_clamped_to_zero_when_half_length_not_larger_than_radius():
+    """half_length<=vehicle_radius(円だけで全長を覆えている場合)は分割せず
+    従来通り1個のままにする(オフセット負値による退化を防ぐ)。"""
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    predictions = {"d3": [(0.0, 0.0)]}
+    obstacles = predictions_to_obstacles_capsule(
+        predictions, vehicle_radius=0.8, headings={"d3": 0.0},
+        half_length=0.5, obstacle_cls=_StubObstacle)
+
+    assert len(obstacles) == 1
+    assert (obstacles[0].cx, obstacles[0].cy, obstacles[0].radius) == (0.0, 0.0, 0.8)
+
+
+def test_capsule_missing_heading_defaults_to_zero():
+    """headingsに未登録のvid(異常系)はheading=0.0(+x方向)へfail-openすることを確認する。"""
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    predictions = {"d3": [(0.0, 0.0)]}
+    obstacles = predictions_to_obstacles_capsule(
+        predictions, vehicle_radius=0.8, headings={},
+        half_length=1.0, obstacle_cls=_StubObstacle)
+
+    ys = [round(o.cy, 6) for o in obstacles]
+    assert ys == [0.0, 0.0]
+
+
+def test_capsule_heading_perpendicular_offsets_along_y():
+    import math
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    predictions = {"d3": [(0.0, 0.0)]}
+    obstacles = predictions_to_obstacles_capsule(
+        predictions, vehicle_radius=0.8, headings={"d3": math.pi / 2},
+        half_length=1.0, obstacle_cls=_StubObstacle)
+
+    centers = sorted((round(o.cx, 6), round(o.cy, 6)) for o in obstacles)
+    assert centers == [(0.0, -0.2), (0.0, 0.2)]
+
+
+def test_capsule_empty_points_skipped():
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    obstacles = predictions_to_obstacles_capsule(
+        {"d3": []}, vehicle_radius=0.8, headings={"d3": 0.0},
+        half_length=1.0, obstacle_cls=_StubObstacle)
+    assert obstacles == []
+
+
+def test_capsule_empty_input():
+    from multi_purpose_mpc_ros.v2x_vehicle_tracker import predictions_to_obstacles_capsule
+
+    assert predictions_to_obstacles_capsule(
+        {}, vehicle_radius=0.8, headings={}, half_length=1.0,
+        obstacle_cls=_StubObstacle) == []
 
 
 def test_position_jump_invokes_warn_callback():

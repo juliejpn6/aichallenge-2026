@@ -93,21 +93,30 @@ class SpatialState(ABC):
 
 
 class SimpleSpatialState(SpatialState):
-    def __init__(self, e_y=0.0, e_psi=0.0, t=0.0):
+    def __init__(self, e_y=0.0, e_psi=0.0, t=0.0, delta_actual=0.0):
         """
         Simplified Spatial State Vector containing orthogonal deviation from
         reference path (e_y), difference in orientation (e_psi) and velocity
         :param e_y: orthogonal deviation from center-line | [m]
         :param e_psi: yaw angle relative to path | [rad]
         :param t: time | [s]
+        :param delta_actual: actuator's actual (lagged) steering input state,
+            first-order-lag toward the commanded input | [rad or curvature,
+            same unit as input[1]]. 2026-07-27再実装(201/202節、AXIS06):
+            アクチュエータの実際の物理応答遅れ(tau、環境に依らず一定=130ms、
+            198節で一度撤回・202節続報でtau=55ms差分案も無効と判明の末に再設計)を
+            QPの内部モデルへ明示的に組み込むための第4状態。予選環境特有の追加遅延
+            (55-60ms)はこのtauではなくdebug_extra_actuator_delay_s(196節、別機構)
+            で扱う。
         """
         super(SimpleSpatialState, self).__init__()
 
         self.e_y = e_y
         self.e_psi = e_psi
         self.t = t
+        self.delta_actual = delta_actual
 
-        self.members = ['e_y', 'e_psi', 't']
+        self.members = ['e_y', 'e_psi', 't', 'delta_actual']
 
 
 ####################################
@@ -217,7 +226,12 @@ class SpatialBicycleModel(ABC):
         # prediction horizon
         t = 0.0
 
-        return SimpleSpatialState(e_y, e_psi, t)
+        # delta_actual(実際の遅延応答舵角)は(x,y,psi)から幾何学的に導出できない内部
+        # フィルタ状態のため、位置更新のたびにリセットせず前回値を引き継ぐ(2026-07-27
+        # 再実装)。self.spatial_stateは呼び出し時点でまだ更新前の値を保持している。
+        delta_actual = getattr(self.spatial_state, 'delta_actual', 0.0)
+
+        return SimpleSpatialState(e_y, e_psi, t, delta_actual)
 
     def drive(self, u):
         """
@@ -290,21 +304,37 @@ class SpatialBicycleModel(ABC):
             self.wp_id = prev_wp_id
             self.current_waypoint = self.reference_path.waypoints[prev_wp_id]
 
-    def get_closest_waypoint(self, x, y):
+    def get_closest_waypoint(self, x, y, prev_idx=None, radius_m=None):
         """
         Get the index of the closest waypoint to the given x, y coordinates.
         :param x: x coordinate
         :param y: y coordinate
+        :param prev_idx: previous matched waypoint index (search anchor). None -> full global search.
+        :param radius_m: search window radius in meters around prev_idx. Ignored if prev_idx is None.
         :return: Index of the closest waypoint
+
+        2026-07-14追加(水平展開: mpc_controller.py._closest_wp_and_sと同一パターン)。
+        従来は全waypointからの単純な(x,y)最近傍探索のみで、弧長的な連続性を考慮して
+        いなかった。ヘアピン等、コースが壁一枚を挟んで自分自身に近接する箇所では、
+        自車の生座標が壁の反対側のwaypointへ誤ってマッチし得る(他車のwall誤認識と
+        全く同じ構造)。prev_idx(前回マッチしたwp_id)とradius_mが与えられた場合のみ
+        探索をその近傍に限定する。prev_idx=None(初回起動時、基準点が無い)は従来通り
+        全waypointから探索する(呼び出し側のupdate_statesが判断する)。
         """
-        # Compute distances from the point to all waypoints
-        distances = np.sqrt((np.array([wp.x for wp in self.reference_path.waypoints]) - x)**2 +
-                            (np.array([wp.y for wp in self.reference_path.waypoints]) - y)**2)
+        waypoints = self.reference_path.waypoints
+        n = len(waypoints)
+        if prev_idx is None or radius_m is None:
+            distances = np.sqrt((np.array([wp.x for wp in waypoints]) - x)**2 +
+                                (np.array([wp.y for wp in waypoints]) - y)**2)
+            return int(np.argmin(distances))
 
-        # Get the index of the closest waypoint
-        closest_wp_id = np.argmin(distances)
-
-        return closest_wp_id
+        radius_idx = max(1, int(np.ceil(radius_m / max(self.reference_path.resolution, 1e-3))))
+        idxs = np.arange(prev_idx - radius_idx, prev_idx + radius_idx + 1) % n
+        xs = np.array([waypoints[i].x for i in idxs])
+        ys = np.array([waypoints[i].y for i in idxs])
+        distances = np.sqrt((xs - x)**2 + (ys - y)**2)
+        local = int(np.argmin(distances))
+        return int(idxs[local])
 
     def get_s_at_waypoint(self, wp_id):
         """
@@ -366,7 +396,7 @@ class SpatialBicycleModel(ABC):
 #################
 
 class BicycleModel(SpatialBicycleModel):
-    def __init__(self, reference_path, length, width, Ts):
+    def __init__(self, reference_path, length, width, Ts, actuator_lag_tau_s=0.19):
         """
         Simplified Spatial Bicycle Model. Spatial Reformulation of Kinematic
         Bicycle Model. Uses Simplified Spatial State.
@@ -374,11 +404,25 @@ class BicycleModel(SpatialBicycleModel):
         :param length: length of the car in m
         :param width: with of the car in m
         :param Ts: sampling time of model in s
+        :param actuator_lag_tau_s: delta_actual状態(第4状態)の一次遅れ時定数 | [s]。
+            2026-07-27再実装(201節続報、AXIS06): 差分のみ(tau=55ms)は、MPCのホライズン
+            ステップが表す実時間(delta_s/v_ref、典型的に0.1-0.4s)より常に小さく、
+            alphaが常に1.0へ飽和して旧3状態モデルと数値的に区別できないと判明した
+            (202節)。202節続報: tauをローカル環境の実測フル遅延(130ms)へ変更し、
+            Q/Rをこのモデルに対して再チューニングする方針へ転換した。203節続報:
+            実装バグ(e_psi行がdelta_actual_k+1でなくdelta_actual_kを使っていた、
+            修正済み)の影響で198節のtau=130ms/190ms実験結果が過小評価されていた
+            疑いが生じたため、修正後の実装でtau=190ms(予選環境相当のフル遅延)を
+            探索的に再検証する(0.13から一時変更)。0.0を指定するとdelta_actual_next=
+            delta_cmd(瞬時追従)となり旧3状態モデルと数学的に完全一致する
+            (下位互換の保証、テストで検証)。
         """
 
         # Initialize base class
         super(BicycleModel, self).__init__(reference_path, length=length,
                                            width=width, Ts=Ts)
+
+        self.actuator_lag_tau_s = max(0.0, actuator_lag_tau_s)
 
         # Initialize spatial state
         self.spatial_state = SimpleSpatialState()
@@ -400,13 +444,14 @@ class BicycleModel(SpatialBicycleModel):
         # Update the distance s along the reference path based on the closest waypoint
         self.s = self.get_s_at_waypoint(self.wp_id)
 
-    def update_states(self, x, y, psi):
+    def update_states(self, x, y, psi, prev_idx=None, radius_m=None):
         self.temporal_state.x = x
         self.temporal_state.y = y
         self.temporal_state.psi = psi
 
         # Update the current waypoint based on the new reference path
-        self.wp_id = self.get_closest_waypoint(self.temporal_state.x, self.temporal_state.y)
+        self.wp_id = self.get_closest_waypoint(self.temporal_state.x, self.temporal_state.y,
+                                                prev_idx=prev_idx, radius_m=radius_m)
 
         # Update the distance s along the reference path based on the closest waypoint
         self.s = self.get_s_at_waypoint(self.wp_id)
@@ -421,14 +466,15 @@ class BicycleModel(SpatialBicycleModel):
         """
 
         # Get state and input variables
-        e_y, e_psi, t = state
+        e_y, e_psi, t, delta_actual = state
         v, delta = input
 
         # Compute velocity along path
         s_dot = 1 / (1 - (e_y * kappa)) * v * np.cos(e_psi)
 
-        # Compute yaw angle rate of change
-        psi_dot = v / self.length * np.tan(delta)
+        # Compute yaw angle rate of change from the actual(lagged) steering
+        # state, not the instantaneously commanded input (2026-07-27再実装)
+        psi_dot = v / self.length * np.tan(delta_actual)
 
         return s_dot, psi_dot
 
@@ -442,7 +488,7 @@ class BicycleModel(SpatialBicycleModel):
         """
 
         # Get state and input variables
-        e_y, e_psi, t = state
+        e_y, e_psi, t, delta_actual = state
         v, delta = input
 
         # Compute temporal derivatives
@@ -453,7 +499,12 @@ class BicycleModel(SpatialBicycleModel):
         d_e_psi_d_s = psi_dot / s_dot - kappa
         d_t_d_s = 1 / s_dot
 
-        return np.array([d_e_y_d_s, d_e_psi_d_s, d_t_d_s])
+        # delta_actualの一次遅れ(連続時間: d(delta_actual)/dt=(delta-delta_actual)/tau)
+        # を空間微分へ変換(2026-07-27再実装)。tau=0(無効)はゼロ除算を避けepsを使う。
+        tau = max(self.actuator_lag_tau_s, self.eps)
+        d_delta_actual_d_s = (delta - delta_actual) / (tau * s_dot)
+
+        return np.array([d_e_y_d_s, d_e_psi_d_s, d_t_d_s, d_delta_actual_d_s])
 
     def linearize(self, v_ref, kappa_ref, delta_s):
         """
@@ -461,30 +512,55 @@ class BicycleModel(SpatialBicycleModel):
         :param v_ref: velocity reference around which to linearize
         :param kappa_ref: kappa of waypoint around which to linearize
         :param delta_s: distance between current waypoint and next waypoint
+
+        2026-07-27再実装(201節続報、AXIS06のdelta_actual状態拡張、198節撤回分の
+        再挑戦): e_psiの更新を駆動する項(旧: b_2[1]=delta_s、指令入力から瞬時に反映)
+        を、delta_actual_{k+1}(今回ステップで更新された後の実舵角)経由の寄与へ置き換
+        える。delta_actual_{k+1}=(1-alpha)*delta_actual_k + alpha*delta_k
+        (alpha=clip(delta_s/(tau*v_ref),0,1)、一次遅れの離散化率)を e_psi の式へ
+        代入すると、e_psi_{k+1}の delta_actual_k 係数は delta_s*(1-alpha)
+        (a_2[3])、delta_k係数は delta_s*alpha (b_2[1])になる。
+        (delta_actual_kをそのまま使うと、直近1周期分の値をさらに1周期遅らせてしまう
+        バグになるため、必ず更新後の値を代入すること。)
+        tau→0(alpha→1、v_ref>0)では a_2[3]→0・b_2[1]→delta_s となり、旧3状態
+        モデルのb_2=[0,delta_s]と数学的に完全一致する(下位互換、テストで検証)。
+        v_ref==0(速度ゼロ)ではalphaを定義できないため0扱い(delta_actual凍結、
+        t状態のv_ref==0特別扱いと同じ思想)とする。
          """
 
         ###################
         # System Matrices #
         ###################
 
-        # Construct Jacobian Matrix
-        a_1 = np.array([1, delta_s, 0])
-        a_2 = np.array([-kappa_ref ** 2 * delta_s, 1, 0])
-
-        b_1 = np.array([0, 0])
-        b_2 = np.array([0, delta_s])
+        tau = max(self.actuator_lag_tau_s, self.eps)
 
         # Handle v_ref == 0 case
         if v_ref == 0:
-            a_3 = np.array([0, 0, 1])
-            b_3 = np.array([0, 0])
-            f = np.array([0.0, 0.0, 0.0])
+            alpha = 0.0
         else:
-            a_3 = np.array([-kappa_ref / v_ref * delta_s, 0, 1])
-            b_3 = np.array([-1 / (v_ref ** 2) * delta_s, 0])
-            f = np.array([0.0, 0.0, 1 / v_ref * delta_s])
+            alpha = min(1.0, max(0.0, delta_s / (tau * v_ref)))
 
-        A = np.stack((a_1, a_2, a_3), axis=0)
-        B = np.stack((b_1, b_2, b_3), axis=0)
+        # Construct Jacobian Matrix
+        a_1 = np.array([1, delta_s, 0, 0])
+        a_2 = np.array([-kappa_ref ** 2 * delta_s, 1, 0, delta_s * (1 - alpha)])
+
+        b_1 = np.array([0, 0])
+        b_2 = np.array([0, delta_s * alpha])
+
+        if v_ref == 0:
+            a_3 = np.array([0, 0, 1, 0])
+            b_3 = np.array([0, 0])
+            a_4 = np.array([0, 0, 0, 1])
+            b_4 = np.array([0, 0])
+            f = np.array([0.0, 0.0, 0.0, 0.0])
+        else:
+            a_3 = np.array([-kappa_ref / v_ref * delta_s, 0, 1, 0])
+            b_3 = np.array([-1 / (v_ref ** 2) * delta_s, 0])
+            a_4 = np.array([0, 0, 0, 1 - alpha])
+            b_4 = np.array([0, alpha])
+            f = np.array([0.0, 0.0, 1 / v_ref * delta_s, 0.0])
+
+        A = np.stack((a_1, a_2, a_3, a_4), axis=0)
+        B = np.stack((b_1, b_2, b_3, b_4), axis=0)
 
         return f, A, B

@@ -66,7 +66,7 @@
   </group>
 
     <!-- Localization -->
-  <let name="pose_additional_delay_var" value="0.0" />
+  <let name="pose_additional_delay_var" value="0.14" />
   <group>
     <push-ros-namespace namespace="localization"/>
     <include file="$(find-pkg-share gyro_odometer)/launch/gyro_odometer.launch.xml">
@@ -97,7 +97,29 @@
       <arg name="output_twist_name" value="twist"/>
       <arg name="output_twist_with_covariance_name" value="twist_with_covariance"/>
       <arg name="proc_stddev_vx_c" value="10.0"/>
-      <arg name="proc_stddev_wz_c" value="5.0"/>
+      <!-- 2026-07-23実験(166節)→2026-07-25撤回(180節続報、緊急): コーナーでのEKF横位置
+           スムージング仮説の検証として5.0→10.0へ引き上げたが、変更時のコメント自体が
+           懸念していた「直線でのステア分散」への影響検証が未実施のまま放置されていた。
+           180節で実測した予選ログ(0725-01)で、コーナーだけでなく直線含む全区間で
+           一様に蛇行が悪化していることが判明し(超過率1.5%というほぼ健全な軽負荷下でも
+           発生=CPU競合では説明不可)、タイムライン(ユーザー証言「7/22までは問題なし」
+           と本変更日7/23が一致)から本変更を最有力候補として撤回・原点(5.0)へ戻す。
+           単独変数A/Bのため他パラメータは無変更。
+           2026-07-26追記: 撤回(5.0)はローカルでは改善確認(166-8節)されたが、その後の
+           実予選ログ(0726-01/02、撤回反映後にビルド・記録されたことをファイル日時と
+           symlink-installで確認済み)でもコース全域の細かな振動が引き続き確認され、
+           5.0への復帰だけでは実環境で不十分だったと判明した。さらにwp321/wp342
+           (曲率がほぼ0付近で符号反転するだけの、実質的に直線に近い区間)でも
+           ekf_ey/gnss_ey乖離0.15〜0.21m(他区間の3〜4倍)を実測し、原因が特定の
+           コーナー形状に依存しない、より根深いEKF平滑化不足である可能性を示唆する
+           追加証拠を得た。5.0→10.0(下げ過ぎるとGHOST-BLOCK=コーナーでのEKF過剰
+           平滑化が再発するリスク)の間で一段だけ下げ、3.0で試す(good_valueチューニング
+           と同じ「一段ずつ踏み込み、行き過ぎたら戻す」方式)。
+           判定基準(二面的、既存方式を踏襲): ①改善面=直線区間でのステア指令分散・
+           反転回数(蛇行)が5.0時点より減るか。②悪化面=GHOST-BLOCK発火数・STUCK数が
+           増えていないか(166節がそもそも対処しようとしていた問題の再発が無いか)。
+           単独変数A/Bのため他パラメータは無変更。 -->
+      <arg name="proc_stddev_wz_c" value="3.0"/>
       <arg name="pose_additional_delay" value="$(var pose_additional_delay_var)"/>
       <arg name="extend_state_step" value="100"/>
     </include>
@@ -124,8 +146,16 @@
       <push-ros-namespace namespace="scenario_planning"/>
 
       <!-- Customizable -->
+      <!-- 2026-07-23修正(166節続報): 従来はガレージ発進経路(raceline_awsim_30km_from_garage.csv、
+           pit_lane.csv_relと同一)を配信しており、RVIZの/planning/scenario_planning/trajectory表示が
+           コース本線と無関係な経路を常時表示し続けるバグの原因だった(ユーザー指摘で発覚)。
+           multi_purpose_mpc_ros/config.yamlのreference_path.csv_path(env/final_ver3/traj_mincurv.csv)から
+           変換した実際のレースラインへ切替える(x,y,psi,kappa,vx,ax → x,y,z,quat×4,speedへ変換、
+           s/kappa/ax列は本ノードの8列固定フォーマットに存在しないため破棄)。
+           multi_purpose_mpc_ros自体はupdate_by_topic:falseのためこのtopicを消費せず、RVIZ表示専用。
+           reference_path.csv_pathが別のenv/*へ変更された場合はこのCSVも再生成が必要。 -->
       <node pkg="simple_trajectory_generator" exec="simple_trajectory_generator_node" name="simple_trajectory_generator" output="screen">
-            <param name="csv_path" value="$(find-pkg-share simple_trajectory_generator)/data/raceline_awsim_30km_from_garage.csv"/>
+            <param name="csv_path" value="$(find-pkg-share simple_trajectory_generator)/data/raceline_final_ver3_mincurv.csv"/>
             <param name="z" value="6.5"/>
       </node>
       

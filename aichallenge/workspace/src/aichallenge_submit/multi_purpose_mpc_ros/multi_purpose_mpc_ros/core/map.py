@@ -159,8 +159,18 @@ class Map:
             # Add circular object to map
             y, x = np.ogrid[-radius_px: radius_px, -radius_px: radius_px]
             index = x ** 2 + y ** 2 <= radius_px ** 2
-            self.data[cy_px-radius_px:cy_px+radius_px, cx_px-radius_px:
-                                                cx_px+radius_px][index] = 0
+            # グリッド境界クリップ: 障害物が端に掛かると書き込み先スライスが縮み、
+            # 固定サイズ(2*radius_px)のマスク index と形が合わず IndexError で制御ノードが落ちる。
+            # 衝突環境では他車が端に来るたびに全停止するため、範囲をグリッド内にクリップし
+            # マスクも同じ部分だけ切り出して適用する（端以外の挙動は従来と完全に同一）。
+            h, w = self.data.shape
+            y0, y1 = cy_px - radius_px, cy_px + radius_px
+            x0, x1 = cx_px - radius_px, cx_px + radius_px
+            yy0, yy1 = max(0, y0), min(h, y1)
+            xx0, xx1 = max(0, x0), min(w, x1)
+            if yy0 < yy1 and xx0 < xx1:
+                sub = index[yy0 - y0: yy1 - y0, xx0 - x0: xx1 - x0]
+                self.data[yy0:yy1, xx0:xx1][sub] = 0
 
     def add_boundary(self, boundaries):
         """

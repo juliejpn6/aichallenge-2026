@@ -28,6 +28,9 @@ source /autoware/install/setup.bash
 cd ./workspace
 
 # NOTE: gyro_odometer exists in the Autoware underlay, so allow overriding in this overlay workspace.
+# setuptools の「setup.py install is deprecated」警告を抑制(ROS2 Humble+新setuptoolsの既知の無害警告。
+# ament_cmake_python が setup.py install を使うため毎回 stderr に出る。この警告のみをピンポイントで無効化)
+export PYTHONWARNINGS="ignore:setup.py install is deprecated::setuptools.command.install"
 colcon build --symlink-install --allow-overriding gyro_odometer --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 echo "[build_autoware] Build successful."
