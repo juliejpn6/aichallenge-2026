@@ -3,10 +3,12 @@ import numpy as np
 import numpy.ma as ma
 import math
 import copy
+import time as _time
 from multi_purpose_mpc_ros.core.map import Map, Obstacle
 from skimage.draw import line_aa
 import matplotlib.pyplot as plt
 from scipy import sparse
+from scipy.signal import savgol_filter
 import osqp
 import itertools
 
@@ -158,9 +160,22 @@ class BorderCells:
         self.dynamic_upper_bounds = []
         self.dynamic_lower_bounds = []
 
+
+def _apply_savgol_kappa(kappa, window_length, polyorder, circular):
+    """215節続報2(AXIS08、原因2): 算出済みのkappa配列にSavitzky-Golay空間フィルタ
+    (局所多項式最小二乗平滑化)を適用する。214節続報のC2スプライン(厳密内挿)と異なり、
+    各点を厳密に通過する制約が無い"近似"フィルタのため、局所的なキンクの周囲で
+    オーバーシュート(リンギング)が起きにくい。circular=Trueならmode='wrap'で
+    始点・終点の接続不連続を防ぐ。x, y, psiには一切触れない。"""
+    kappa = np.asarray(kappa, dtype=float)
+    return savgol_filter(
+        kappa, window_length, polyorder, mode='wrap' if circular else 'nearest')
+
+
 class ReferencePath:
     def __init__(self, map, wp_x, wp_y, resolution, smoothing_distance,
-                 max_width, circular):
+                 max_width, circular,
+                 use_savgol_kappa=False, savgol_window_length=7, savgol_polyorder=2):
         """
         Reference Path object. Create a reference trajectory from specified
         corner points with given resolution. Smoothing around corners can be
@@ -174,6 +189,12 @@ class ReferencePath:
         path by averaging neighborhood of waypoints
         :param max_width: maximum width of path to both sides in m
         :param circular: True if path circular
+        :param use_savgol_kappa: 215節続報2(AXIS08、原因2)。Trueの場合、算出済みの
+        kappa配列にSavitzky-Golay空間フィルタ(局所多項式最小二乗平滑化)を後処理として
+        適用する。厳密内挿ではなく近似(最小二乗)のためオーバーシュートが起きにくい。
+        x, y・psi・区分再分割・移動平均は不変。既定False。
+        :param savgol_window_length: Savitzky-Golayの窓幅[点数](奇数必須)。
+        :param savgol_polyorder: Savitzky-Golayの局所多項式次数。
         """
 
         self.org_wp_x = wp_x
@@ -193,6 +214,13 @@ class ReferencePath:
 
         # Circular flag
         self.circular = circular
+
+        # 215節続報2(AXIS08、原因2): kappaへのSavitzky-Golay後処理平滑化フラグ。
+        # (214節で試したuse_c2_spline_kappaは、厳密内挿スプラインがキンクを増幅する
+        #  ことが215節で判明したため217節で削除した。savgolのみが現行の対処)
+        self.use_savgol_kappa = bool(use_savgol_kappa)
+        self.savgol_window_length = int(savgol_window_length)
+        self.savgol_polyorder = int(savgol_polyorder)
 
         # List of waypoint objects
         self.waypoints = self._construct_path(wp_x, wp_y)
@@ -285,6 +313,17 @@ class ReferencePath:
         waypoints = list(zip(wp_xs, wp_ys))
         # print(f"n_wp: {n_wp}, smooth_dist: {self.smoothing_distance}, len(wp_x): {len(wp_x)}, len way: {len(waypoints)}")
         waypoints = self._construct_waypoints(waypoints)
+
+        # 215節続報2(AXIS08、原因2): 算出済みkappaのみにSavitzky-Golay後処理平滑化を
+        #   適用する(x, y・psiは不変、既定off)。厳密内挿ではなく局所最小二乗近似のため、
+        #   215節続報で確認したC2スプラインのオーバーシュート増幅は起きにくい。
+        if self.use_savgol_kappa and len(waypoints) > self.savgol_window_length:
+            kappa_arr = [wp.kappa for wp in waypoints]
+            kappa_sg = _apply_savgol_kappa(
+                kappa_arr, self.savgol_window_length, self.savgol_polyorder,
+                self.circular)
+            for wp, kappa_i in zip(waypoints, kappa_sg):
+                wp.kappa = float(kappa_i)
 
         return waypoints
 
@@ -668,9 +707,206 @@ class ReferencePath:
         #     obstacle.show(ax=ax)
 
 
+    # 2026-07-31追加(254節続報続、Phase 1): update_path_constraints内訳計測。
+    #   control_rateとは無関係の独立した計測窓(固定400周期)であり、
+    #   mpc_controller.pyの[PERF]/レートスケーリング機構とは結合しない
+    #   (「control_rateは別課題として触れない」という本タスクの制約に従う)。
+    #   phaseA=_compute_free_segments(ラスタ走査)の合計時間、
+    #   phaseB=itertools.productによる組み合わせ探索の合計時間。
+    #
+    #   2026-07-31追記(256節続報、クローズ作業Phase 4-3): collision_checks
+    #   カウンタの意味注記。Phase 3-2導入前(itertools.product+毎組み合わせ
+    #   ごとのhas_collision_in_line再計算)はlazy(衝突が見つかった時点で
+    #   その組み合わせの以降のペアは評価せず早期打ち切り)だったのに対し、
+    #   Phase 3-2後の実装(隣接レイヤー間ペアの事前メモ化)はeager(組み合わせの
+    #   列挙結果に関わらず、全ペアを常に事前計算しきる)である。したがって
+    #   新実装のcollision_checksは常にΣS_i×S_{i+1}(初期点→レイヤー0を含む)の
+    #   固定上限値そのものであり、旧実装のようにケースごとの早期打ち切り具合で
+    #   変動する値ではない(新旧の数値を単純比較する際はこの意味の違いに注意)。
+    _PERFC_REPORT_EVERY = 400
+
+    def _perfc_init(self):
+        self._perfc_cycles = 0
+        self._perfc_phaseA_times = []
+        self._perfc_phaseB_times = []
+        self._perfc_phaseB_invocations = 0
+        self._perfc_max_nseg = 0
+        self._perfc_combination_count = 0
+        self._perfc_collision_check_count = 0
+        self._perfc_complete_blockage_count = 0
+        self._perfc_cache_build_count = 0
+
+    def _perfc_cycle_end(self, phaseA_time, phaseB_time, phaseB_invocations,
+                          max_nseg, combination_count, collision_check_count,
+                          complete_blockage_count):
+        self._perfc_cycles += 1
+        self._perfc_phaseA_times.append(phaseA_time)
+        self._perfc_phaseB_times.append(phaseB_time)
+        self._perfc_phaseB_invocations += phaseB_invocations
+        self._perfc_max_nseg = max(self._perfc_max_nseg, max_nseg)
+        self._perfc_combination_count += combination_count
+        self._perfc_collision_check_count += collision_check_count
+        self._perfc_complete_blockage_count += complete_blockage_count
+
+        if self._perfc_cycles >= self._PERFC_REPORT_EVERY:
+            a = np.array(self._perfc_phaseA_times) * 1000.0
+            b = np.array(self._perfc_phaseB_times) * 1000.0
+            print(
+                '[PERF-CORRIDOR] n=%d '
+                'phaseA(segments) avg=%.2fms p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms | '
+                'phaseB(search) avg=%.2fms p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms '
+                'invocations=%d max_nseg=%d combos=%d collision_checks=%d complete_blockage=%d回 '
+                'cache_builds=%d'
+                % (self._perfc_cycles,
+                   a.mean(), np.percentile(a, 50), np.percentile(a, 95), np.percentile(a, 99), a.max(),
+                   b.mean(), np.percentile(b, 50), np.percentile(b, 95), np.percentile(b, 99), b.max(),
+                   self._perfc_phaseB_invocations, self._perfc_max_nseg,
+                   self._perfc_combination_count, self._perfc_collision_check_count,
+                   self._perfc_complete_blockage_count, self._perfc_cache_build_count),
+                flush=True)
+            self._perfc_init()
+
     def _compute_free_segments(self, wp, min_width):
         """
-        Compute free path segments.
+        Compute free path segments (254節続報続、Phase 3-1: ベクトル化版)。
+        _compute_free_segments_scalar()と1ビットも違わない出力を返す
+        (corridor_golden_expected.json/corridor_fuzz_corpus.jsonで保証)。
+
+        高速化の要点: wp.static_border_cellsはwaypoint構築後に変化しない
+        (動的障害物で変化するのは占有格子データ側だけ)ため、line_aaが返す
+        ラスタ座標列(x_arr,y_arr)はwaypointごとに一度だけ計算しwpインスタンスに
+        キャッシュできる。毎周期の実処理は、そのキャッシュ済み座標での
+        occupancy値のgather(map_data[y_arr,x_arr])と、numpyのbool演算/
+        flatnonzeroによるセグメント境界検出のみになる(per-cell Pythonループ
+        を排除)。
+
+        安全策:
+        - map.dataが0/1のみという前提(core/map.py:131のコメント通り)が崩れる、
+          またはrising/close edgeの対応数が一致しない(想定外の入力)場合は
+          即座に_compute_free_segments_scalar()へフォールバックし、誤った結果を
+          絶対に返さない(self._fs_fallback_countで発火有無をテストから検証可能)。
+        - 2026-07-31追加(256節続報、クローズ作業Phase 1): このキャッシュは
+          マップ幾何(origin/resolution/width/height)が起動後不変であること
+          (占有格子の値=map.dataのみが周期ごとに変わる)に依存している。
+          調査の結果、self.mapが同一Mapインスタンスのまま使われ続け、
+          reference_path再構築時もそのMapを再利用する(core/map.pyには
+          origin/resolution/width/heightを書き換えるメソッドが存在しない)ことを
+          確認済みだが、将来この前提が崩れても静かに誤った座標を使い続けない
+          よう、キャッシュ構築時の幾何をタプルとして記録し、参照のたびに
+          (タプル比較のみ、数十ns)現在の幾何と照合する。2026-08-01追加
+          (258節続報、マージ後フォローアップPhase 1): このタプルには
+          map.data.shapeも含める——origin/resolution/width/heightを変えずに
+          map.dataだけ別形状へ差し替えられる経路(想定外)は、他の4値だけの
+          照合では検出できず、キャッシュ座標が新しい配列の有効範囲内にある
+          別セルを静かに読んでしまう(このガードが本来防ぎたい失敗そのもの)
+          ため。不一致ならキャッシュを
+          破棄し、この呼び出しに限り安全な素朴実装へフォールバックする
+          (次回呼び出し時に新しい幾何でキャッシュが再構築される)。
+        - 2026-07-31追加(256節続報、クローズ作業Phase 4-1): キャッシュ構築時の
+          ピクセル座標にnp.clipを適用する。現行のskimage(0.25.2)ではline_aaが
+          範囲外座標を返さないことを10,000件超で確認済み(Phase 2実験、
+          test_line_aa_oob_property_254.pyで常設回帰化)であり、このclipは
+          現状は恒等操作(出力への影響ゼロ、等価性回帰1509件で確認済み)だが、
+          将来のskimageバージョン更新でラスタライズアルゴリズムが変わっても
+          IndexErrorでノードごと落ちることがないよう、静的パスを構造的に
+          安全にしておく(周期あたりコストはゼロ、初回waypoint参照時の1回のみ)。
+        """
+        if not hasattr(self, '_fs_fallback_count'):
+            self._fs_fallback_count = 0
+        # 2026-08-01追加(258節続報、マージ後フォローアップPhase 1): origin/
+        #   resolution/width/heightだけの照合では、これら属性を変えずに
+        #   map.dataだけ別形状の配列へ差し替えられた場合を検出できない。
+        #   縮小方向はIndexErrorで顕在化するが、拡大方向はキャッシュ座標が
+        #   新しい配列の有効範囲内にある別セルを静かに読んでしまう——ガードが
+        #   本来防ぎたい失敗そのものである。data.shapeをタプルへ加えることで
+        #   この経路も検出する(コストはタプル比較のまま変わらない)。
+        map_geom = (self.map.origin, self.map.resolution, self.map.width,
+                    self.map.height, self.map.data.shape)
+        if hasattr(wp, '_fs_line_cache') and wp._fs_line_cache[4] != map_geom:
+            # マップ幾何が変化した(現行コードでは到達しないはずの想定外経路)。
+            # 誤った座標を使い続けないよう、キャッシュを破棄して安全側の
+            # 素朴実装へこの呼び出しに限りフォールバックする。
+            print(f"[WARN] _compute_free_segments: map geometry changed "
+                  f"(cached={wp._fs_line_cache[4]}, current={map_geom}), "
+                  f"invalidating _fs_line_cache and falling back to scalar impl")
+            del wp._fs_line_cache
+            self._fs_fallback_count += 1
+            return self._compute_free_segments_scalar(wp, min_width)
+
+        if not hasattr(wp, '_fs_line_cache'):
+            ub_p0 = self.map.w2m(wp.static_border_cells[0][0],
+                                  wp.static_border_cells[0][1])
+            lb_p0 = self.map.w2m(wp.static_border_cells[1][0],
+                                  wp.static_border_cells[1][1])
+            x_list0, y_list0, _ = line_aa(ub_p0[0], ub_p0[1], lb_p0[0], lb_p0[1])
+            x_arr = np.clip(np.asarray(x_list0[1:], dtype=np.intp), 0, self.map.width - 1)
+            y_arr = np.clip(np.asarray(y_list0[1:], dtype=np.intp), 0, self.map.height - 1)
+            wp._fs_line_cache = (x_arr, y_arr, ub_p0, lb_p0, map_geom)
+            # 2026-07-31追加(256節続報、クローズ作業Phase 4-2): _fs_line_cacheは
+            # 遅延構築(各waypointが初めてホライズンに入った周期にまとめて発生)
+            # であり、全waypoint分のプリウォームはReferencePath.__init__という
+            # 広く使われるコンストラクタへ手を入れるリスクを伴うため見送った。
+            # 代わりに、この「初回構築」が実際に何回・どの周期で起きているかを
+            # [PERF-CORRIDOR]のcache_buildsカウンタで可視化する(通常は起動直後の
+            # 数周期、またはreference_path再構築時のみ増加するはずで、巡航中は
+            # ゼロが継続するのが正常)。
+            if hasattr(self, '_perfc_cache_build_count'):
+                self._perfc_cache_build_count += 1
+
+        x_arr, y_arr, ub_p, lb_p, _cached_geom = wp._fs_line_cache
+        n = x_arr.shape[0]
+        if n == 0:
+            return []
+
+        map_data = self.map.data
+        cv = map_data[y_arr, x_arr]
+
+        is_free = (cv == 1)
+        is_occ = (cv == 0)
+        if not np.all(is_free | is_occ):
+            # map.dataが0/1以外の値を含む(想定外)。安全のため素朴実装へ委ねる。
+            self._fs_fallback_count += 1
+            return self._compute_free_segments_scalar(wp, min_width)
+
+        is_lbp = (x_arr == lb_p[0]) & (y_arr == lb_p[1])
+
+        rising_mask = is_free.copy()
+        rising_mask[1:] &= ~is_free[:-1]
+
+        close_mask = np.zeros(n, dtype=bool)
+        close_mask[1:] = is_free[:-1] & (~is_free[1:])
+        close_mask |= (is_free & is_lbp)
+
+        rising_indices = np.flatnonzero(rising_mask)
+        close_indices = np.flatnonzero(close_mask)
+        if rising_indices.shape[0] != close_indices.shape[0]:
+            # 各free runが必ず1つのclose(falling edgeまたはlb_p到達)で
+            # 閉じるという不変条件が崩れた(想定外)。安全のため素朴実装へ委ねる。
+            self._fs_fallback_count += 1
+            return self._compute_free_segments_scalar(wp, min_width)
+
+        all_segments = []
+        free_segments = []
+        m2w = self.map.m2w
+        for ub_idx, lb_idx in zip(rising_indices - 1, close_indices):
+            ub_o = m2w(ub_p[0], ub_p[1]) if ub_idx < 0 else m2w(int(x_arr[ub_idx]), int(y_arr[ub_idx]))
+            lb_o = m2w(int(x_arr[lb_idx]), int(y_arr[lb_idx]))
+            all_segments.append((ub_o, lb_o))
+            if ((ub_o[0]-lb_o[0])**2 + (ub_o[1]-lb_o[1])**2) > min_width**2:
+                free_segments.append((ub_o, lb_o))
+
+        if not free_segments and all_segments:
+            free_segments = [max(
+                all_segments,
+                key=lambda seg: (seg[0][0]-seg[1][0])**2 + (seg[0][1]-seg[1][1])**2)]
+
+        return free_segments
+
+    def _compute_free_segments_scalar(self, wp, min_width):
+        """
+        Compute free path segments (254節続報続、Phase 3-1以前の素朴実装。
+        参照実装として保持し、_compute_free_segments()の想定外入力時の
+        フォールバック先として使う)。
         :param wp: waypoint object
         :param min_width: minimum width of valid segment
         :return: segment candidates as list of tuples (ub_cell, lb_cell)
@@ -843,6 +1079,14 @@ class ReferencePath:
         Compute upper and lower bounds of the drivable area orthogonal to
         the given waypoint.
         """
+        if not hasattr(self, '_perfc_cycles'):
+            self._perfc_init()
+        _perfc_phaseA_time = 0.0
+        _perfc_phaseB_time = 0.0
+        _perfc_phaseB_invocations = 0
+        _perfc_combination_count = 0
+        _perfc_collision_check_count = 0
+        _perfc_complete_blockage_count = 0
 
         # min_width = model_width / np.sqrt(2)
         # min_width = model_width
@@ -953,11 +1197,13 @@ class ReferencePath:
 
         # compute free segments for each waypoints in horizon
         free_segments_hor = []
+        _t0_phaseA = _time.perf_counter()
         for n in range(N):
             wp = self.get_waypoint(wp_id+n)
             free_segments = self._compute_free_segments(wp, min_width)
             free_segments_hor.append(free_segments)
             self.free_segs.extend(free_segments)
+        _perfc_phaseA_time += _time.perf_counter() - _t0_phaseA
 
         # [案X corridor debug] horizon内で free-segment が何本見つかったかの内訳
         self.dbg_nseg0 = sum(1 for fs in free_segments_hor if len(fs) == 0)
@@ -976,6 +1222,8 @@ class ReferencePath:
 
             # Iterate over free segments for current waypoint
             if len(free_segments) >= 2:
+                _t0_phaseB = _time.perf_counter()
+                _perfc_phaseB_invocations += 1
                 free_segments_indices = [[idx for idx in range(len(free_segments))]]
                 for i in range(n+1, n+5):
                     if i >= N:
@@ -986,57 +1234,114 @@ class ReferencePath:
                     else:
                       free_segments_indices.append([idx for idx in range(len(free_segments))])
 
-                free_segments_indices_combinations = itertools.product(*free_segments_indices)
-                # if show:
-                #     print(f"n :{n}, free_segments_indices: {free_segments_indices}")
+                # ============================================================
+                # 警告(2026-07-31、256節続報、クローズ作業Phase 1): 過去に
+                # 後ろ向きDP(suffix DP)による組み合わせ数(S^D)自体の削減を
+                # 試みたが、意図的に破棄している。将来ここを最適化する際は
+                # 同じ罠を踏まないよう、必ず先にこの経緯を読むこと。
+                #
+                # 破棄した理由: 浮動小数点加算は結合則が厳密には成立しない。
+                # 旧実装(itertools.product列挙+前向き=左結合の逐次累積、
+                # `((0+w0)+w1)+w2+...`)に対し、DPは後ろ向き=右結合
+                # (`w0+(w1+(w2+...))`)で合計を組み立てる。この結合順序の違いにより、
+                # 「前向き累積では実質同点」の2つの組み合わせが、DPの局所比較では
+                # 異なる値として扱われてしまうケースが実在する(差分ファジング
+                # case_idx=125、golden case 10_fp_absorption_tiebreakとして固定済み:
+                # レイヤー内の2区間幅4.199999999999999/4.2は単独では区別されるが、
+                # 約21.2の部分和に加算すると両方25.400000000000002へ丸め吸収される)。
+                # この結合順序差が原因で、DP実装は旧実装(itertools.product+
+                # max()+.index())と異なる組み合わせを選んでしまい、ファジングで
+                # 経路選択(=出力ub/lb)がビット単位で変わることを実測で確認した。
+                #
+                # 結論: 「itertools.productの列挙順序(辞書式順序、レイヤーの
+                # 添字が後ろほど速く変化する)」と「前向き(左結合)からの逐次加算」
+                # の組み合わせは、タイブレーク判定を旧実装と1ビットの狂いなく
+                # 一致させるための生命線であり、変更してはならない。
+                # ============================================================
+                #
+                # 2026-07-31追加(254節続報続、Phase 3-2): 列挙対象(itertools.product)・
+                # 各組み合わせの前向き累積(total_segment_length += ...)・
+                # 衝突時の即時打ち切り・max()+.index()のタイブレークは一切変更しない。
+                # 変更するのはhas_collision_in_lineの呼び出し回数のみ: 隣接レイヤー間
+                # (および初期点→レイヤー0間)の衝突判定は「どちらのレイヤーのどの
+                # セグメントか」だけで決まり、組み合わせ間で同じペアが最悪S^D×D回も
+                # 再計算されていた。全ペアを一度だけ事前計算してメモ化することで、
+                # has_collision_in_line自体の呼び出し回数をO(ΣS_i×S_{i+1})に削減する
+                # (mean_prev/mean_fsの計算式・比較対象は元の関数と完全に同一)。
+                D = len(free_segments_indices)
+                layer_segments = [free_segments_hor[n+i] for i in range(D)]
 
-                def calculate_combination_total_segment_length(index_combination, ub_pw, lb_pw):
+                def _collides(mean_a, mean_b):
+                    nonlocal _perfc_collision_check_count
+                    _perfc_collision_check_count += 1
+                    if has_collision_in_line(self.map, mean_a, mean_b):
+                        self.upper_cols.append([[mean_a[0], mean_b[0]], [mean_a[1], mean_b[1]]])
+                        return True
+                    return False
+
+                if n > 0:
+                    init_ub_pw, init_lb_pw = border_cells_hor[n-1]
+                else:
+                    if pose is not None:
+                        init_ub_pw, init_lb_pw = [pose[0], pose[1]], [pose[0], pose[1]]
+                    else:
+                        init_ub_pw, init_lb_pw = [wp.x, wp.y], [wp.x, wp.y]
+                init_mean = (np.array(init_ub_pw) + np.array(init_lb_pw)) / 2.
+
+                layer_means = [[(np.array(ub_fs) + np.array(lb_fs)) / 2. for ub_fs, lb_fs in layer]
+                               for layer in layer_segments]
+
+                # 初期点→レイヤー0、および隣接レイヤー間の衝突判定を一度だけ計算する
+                # (mean_a/mean_bは元のmean_prev/mean_fsと同一式・同一値)。
+                edge_collision_init = [_collides(init_mean, layer_means[0][j])
+                                       for j in range(len(layer_segments[0]))]
+                edge_collision_between = []
+                for i in range(D - 1):
+                    mat = [[_collides(layer_means[i][jp], layer_means[i + 1][j])
+                            for j in range(len(layer_segments[i + 1]))]
+                           for jp in range(len(layer_segments[i]))]
+                    edge_collision_between.append(mat)
+
+                def calculate_combination_total_segment_length(index_combination):
                     total_segment_length = 0.0
-
+                    prev_idx = None
                     for i, segment_index in enumerate(index_combination):
-                        ub_fs, lb_fs = free_segments_hor[n+i][segment_index]
-
-                        mean_prev = (np.array(ub_pw) + np.array(lb_pw)) / 2.
-                        mean_fs = (np.array(ub_fs) + np.array(lb_fs)) / 2.
-
-                        if has_collision_in_line(self.map, mean_prev, mean_fs):
-                            self.upper_cols.append([[mean_prev[0], mean_fs[0]], [mean_prev[1], mean_fs[1]]])
-                            return -1000000.0 # penalty because has collision!
-
+                        if i == 0:
+                            collided = edge_collision_init[segment_index]
+                        else:
+                            collided = edge_collision_between[i - 1][prev_idx][segment_index]
+                        if collided:
+                            return -1000000.0  # penalty because has collision!
+                        ub_fs, lb_fs = layer_segments[i][segment_index]
+                        # 警告: この加算の順序(前向き・左結合)はタイブレークの一部である。
+                        # DP化・加算順の並べ替え・math.fsum・numpy sum への置換は、浮動小数点の
+                        # 吸収により選択結果を変える(実証: golden case 10_fp_absorption_tiebreak、
+                        # test_case_10_actually_exhibits_floating_point_absorption参照)。
                         total_segment_length += dist(ub_fs[0], ub_fs[1], lb_fs[0], lb_fs[1])
-                        ub_pw = ub_fs
-                        lb_pw = lb_fs
-
+                        prev_idx = segment_index
                     return total_segment_length
 
                 combination_segment_length = []
                 combination_indices = []
-                for combination in free_segments_indices_combinations:
-                    if n > 0:
-                        ub_pw, lb_pw = border_cells_hor[n-1]
-                    else:
-                        if pose is not None:
-                            ub_pw, lb_pw =  [pose[0], pose[1]], [pose[0], pose[1]]
-                        else:
-                            ub_pw, lb_pw =  [wp.x, wp.y], [wp.x, wp.y]
-
-                    total_segment_length = calculate_combination_total_segment_length(combination, ub_pw, lb_pw)
+                for combination in itertools.product(*free_segments_indices):
+                    total_segment_length = calculate_combination_total_segment_length(combination)
                     combination_segment_length.append(total_segment_length)
                     combination_indices.append(combination)
+
+                _perfc_combination_count += len(combination_indices)
 
                 max_area = max(combination_segment_length)
                 max_area_index = combination_segment_length.index(max_area)
                 max_area_combination_indices = combination_indices[max_area_index]
-
-                # if show:
-                #     print(f"max_area_combination_indices: {max_area_combination_indices}")
-                #     print(f"n: {n}, combination_segment_length: {combination_segment_length}, combination_indices: {combination_indices}")
+                if max_area == -1000000.0:
+                    _perfc_complete_blockage_count += 1
 
                 for i in max_area_combination_indices:
                     wp = self.get_waypoint(wp_id+n)
                     ub_ls, lb_ls = free_segments_hor[n][i]
                     add_constraint(wp, ub_ls, lb_ls)
                     n += 1
+                _perfc_phaseB_time += _time.perf_counter() - _t0_phaseB
 
             # Select free segment in case of only one candidate
             elif len(free_segments) == 1:
@@ -1173,6 +1478,12 @@ class ReferencePath:
             waypoint_mid.dynamic_border_cells = tuple(new_border_cells_hor_sm_mid)
             waypoint_mid.ub_sm = new_bound_sm[0]
             waypoint_mid.lb_sm = new_bound_sm[1]
+
+        _perfc_max_nseg = max((len(fs) for fs in free_segments_hor), default=0)
+        self._perfc_cycle_end(
+            _perfc_phaseA_time, _perfc_phaseB_time, _perfc_phaseB_invocations,
+            _perfc_max_nseg, _perfc_combination_count, _perfc_collision_check_count,
+            _perfc_complete_blockage_count)
 
         return np.array(ub_hor), np.array(lb_hor), np.array(border_cells_hor_sm)
 

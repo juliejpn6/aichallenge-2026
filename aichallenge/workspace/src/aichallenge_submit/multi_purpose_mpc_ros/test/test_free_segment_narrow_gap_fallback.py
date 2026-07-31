@@ -131,17 +131,33 @@ with open(_SRC_PATH) as _f:
     _SRC = _f.read()
 
 
+def _function_body(def_line):
+    """def_line(例: "def _compute_free_segments(self, wp, min_width):")から
+    次の同レベルの`def `までのソース断片を切り出す。2026-07-31追加(Phase 3-1):
+    _compute_free_segmentsがベクトル化版+_compute_free_segments_scalar(素朴な
+    参照実装、旧ロジックをそのまま保持)の2関数に分かれたため、固定文字数の
+    ウィンドウ(旧: 900/4500文字、ベクトル化版の長いdocstringで範囲外になり
+    偽陰性になっていた)ではなく、関数の実際の範囲を動的に切り出す。"""
+    idx = _SRC.index(def_line)
+    next_def = _SRC.index("\n    def ", idx + len(def_line))
+    return _SRC[idx:next_def]
+
+
 def test_all_segments_tracked_regardless_of_width():
-    idx = _SRC.index("def _compute_free_segments")
-    snippet = _SRC[idx:idx + 900]
-    assert "all_segments = []" in snippet
+    # ベクトル化版(既定の実行パス)・素朴な参照実装(フォールバック)の両方に
+    # all_segments追跡ロジックが存在することを確認する。
+    fast = _function_body("def _compute_free_segments(self, wp, min_width):")
+    scalar = _function_body("def _compute_free_segments_scalar(self, wp, min_width):")
+    assert "all_segments = []" in fast
+    assert "all_segments = []" in scalar
 
 
 def test_widest_fallback_only_applies_when_free_segments_empty_and_all_segments_nonempty():
-    idx = _SRC.index("def _compute_free_segments")
-    snippet = _SRC[idx:idx + 4500]
-    assert "if not free_segments and all_segments:" in snippet
-    assert "max(" in snippet
+    fast = _function_body("def _compute_free_segments(self, wp, min_width):")
+    scalar = _function_body("def _compute_free_segments_scalar(self, wp, min_width):")
+    for snippet in (fast, scalar):
+        assert "if not free_segments and all_segments:" in snippet
+        assert "max(" in snippet
 
 
 def test_zero_width_fallback_in_caller_is_unchanged_regression():
