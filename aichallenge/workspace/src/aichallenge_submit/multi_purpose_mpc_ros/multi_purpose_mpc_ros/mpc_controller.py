@@ -120,6 +120,7 @@ class MPCConfig:
     wp_id_offset: int
     use_max_kappa_pred: bool
     debug_extra_actuator_delay_s: float = 0.0
+    enable_diag_log: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -321,6 +322,18 @@ class MPCController(Node):
             self.declare_parameter("line_follow_w", self._line_follow_w)
             # デバッグ専用(196節続報): 予選環境との遅延差再現実験。既定0.0=無効。
             self.declare_parameter("debug_extra_actuator_delay_s", mpc_cfg.debug_extra_actuator_delay_s)
+            # 214節: 予選環境(3vCPU制限)向け、診断ログ計算(STEER-XCORR等)のバイパスフラグ。
+            #   既定true=従来通り診断ログを出力(ローカル調査を継続するため)。予選提出時のみ
+            #   config.yamlまたはrqtでfalseへ切り替える運用(debug_extra_actuator_delay_sと同じ
+            #   「既定は現状維持、本番のみ明示的に変更」パターン)。
+            self.declare_parameter("enable_diag_log", mpc_cfg.enable_diag_log)
+            # 220節続報(AXIS07 State Sanitizer): EKFの横方向誤差(曲率比例)への補正。既定false。
+            self.declare_parameter(
+                "use_curvature_bias_correction", self._car.use_curvature_bias_correction)
+            self.declare_parameter(
+                "curvature_bias_slope", self._car.curvature_bias_slope)
+            self.declare_parameter(
+                "curvature_bias_intercept", self._car.curvature_bias_intercept)
 
         def param_cb(parameters):
             cfg_mpc = self._cfg.mpc # type: ignore
@@ -396,10 +409,12 @@ class MPCController(Node):
                 elif param.name == "accel_low_pass_gain" and param.type_ == Parameter.Type.DOUBLE:
                     mpc_cfg.accel_low_pass_gain = param.value
                     self.get_logger().warn(f"accel_low_pass_gain was updated to '{param.value}'")
+                    self._warn_if_dynamic_gain_param_unscaled("accel_low_pass_gain")
 
                 elif param.name == "steer_low_pass_gain" and param.type_ == Parameter.Type.DOUBLE:
                     mpc_cfg.steer_low_pass_gain = param.value
                     self.get_logger().warn(f"steer_low_pass_gain was updated to '{param.value}'")
+                    self._warn_if_dynamic_gain_param_unscaled("steer_low_pass_gain")
 
                 elif param.name == "wp_id_offset" and param.type_ == Parameter.Type.INTEGER:
                     mpc_cfg.wp_id_offset = param.value
@@ -415,11 +430,93 @@ class MPCController(Node):
                     self.get_logger().warn(
                         f"debug_extra_actuator_delay_s was updated to '{mpc_cfg.debug_extra_actuator_delay_s}'")
 
+                elif param.name == "enable_diag_log" and param.type_ == Parameter.Type.BOOL:
+                    mpc_cfg.enable_diag_log = bool(param.value)
+                    self.get_logger().warn(
+                        f"[CONFIG] enable_diag_log was updated to "
+                        f"'{'TRUE' if mpc_cfg.enable_diag_log else 'FALSE'}'")
+
+                elif (param.name == "use_curvature_bias_correction"
+                        and param.type_ == Parameter.Type.BOOL):
+                    self._car.use_curvature_bias_correction = bool(param.value)
+                    self.get_logger().warn(
+                        f"[CONFIG] use_curvature_bias_correction was updated to "
+                        f"'{'TRUE' if self._car.use_curvature_bias_correction else 'FALSE'}'")
+
+                elif param.name == "curvature_bias_slope" and param.type_ == Parameter.Type.DOUBLE:
+                    self._car.curvature_bias_slope = float(param.value)
+                    self.get_logger().warn(
+                        f"curvature_bias_slope was updated to '{self._car.curvature_bias_slope}'")
+
+                elif (param.name == "curvature_bias_intercept"
+                        and param.type_ == Parameter.Type.DOUBLE):
+                    self._car.curvature_bias_intercept = float(param.value)
+                    self.get_logger().warn(
+                        f"curvature_bias_intercept was updated to "
+                        f"'{self._car.curvature_bias_intercept}'")
+
 
             return SetParametersResult(successful=True)
 
         declatre_parameters()
         self.add_on_set_parameters_callback(param_cb)
+        # 214節Task3: 予選提出時の切替忘れ防止(起動時に必ず現在値を目立つ形でログ出力)。
+        self.get_logger().warn(
+            f"[CONFIG] enable_diag_log: "
+            f"{'TRUE' if self._mpc_cfg.enable_diag_log else 'FALSE'}")
+
+    _RATE_SCALE_REFERENCE_HZ = 40.0  # config.yamlの数値は全てこの基準周期で書かれている
+
+    def _rate_scaled_cycles(self, name: str, cycles_at_ref: int) -> int:
+        """2026-07-31追加(254節続報、control_rate 40Hz→72Hz引き上げ設計):
+        周期数閾値をcontrol_rateに合わせて線形換算する(カテゴリA用)。
+        config.yamlの値は_RATE_SCALE_REFERENCE_HZ(40Hz)基準で書かれているため、
+        実際のcontrol_rateとの比で換算し直す。起動時に換算前後の値をログする。
+        max(1, ...)は、将来control_rateを大きく下げた場合に閾値が0(=即発火)へ
+        潰れる事故を防ぐガード(Geminiレビュー指摘)。"""
+        # 2026-07-31: self._mpc_cfg.control_rateではなくself._cfg.mpc.control_rate
+        #   (生の解析済み設定値、__init__時点から常に利用可能)を参照する。
+        #   osqp_shadow_cyclesはcreate_mpc()内(self._mpc_cfg代入より前)で読まれるため、
+        #   self._mpc_cfgに依存すると初期化順序でAttributeErrorになる。両者は同一値。
+        control_rate = self._cfg.mpc.control_rate  # type: ignore
+        scaled = max(1, round(
+            cycles_at_ref * control_rate / self._RATE_SCALE_REFERENCE_HZ))
+        self.get_logger().info(
+            f"[RATE-SCALE] {name}: {cycles_at_ref}周期@{self._RATE_SCALE_REFERENCE_HZ:.0f}Hz "
+            f"({cycles_at_ref / self._RATE_SCALE_REFERENCE_HZ:.3f}s) "
+            f"-> {scaled}周期@{control_rate:.0f}Hz")
+        return scaled
+
+    def _rate_scaled_gain(self, name: str, gain_at_ref: float) -> float:
+        """2026-07-31追加(254節続報): EMA/ローパスゲインをcontrol_rateに合わせて
+        指数換算する(カテゴリB用)。離散一次遅れの時定数を保つ式
+        (1-(1-gain)^(ref_rate/rate))を使う(単純な線形換算(gain×ref_rate/rate)
+        では時定数がずれるため不可)。"""
+        # 2026-07-31: _rate_scaled_cyclesと同じ理由でself._cfg.mpc.control_rateを参照する。
+        control_rate = self._cfg.mpc.control_rate  # type: ignore
+        scaled = 1.0 - (1.0 - gain_at_ref) ** (
+            self._RATE_SCALE_REFERENCE_HZ / control_rate)
+        self.get_logger().info(
+            f"[RATE-SCALE] {name}: gain={gain_at_ref:.4f}@{self._RATE_SCALE_REFERENCE_HZ:.0f}Hz "
+            f"-> {scaled:.4f}@{control_rate:.0f}Hz")
+        return scaled
+
+    def _warn_if_dynamic_gain_param_unscaled(self, name: str) -> None:
+        """2026-07-31追加(255節続報、レートスケーリングのクローズ作業):
+        accel_low_pass_gain/steer_low_pass_gainはros2 param set経由の動的変更
+        (param_cb)ではレート換算されず、現在のcontrol_rateにおける生値として
+        そのまま適用される(config.yaml経由の起動時読み込みのみ_rate_scaled_gain
+        で40Hz基準からcontrol_rateへ自動換算される)。control_rateが40Hzのままの
+        間は両者の値の意味が一致するため実害はないが、72Hzへ切替後に運用者が
+        この換算差に気づかず調整すると意図と異なる時定数になりうるため、
+        control_rateが基準周期と異なる場合のみ1回警告する(換算はしない、
+        生値適用のまま)。"""
+        control_rate = self._cfg.mpc.control_rate  # type: ignore
+        if control_rate != self._RATE_SCALE_REFERENCE_HZ:
+            self.get_logger().warn(
+                f"[RATE-SCALE] {name}はros2 param set経由のため換算されず、"
+                f"現在レート({control_rate:.0f}Hz)における生値としてそのまま適用されます。"
+                f"config.yaml経由の値(40Hz基準・自動換算)とは意味が異なります。")
 
     def _initialize(self) -> None:
         def create_map() -> Map:
@@ -439,7 +536,10 @@ class MPCController(Node):
                     cfg_ref_path.resolution,
                     cfg_ref_path.smoothing_distance,
                     cfg_ref_path.max_width,
-                    cfg_ref_path.circular)
+                    cfg_ref_path.circular,
+                    bool(getattr(cfg_ref_path, "use_savgol_kappa", False)),
+                    int(getattr(cfg_ref_path, "savgol_window_length", 7)),
+                    int(getattr(cfg_ref_path, "savgol_polyorder", 2)))
 
             else:
                 print("Using waypoints to create reference path")
@@ -452,7 +552,10 @@ class MPCController(Node):
                     cfg_ref_path.resolution,
                     cfg_ref_path.smoothing_distance,
                     cfg_ref_path.max_width,
-                    cfg_ref_path.circular)
+                    cfg_ref_path.circular,
+                    bool(getattr(cfg_ref_path, "use_savgol_kappa", False)),
+                    int(getattr(cfg_ref_path, "savgol_window_length", 7)),
+                    int(getattr(cfg_ref_path, "savgol_polyorder", 2)))
 
 
         def create_obstacles() -> List[Obstacle]:
@@ -474,7 +577,13 @@ class MPCController(Node):
                 ref_path,
                 cfg_model.length,
                 cfg_model.width,
-                1.0 / self._cfg.mpc.control_rate) # type: ignore
+                1.0 / self._cfg.mpc.control_rate, # type: ignore
+                use_curvature_bias_correction=bool(
+                    getattr(cfg_model, "use_curvature_bias_correction", False)),
+                curvature_bias_slope=float(
+                    getattr(cfg_model, "curvature_bias_slope", 0.772)),
+                curvature_bias_intercept=float(
+                    getattr(cfg_model, "curvature_bias_intercept", 0.016)))
 
         def create_mpc(car: BicycleModel) -> Tuple[MPCConfig, MPC]:
             cfg_mpc = self._cfg.mpc # type: ignore
@@ -492,11 +601,12 @@ class MPCController(Node):
                 cfg_mpc.steer_rate_max,
                 cfg_mpc.control_rate,
                 cfg_mpc.steering_tire_angle_gain_var,
-                cfg_mpc.accel_low_pass_gain,
-                cfg_mpc.steer_low_pass_gain,
+                self._rate_scaled_gain("accel_low_pass_gain", cfg_mpc.accel_low_pass_gain),
+                self._rate_scaled_gain("steer_low_pass_gain", cfg_mpc.steer_low_pass_gain),
                 cfg_mpc.wp_id_offset,
                 cfg_mpc.use_max_kappa_pred,
-                float(getattr(cfg_mpc, "debug_extra_actuator_delay_s", 0.0)))
+                float(getattr(cfg_mpc, "debug_extra_actuator_delay_s", 0.0)),
+                bool(getattr(cfg_mpc, "enable_diag_log", True)))
 
             state_constraints = {
                 "xmin": np.array([-np.inf, -np.inf, -np.inf, -np.inf]),
@@ -525,7 +635,8 @@ class MPCController(Node):
                 mpc_cfg.use_max_kappa_pred,
                 r_drate=float(getattr(cfg_mpc, "r_drate", 0.0)),
                 use_osqp_update=bool(getattr(cfg_mpc, "use_osqp_update", True)),
-                shadow_cycles=int(getattr(cfg_mpc, "osqp_shadow_cycles", 50)))
+                shadow_cycles=self._rate_scaled_cycles(
+                    "osqp_shadow_cycles", int(getattr(cfg_mpc, "osqp_shadow_cycles", 50))))
 
             return mpc_cfg, mpc
 
@@ -548,8 +659,17 @@ class MPCController(Node):
             / float(self._cfg.mpc.control_rate))  # type: ignore
         self._map = create_map()
         self._reference_path = create_ref_path(self._map)
+        # 215節続報2(AXIS08、原因2 Task3相当): 切替忘れ防止のため起動時に必ずログ出力する。
+        # (use_c2_spline_kappaの同様のログは217節の削除で不要になった)
+        self.get_logger().warn(
+            f"[CONFIG] use_savgol_kappa: "
+            f"{'TRUE (window=' + str(self._reference_path.savgol_window_length) + ' polyorder=' + str(self._reference_path.savgol_polyorder) + ')' if self._reference_path.use_savgol_kappa else 'FALSE'}")
         self._reference_path.corridor_widen_step_m = self._corridor_widen_step_m
         self._car = create_car(self._reference_path)
+        # 220節続報(AXIS07 State Sanitizer): 切替忘れ防止のため起動時に必ずログ出力する。
+        self.get_logger().warn(
+            f"[CONFIG] use_curvature_bias_correction: "
+            f"{'TRUE (slope=' + str(self._car.curvature_bias_slope) + ' intercept=' + str(self._car.curvature_bias_intercept) + ')' if self._car.use_curvature_bias_correction else 'FALSE'}")
         self._mpc_cfg, self._mpc = create_mpc(self._car)
         # 曲率エンベロープ(2026-07-04): ヘアピン(s≈72 R=6m / s≈169 R=8m)で毎周壁接触した対策。
         #   ref_vel適用(毎周期)が v_ref を区間スカラでフラット上書きするため曲率減速が皆無だった。
@@ -582,7 +702,9 @@ class MPCController(Node):
         self._r_delta_swing_kappa_lo = float(getattr(self._cfg.mpc, "r_delta_swing_kappa_lo", 0.12))  # type: ignore
         self._r_delta_swing_kappa_hi = float(getattr(self._cfg.mpc, "r_delta_swing_kappa_hi", 0.30))  # type: ignore
         self._r_delta_swing_lookahead_wp = int(getattr(self._cfg.mpc, "r_delta_swing_lookahead_wp", 16))  # type: ignore
-        self._r_delta_swing_ema_beta = float(getattr(self._cfg.mpc, "r_delta_swing_ema_beta", 0.15))  # type: ignore
+        self._r_delta_swing_ema_beta = self._rate_scaled_gain(
+            "r_delta_swing_ema_beta",
+            float(getattr(self._cfg.mpc, "r_delta_swing_ema_beta", 0.15)))  # type: ignore
         self._r_delta_swing_ema = None  # 現在のEMA値(初回呼び出しで生値から初期化)
         self._r_delta_applied_value = None  # 直近update_Rに実際に反映したR[delta]値(未適用ならNone)
         self._r_delta_swing_update_count = 0  # [R-DELTA-SWING]検証: 実際にupdate_Rを呼んだ回数
@@ -614,7 +736,8 @@ class MPCController(Node):
                 self._pit_raw_x, self._pit_raw_y = self._load_densified_pit_points()
                 self._pit_enter_dist = float(getattr(_pit, "enter_dist", 5.0))
                 self._pit_course_in_dist = float(getattr(_pit, "course_in_dist", 3.0))
-                self._pit_course_in_count = int(getattr(_pit, "course_in_count", 5))
+                self._pit_course_in_count = self._rate_scaled_cycles(
+                    "course_in_count", int(getattr(_pit, "course_in_count", 5)))
                 self._pit_v_max = kmh_to_m_per_sec(float(getattr(_pit, "v_max_pit_kmh", 5.0)))
                 self._pit_q_ey = float(getattr(_pit, "q_ey_pit", 5000000.0))
                 self._pit_safety_margin = float(getattr(_pit, "safety_margin_pit", 0.9))
@@ -730,8 +853,10 @@ class MPCController(Node):
             self._opp_min_closing = float(_otget("opp_min_closing", 0.7))   # [m/s] エンゲージ閾値(ヒステリシス上側)
             # Fix-1: OVERTAKINGコミット(入りにくく・出にくく)
             self._opp_giveup_closing = float(_otget("opp_giveup_closing", 0.2))  # [m/s] これ未満連続で断念
-            self._ot_giveup_cycles = int(_otget("giveup_cycles", 40))       # [周期] 断念に要する連続数(≈1s)
-            self._ot_engage_debounce = int(_otget("engage_debounce", 8))    # [周期] エンゲージに要するworth連続数(≈0.2s)
+            self._ot_giveup_cycles = self._rate_scaled_cycles(
+                "giveup_cycles", int(_otget("giveup_cycles", 40)))       # [周期] 断念に要する連続数(≈1s)
+            self._ot_engage_debounce = self._rate_scaled_cycles(
+                "engage_debounce", int(_otget("engage_debounce", 8)))    # [周期] エンゲージに要するworth連続数(≈0.2s)
             self._ot_engage_lat_max = float(_otget("engage_lat_max", 2.0))  # [m] H2: 進路上(|lat|≤)の相手のみエンゲージ
             self._engage_ego_margin = float(_otget("engage_ego_margin", 0.3)) # [m/s] 段階1: 自分が相手より遅すぎない事
             self._ot_engage_max_dist = float(_otget("engage_max_dist", 6.0))   # [m] 近接ゲート: 前車がこの距離以内でのみエンゲージ
@@ -740,8 +865,10 @@ class MPCController(Node):
             #   自体にもこのEMAを使っていたが、2026-07-12にLAT-TTCのC2分岐へ一本化し
             #   giveup用のEMA(_ot_side_block_ema)は2026-07-17に削除した。alongレーン幅の
             #   平滑化(_along_lane_ema)は今も同じ時定数を使うため、本パラメータ自体は残す。
-            self._ot_ema_alpha = float(_otget("ema_alpha", 0.05))  # EMA時定数(≈1秒@40Hz)
-            self._ot_engage_cooldown_cycles = int(_otget("engage_cooldown", 80))  # [周期] 失敗離脱後の再エンゲージ抑制
+            self._ot_ema_alpha = self._rate_scaled_gain(
+                "ema_alpha", float(_otget("ema_alpha", 0.05)))  # EMA時定数(≈1秒@40Hz)
+            self._ot_engage_cooldown_cycles = self._rate_scaled_cycles(
+                "engage_cooldown", int(_otget("engage_cooldown", 80)))  # [周期] 失敗離脱後の再エンゲージ抑制
             self._ot_engage_cooldown = 0
             # 2026-07-21追加(148節②、実測に基づく再設計): 0721-01以降のローカルログ実測
             # (giveup後のfwd_dlat推移をwaypoint単位で追跡)で、footprint_risk起因のgiveup
@@ -760,13 +887,17 @@ class MPCController(Node):
             self._ot_pass_block_kappa = float(_otget("pass_block_kappa", 0.10))   # [1/m] 内側可否判定のきついコーナー閾値(R≤10m)
             self._ot_pass_clear = float(_otget("pass_clear", 3.0))                # [m] 「抜き切り」= 相手の前にこれだけ出る
             self._ot_pass_t_max = float(_otget("pass_t_max", 8.0))                # [s] パス所要時間の予算(超過=追従の方が速い)
-            self._def_enter_cycles = int(_otget("def_enter_cycles", 5))           # [周期] 被追い越しON確定(≈0.12s連続)
-            self._def_exit_cycles = int(_otget("def_exit_cycles", 15))            # [周期] 被追い越しOFF確定(≈0.38s連続)
+            self._def_enter_cycles = self._rate_scaled_cycles(
+                "def_enter_cycles", int(_otget("def_enter_cycles", 5)))           # [周期] 被追い越しON確定(≈0.12s連続)
+            self._def_exit_cycles = self._rate_scaled_cycles(
+                "def_exit_cycles", int(_otget("def_exit_cycles", 15)))            # [周期] 被追い越しOFF確定(≈0.38s連続)
             self._def_on_count = 0
             self._def_off_count = 0
             self._def_active = False
-            self._unlock_after = int(_otget("unlock_inf_cycles", 80))             # [周期] H4-lite発動: inf連続がこれ以上かつ停止
-            self._unlock_hold = int(_otget("unlock_hold_cycles", 60))             # [周期] H4-lite保持時間(≈1.5s)
+            self._unlock_after = self._rate_scaled_cycles(
+                "unlock_inf_cycles", int(_otget("unlock_inf_cycles", 80)))             # [周期] H4-lite発動: inf連続がこれ以上かつ停止
+            self._unlock_hold = self._rate_scaled_cycles(
+                "unlock_hold_cycles", int(_otget("unlock_hold_cycles", 60)))             # [周期] H4-lite保持時間(≈1.5s)
             self._unlock_left = 0
             self._ot_giveup_count = 0
             self._ot_worth_count = 0
@@ -882,7 +1013,7 @@ class MPCController(Node):
                 except AttributeError:
                     return default
             self._lat_ttc = LateralTTCMonitor(
-                beta=float(_lget("beta", 0.15)),
+                beta=self._rate_scaled_gain("beta(LAT-TTC)", float(_lget("beta", 0.15))),
                 # 2026-07-12追加: 生spaceの事前平滑化。既存のema_alpha(既定0.05、
                 #   along_lane_emaと共通)を再利用し、新規チューニング値を増やさない。
                 space_ema_alpha=float(_lget("space_ema_alpha", self._ot_ema_alpha)),
@@ -906,7 +1037,8 @@ class MPCController(Node):
                     _lget("side_by_side_dlat_release_m", self._clear_lat_release)),
                 side_by_side_ds_m=float(_lget("side_by_side_ds_m", self._clear_ds_beside)),
                 caution_speed_margin_kmh=float(_lget("caution_speed_margin_kmh", 2.0)),
-                min_trend_cycles=int(_lget("min_trend_cycles", 3)),
+                min_trend_cycles=self._rate_scaled_cycles(
+                    "min_trend_cycles", int(_lget("min_trend_cycles", 3))),
                 # 2026-07-13追加: 真横到達(_ot_cleared)後の緩和閾値。既存along_min_width
                 # (カート幅未満の物理下限)を再利用し、新規チューニング値を増やさない。
                 cleared_space_m=float(_lget("cleared_space_m", self._along_min_width)),
@@ -950,7 +1082,8 @@ class MPCController(Node):
             self._on_path_false_start_dlat = None
             # (v_min は統一ICC化でクリープ(v_creep)+ハード停止に置換済み・不読)
             self._ot_infeasible_stop = int(_otget("infeasible_stop", 5))   # MPCがこの回数連続infeasibleで安全STOPへ
-            self._ot_infeasible_latch_cycles = int(_otget("infeasible_latch", 40))  # 安全STOP後、再挑戦を抑制する周期数
+            self._ot_infeasible_latch_cycles = self._rate_scaled_cycles(
+                "infeasible_latch", int(_otget("infeasible_latch", 40)))  # 安全STOP後、再挑戦を抑制する周期数
             self._ot_infeasible_latch = 0  # >0 の間は OVERTAKING を禁止（オシレーション防止）
 
             # --- スタック検知バック(2026-07-09) ---
@@ -968,11 +1101,15 @@ class MPCController(Node):
             self._stuck_startup_grace_s = float(_stkget("startup_grace_s", 10.0))  # [s] 起動直後は判定しない
             self._stuck_u0_thr = float(_stkget("u0_thr", 2.0))         # [m/s] 指令速度がこれ以上
             self._stuck_v_thr = float(_stkget("v_thr", 0.3))           # [m/s] 実速度がこれ未満
-            self._stuck_hold_cycles = int(_stkget("hold_cycles", 120))  # [周期] 継続でスタック判定(≈3s@40Hz)
-            self._ghost_block_hold_cycles = int(_stkget("ghost_block_hold_cycles", 40))  # [周期] GHOST-BLOCK早期ログ(≈1s@40Hz、経路1本発動より早い)
+            self._stuck_hold_cycles = self._rate_scaled_cycles(
+                "hold_cycles", int(_stkget("hold_cycles", 120)))  # [周期] 継続でスタック判定(≈3s@40Hz)
+            self._ghost_block_hold_cycles = self._rate_scaled_cycles(
+                "ghost_block_hold_cycles", int(_stkget("ghost_block_hold_cycles", 40)))  # [周期] GHOST-BLOCK早期ログ(≈1s@40Hz、経路1本発動より早い)
             self._ghost_block_logged = False  # 現在のepisode内で[GHOST-BLOCK]を出力済みか(_stuck_count==0でリセット)
-            self._stuck_infeas_thr = int(_stkget("infeas_thr", 300))  # [周期] H4-liteに猶予を与えた上でこれ以上連続infeasibleなら即発動(≈7.5s@40Hz)
-            self._stuck_gear_settle_cycles = int(_stkget("gear_settle_cycles", 20))  # [周期] ギア確定待ち(≈0.5s)
+            self._stuck_infeas_thr = self._rate_scaled_cycles(
+                "infeas_thr", int(_stkget("infeas_thr", 300)))  # [周期] H4-liteに猶予を与えた上でこれ以上連続infeasibleなら即発動(≈7.5s@40Hz)
+            self._stuck_gear_settle_cycles = self._rate_scaled_cycles(
+                "gear_settle_cycles", int(_stkget("gear_settle_cycles", 20)))  # [周期] ギア確定待ち(≈0.5s)
             self._stuck_backup_dist = float(_stkget("backup_dist", 2.0))  # [m] 後退距離
             self._stuck_backup_speed = float(_stkget("backup_speed", -3.0))  # [m/s] サンプル準拠
             self._stuck_backup_accel = float(_stkget("backup_accel", 1.5))   # [m/s^2] サンプル準拠
@@ -982,7 +1119,8 @@ class MPCController(Node):
             #   実測: 予選0710-02で363秒間完全停止・0周(相手2台による封鎖、K対策の窓内他車
             #   チェックが両側とも正しく拒否し続けた結果、既存の経路1/2はどちらも構造上発動しない)。
             self._stuck_stall_v_thr = float(_stkget("stall_v_thr", 0.1))    # [m/s] 「まったく動かない」判定
-            self._stuck_stall_hold_cycles = int(_stkget("stall_hold_cycles", 400))  # [周期] ≈10s@40Hz
+            self._stuck_stall_hold_cycles = self._rate_scaled_cycles(
+                "stall_hold_cycles", int(_stkget("stall_hold_cycles", 400)))  # [周期] ≈10s@40Hz
             self._stuck_push_dist = float(_stkget("push_dist", 2.0))        # [m] 前進突入の目標距離
             self._stuck_push_speed = float(_stkget("push_speed", 3.0))      # [m/s] 前進突入の速度指令
             self._stuck_push_accel = float(_stkget("push_accel", 1.5))      # [m/s^2] backup_accel流用
@@ -1082,6 +1220,7 @@ class MPCController(Node):
             self._stuck_backup_first_timeout_time = None  # BACKUPウォッチドッグ初回発火時刻(リトライ予算の起点)
             self._stuck_backup_budget_exhausted_logged = False
             self._stuck_backup_zero_v_since = None  # 実速度が閾値未満になった開始時刻(後退不能検知用、2026-07-14追加)
+            self._stuck_backup_v_prev = None  # 252節追加(2026-07-31): 前周期の実速度(1周期急減速=衝突疑い検知用)
             self._stuck_trigger_path = None  # 1=u0/v, 2=infeasibility, 3=完全停止(→PUSH分岐)
             self._stuck_stall_first_trigger_time = None  # 経路3の初回発火時刻(リトライ予算の起点)
             self._stuck_stall_budget_exhausted_logged = False
@@ -1089,6 +1228,7 @@ class MPCController(Node):
             self._stuck_push_start_time = None  # PUSH開始時刻(タイムアウト判定用)
             self._stuck_push_log_count = 0      # [STUCK-PUSH]ログの間引き用
             self._stuck_push_steer = 0.0        # PUSH開始時に1回だけ決める操舵角[rad](148節②)
+            self._stuck_push_v_prev = None      # 252節追加(2026-07-31): 前周期の実速度(1周期急減速=衝突疑い検知用)
             # 自動衝突検知(2026-07-10追加): 予選環境のbagにcondition系トピックがなく、
             #   0710-03の壁衝突も既存の/aichallenge/pitstop/condition経由の検知
             #   (ピット専用の別目的ヒューリスティック)では捕捉できなかった(手動でbagの
@@ -1099,8 +1239,17 @@ class MPCController(Node):
             self._collision_check_v_prev = None
             # 累積版(2026-07-11追加): 低速域での接触が複数周期に分散するケースを拾う。
             self._collision_suspect_cum_dv = float(_stkget("collision_suspect_cum_dv", 1.0))  # [m/s] 窓内最大値からの下落閾値
-            self._collision_cum_window_cycles = int(_stkget("collision_cum_window_cycles", 5))  # [周期] 監視窓幅
+            self._collision_cum_window_cycles = self._rate_scaled_cycles(
+                "collision_cum_window_cycles",
+                int(_stkget("collision_cum_window_cycles", 5)))  # [周期] 監視窓幅
             self._collision_v_window = deque(maxlen=self._collision_cum_window_cycles)
+            # 252節追加(2026-07-31): 0730_06実測(v: -1.38->-0.64、drop=0.74m/sで単発閾値
+            #   0.8m/s未満)で、2〜3周期にわたる緩やかな減速は単発の急落検知だけでは
+            #   捕捉できないと判明。上記の正面衝突検知が持つ累積版(collision_suspect_cum_dv/
+            #   collision_cum_window_cycles、新規パラメータ0個)と全く同じ考え方を
+            #   BACKUP/PUSHにも適用する。
+            self._stuck_backup_v_window = deque(maxlen=self._collision_cum_window_cycles)
+            self._stuck_push_v_window = deque(maxlen=self._collision_cum_window_cycles)
             self._gear_report = GearReport()  # 初期値(report=0)
             # --- 方式B: 空き側へ e_y 目標をオフセット（発進時ランプ付き）---
             self._ot_d_off = float(_otget("d_off", 1.8))           # [m] 参照ラインからの寄せ量
@@ -1607,6 +1756,27 @@ class MPCController(Node):
         #   room_exhausted計数・凍結オフセットも持ち越さない(次の側選択と無関係な値)。
         self._ot_room_exhausted_count = 0
         self._ot_last_valid_target_mag = None
+        self._reset_ot_offset_state()
+
+    def _reset_ot_offset_state(self) -> None:
+        """230節続報(2026-07-29)追加: OVERTAKING/STOPPING能動バイアスから離脱する
+        全ての経路で共通して呼ぶ、横オフセット関連状態のリセット専用ヘルパー。
+
+        背景: self._mpc.lateral_target(横オフセット目標)とself._ot_alpha(0..1の
+        ブレンド係数)は、OVERTAKINGへ入る際(5158/5179行目付近)にのみ書き込まれ、
+        離脱側の3箇所(giveup系4935行目・通常exit_clear5033行目・infeasibility強制
+        5053行目、いずれも_ot_side/_ot_side_locked/_ot_giveup_count等は個別に
+        リセット済み)はこの2つに触れていなかった。結果、離脱後もself._ot_alphaが
+        既存の_ot_ramp_time(2.5秒)ランプで緩やかにしか0へ減衰しないため、最大2.5秒間
+        「もう無効なはずの横オフセット目標」を保持し続ける。実ログ(0728-04 wp243)で、
+        この残存オフセットがinfeasibility強制STOPPING直後も次周期のQP解に影響し、
+        infeasibility_counterが17→124まで拡大し続ける一因であることを確認した。
+        側フリップ(4778行目)・側変更を伴う再エンゲージ(5024行目)は既に_ot_alphaのみ
+        即時リセットする前例があり、本ヘルパーはその適用範囲をOVERTAKING離脱全般へ
+        一般化したもの(特定地点への対処ではない、新規状態変数0個)。"""
+        self._ot_alpha = 0.0
+        self._mpc.lateral_target = 0.0
+        self._mpc.lateral_blend = 0.0
 
     def _stuck_update_shuffle_cycle(self, now, pose) -> None:
         """184節追加(2026-07-26): 新規STUCK検知(WAIT_REVERSE突入)が、直前の
@@ -1632,6 +1802,23 @@ class MPCController(Node):
         #   新規エピソードなので、シャッフル上限への到達回数・操舵反転状態も仕切り直す。
         self._stuck_giveup_streak = 0
         self._stuck_push_side_flip = False
+
+    def _stuck_enter_wait_reverse(self, now, pose) -> None:
+        """230節続報2(2026-07-29)追加: STUCK検知(経路1/2/3いずれか)からWAIT_REVERSEへ
+        突入する際の共通後処理。従来は経路1/2用・経路3用の2箇所で全く同じ7行
+        (_stuck_update_shuffle_cycle呼び出し+_stuck_state/_stuck_count/
+        _stuck_stall_count/_stuck_gear_wait_count/_ghost_block_loggedのリセット+
+        _handle_stuck_recovery呼び出し)が手作業で複製されており、ログメッセージ
+        (path=1/2 vs path=3で文言が異なる)のみが呼び出し元固有だった。呼び出し元は
+        本ヘルパー呼び出し後に直ちにreturnするため、returnはこのヘルパーに含めない
+        (制御フローの分岐点は呼び出し元に残す)。"""
+        self._stuck_update_shuffle_cycle(now, pose)  # 184節追加
+        self._stuck_state = "WAIT_REVERSE"
+        self._stuck_count = 0
+        self._stuck_stall_count = 0
+        self._stuck_gear_wait_count = 0
+        self._ghost_block_logged = False
+        self._handle_stuck_recovery(now, pose)
 
     def _stuck_recovery_complete(self, reset_backup_state: bool, reset_corridor: bool,
                                   now=None, pose=None) -> None:
@@ -1879,6 +2066,8 @@ class MPCController(Node):
                 self._stuck_gear_wait_count = 0
                 self._stuck_backup_log_count = 0
                 self._stuck_backup_zero_v_since = None  # 2026-07-14追加: 後退不能検知を仕切り直す
+                self._stuck_backup_v_prev = None  # 252節追加(2026-07-31): 衝突疑い検知を仕切り直す
+                self._stuck_backup_v_window.clear()  # 252節追加: 累積衝突疑い検知の窓も仕切り直す
                 # 184節追加(2026-07-26): 後退距離を、後方の相手車から見た安全マージンで
                 #   キャップする(壁リカバリーoff化(183節)により、単純な直進バックでは
                 #   同じ壁へ再突入しやすくなったための対処。壁自体の湾曲はbackup_dist
@@ -1928,6 +2117,36 @@ class MPCController(Node):
                     _target_ey_now, _gap_wp_psi_now, _cur_ey_now, pose.theta, reverse=True)
             else:
                 _backup_steer = 0.0
+            # 252節追加(2026-07-31、ユーザー指摘: 後退時に壁へ衝突した後も後退を継続し
+            #   ロスが発生する事例を実測で確認): 1周期での速度の大きさ(絶対値)の急減を、
+            #   既存の衝突検知(collision_suspect_dv、正面衝突用に既にチューニング済みの
+            #   閾値、新規パラメータ0個)を再利用して検知する。後退開始直後(速度がまだ
+            #   立ち上がっていない周期)の誤検知を避けるため、直前速度が後退不能閾値
+            #   (blocked_v_thr)を明確に上回っていた(=実際に動けていた)場合のみ判定
+            #   対象とする。検知したら下記「後退不能検知」の1.5秒継続確認を待たず、
+            #   同じ合流先(ブロック処理)へ即座に合流する(新しい状態遷移パスは追加しない)。
+            _stuck_backup_impact = (
+                self._stuck_backup_v_prev is not None
+                and abs(self._stuck_backup_v_prev) > self._stuck_backup_blocked_v_thr
+                and (abs(self._stuck_backup_v_prev) - abs(_v_now)) >= self._collision_suspect_dv)
+            if _stuck_backup_impact:
+                self.get_logger().warn(
+                    f"[STUCK-BACKUP-IMPACT] v drop {self._stuck_backup_v_prev:.2f}"
+                    f"->{_v_now:.2f} m/s in 1 cycle dist={dist:.2f}")
+            self._stuck_backup_v_prev = _v_now
+            # 252節追加: 単発急落(上記)では捕捉できない、2〜3周期に分散した緩やかな
+            #   減速(0730_06実測)を、正面衝突検知の累積版と同一の考え方
+            #   (窓内最大値からの下落幅)で補足検知する。
+            self._stuck_backup_v_window.append(abs(_v_now))
+            if (not _stuck_backup_impact
+                    and len(self._stuck_backup_v_window) == self._stuck_backup_v_window.maxlen):
+                _backup_cum_drop = max(self._stuck_backup_v_window) - abs(_v_now)
+                if _backup_cum_drop >= self._collision_suspect_cum_dv:
+                    _stuck_backup_impact = True
+                    self.get_logger().warn(
+                        f"[STUCK-BACKUP-IMPACT-CUM] v drop {_backup_cum_drop:.2f} m/s over "
+                        f"{self._stuck_backup_v_window.maxlen} cycles dist={dist:.2f} "
+                        f"(window={list(self._stuck_backup_v_window)})")
             # 後退不能検知(2026-07-14追加): 実速度が閾値未満のまま一定時間続くのは、
             #   後退方向に障害物がありそもそも物理的に動けないという直接的な証拠。
             #   0713-05実測で、この状態のまま既存のdist/timeout判定(5秒毎の再試行)を
@@ -1959,7 +2178,7 @@ class MPCController(Node):
                 self._stuck_backup_zero_v_since = None
                 u = [0.0, 0.0]
                 acc = self._stuck_hold_accel
-            elif _zero_v_elapsed >= self._stuck_backup_blocked_confirm_s:
+            elif _zero_v_elapsed >= self._stuck_backup_blocked_confirm_s or _stuck_backup_impact:
                 # 2026-07-26変更(184節、ユーザー提案「縦列駐車から抜け出すように、
                 #   短い後退→隙間への微調整前進を繰り返す」): 後方がほぼ塞がっていて
                 #   ごく僅かしか後退できない状況は、壁リカバリーoff化(183節)後は
@@ -1969,11 +2188,17 @@ class MPCController(Node):
                 #   カウントし、STUCK再検知箇所(_handle_stuck_recovery呼び出し元)で
                 #   インクリメントする)。上限到達後は従来通りNORMALへ委譲する
                 #   (無限ループ回避の安全側バックストップ)。
+                # 252節追加: _stuck_backup_impact(1周期急減速)による合流時は
+                #   _zero_v_elapsedが0.0のままのことがある(急減速直後はまだ
+                #   blocked_v_thrを下回っていない場合があるため)。ログの
+                #   トリガー種別を明示し、誤解を避ける。
+                _trigger_reason = "impact" if _stuck_backup_impact else "sustained_zero_v"
                 if self._stuck_shuffle_cycle < self._stuck_shuffle_max_cycles:
                     _next = "WAIT_DRIVE_PUSH"
                     self.get_logger().warn(
                         f"[STUCK-BACKUP-BLOCKED-SHUFFLE] 後退方向がほぼ塞がっている"
-                        f"(実速度{_v_now:.3f}m/sが{_zero_v_elapsed:.1f}s継続、dist={dist:.2f}m) "
+                        f"(reason={_trigger_reason} "
+                        f"実速度{_v_now:.3f}m/sが{_zero_v_elapsed:.1f}s継続、dist={dist:.2f}m) "
                         f"cycle={self._stuck_shuffle_cycle}/{self._stuck_shuffle_max_cycles} -> {_next}")
                     self._stuck_state = _next
                     self._stuck_gear_wait_count = 0
@@ -2067,6 +2292,8 @@ class MPCController(Node):
                 self._stuck_push_start = (pose.x, pose.y)
                 self._stuck_push_start_time = now
                 self._stuck_push_log_count = 0
+                self._stuck_push_v_prev = None  # 252節追加(2026-07-31): 衝突疑い検知を仕切り直す
+                self._stuck_push_v_window.clear()  # 252節追加: 累積衝突疑い検知の窓も仕切り直す
                 # 2026-07-21追加(148節②): PUSH開始時に1回だけ操舵角を決める(_ot_side/
                 #   _plan_passと同じ判断基準を参照、詳細は_compute_stuck_push_steer参照)。
                 self._stuck_push_steer = self._compute_stuck_push_steer(pose)
@@ -2106,6 +2333,32 @@ class MPCController(Node):
                     f"[STUCK-PUSH] x={pose.x:.2f} y={pose.y:.2f} v={v_now:.2f} "
                     f"dist={dist:.2f} elapsed={elapsed:.1f} opp[{_opp_str}]")
             self._stuck_push_log_count += 1
+            # 252節追加(2026-07-31、水平展開: BACKUP側と同じ「1周期急減速=衝突疑い」
+            #   検知をPUSH(前進での回避走行)にも適用する。PUSHにはBACKUPの
+            #   「後退不能検知」(1.5秒継続確認)に相当する早期離脱機構が元々無く、
+            #   push_timeout_s(短縮後も2.5秒)まで無反応に前進し続ける盲点だった。
+            #   検知したらPUSHを即座に終了しNORMALへ委譲する(BACKUPのような
+            #   シャッフル再試行機構は無いため、単純に既存のPUSH終了経路へ合流する)。
+            _stuck_push_impact = (
+                self._stuck_push_v_prev is not None
+                and abs(self._stuck_push_v_prev) > self._stuck_backup_blocked_v_thr
+                and (abs(self._stuck_push_v_prev) - abs(v_now)) >= self._collision_suspect_dv)
+            if _stuck_push_impact:
+                self.get_logger().warn(
+                    f"[STUCK-PUSH-IMPACT] v drop {self._stuck_push_v_prev:.2f}"
+                    f"->{v_now:.2f} m/s in 1 cycle dist={dist:.2f}")
+            self._stuck_push_v_prev = v_now
+            # 252節追加: BACKUP側と同じ累積版(2〜3周期に分散した緩やかな減速の補足検知)。
+            self._stuck_push_v_window.append(abs(v_now))
+            if (not _stuck_push_impact
+                    and len(self._stuck_push_v_window) == self._stuck_push_v_window.maxlen):
+                _push_cum_drop = max(self._stuck_push_v_window) - abs(v_now)
+                if _push_cum_drop >= self._collision_suspect_cum_dv:
+                    _stuck_push_impact = True
+                    self.get_logger().warn(
+                        f"[STUCK-PUSH-IMPACT-CUM] v drop {_push_cum_drop:.2f} m/s over "
+                        f"{self._stuck_push_v_window.maxlen} cycles dist={dist:.2f} "
+                        f"(window={list(self._stuck_push_v_window)})")
             # 2026-07-24追加(171節続報、ユーザー指示「回避できたら通常処理に復帰」):
             #   固定距離/タイムアウトだけでなく、実際に選択side方向の先読みコリドー
             #   (_corr_bound_ahead、147/168節で既出)がカート幅超の実マージンまで
@@ -2134,8 +2387,10 @@ class MPCController(Node):
             else:
                 _cleared = (_dist_ok and self._stuck_push_side != 0
                             and self._corr_bound_ahead(self._stuck_push_side) > self._along_min_width)
-            if dist >= self._stuck_push_dist or elapsed >= self._stuck_push_timeout_s or _cleared:
-                _reason = ("cleared" if _cleared
+            if (dist >= self._stuck_push_dist or elapsed >= self._stuck_push_timeout_s
+                    or _cleared or _stuck_push_impact):
+                _reason = ("impact" if _stuck_push_impact
+                           else "cleared" if _cleared
                            else "dist" if dist >= self._stuck_push_dist else "timeout")
                 self.get_logger().warn(
                     f"[STUCK] PUSH終了(reason={_reason} dist={dist:.2f}m elapsed={elapsed:.1f}s) "
@@ -2240,7 +2495,10 @@ class MPCController(Node):
         act_v = np.degrees(np.array([r[1] for r in act_h]))
 
         _lag_lo, _lag_hi = -0.05, 0.4  # [s] 実測遅延(約200ms)を包含する探索範囲
-        _lag_step = 0.01  # [s]
+        # 214節: 軽量化のためstepのみ0.01→0.025へ粗くする(46点→19点、約60%減)。
+        #   範囲自体は維持(188節で実測遅延110msが観測された前例があり、範囲を
+        #   150-250ms等へ狭めると別条件下の実測値を検出できなくなるリスクがあるため)。
+        _lag_step = 0.025  # [s]
         t_lo = cmd_t[0] + _lag_hi
         t_hi = cmd_t[-1] - max(_lag_lo, 0.0)
         mask = (act_t >= t_lo) & (act_t <= t_hi)
@@ -2483,9 +2741,19 @@ class MPCController(Node):
         という物理的に逆転した選択になっていた。0720-2実測(wp330、d2:ds=1.94
         dlat=1.87/d3:ds=-1.98 dlat=2.36)でd3(後方)が誤選択され、本来
         engage_lat_max(2.0)以内で追従できたはずのd2が無視されてSTOPPING-NO-VSAFE
-        (127節)の空白に陥っていたことを確認した。前方(ds>=0)を常に優先し、
+        (127節)の空白に陥っていたことを確認した。当時は前方(ds>=0)を常に優先し、
         前方候補が無い場合のみ後方をゼロに近い順(along_min_length許容窓内での
-        代替)で選ぶ。"""
+        代替)で選ぶ設計にしていた。
+
+        2026-07-31追記(254節): その後方フォールバック自体が、前方が完全に空いて
+        いても後方2m以内の相手にegoが同期して停止し続けるバグ(0731-03 wp243実測、
+        ユーザー確認: 後方車両を追従する必要は無い)の原因と判明したため、
+        呼び出し元(_scan_traffic)の`cars`構築をds>=0限定へ変更した(該当箇所の
+        docstring参照)。これにより本関数へは常にds>=0の値のみが渡される契約となり、
+        以下のds<0分岐は事実上到達不能である。対象車選択の優先度キーという役割は
+        不変のため、また将来cars以外の入力から呼ばれる可能性に備えた安全側の
+        フォールバックとして関数自体はそのまま残す(呼び出し契約が壊れた場合でも
+        後方車を"無限に低優先"として扱い、決して前方車より優先しない)。"""
         return ds if ds >= 0.0 else (1e9 - ds)
 
     def _dlat_closing_trend(self, fwd_dlat: Optional[float], dlat_v_ema: float,
@@ -2572,9 +2840,8 @@ class MPCController(Node):
         [DLAT-TTC-VETO]ログがTTCトレンド起因かfootprint_risk起因かを区別できる
         よう、診断表示専用としてのみ受け取る。"""
         _fwd_vid_worth = opp_sit.fwd_vid
-        if _fwd_vid_worth != self._ot_worth_prev_vid:
+        if self._vid_changed_reset(_fwd_vid_worth, "_ot_worth_prev_vid"):
             self._ot_worth_count = 0
-        self._ot_worth_prev_vid = _fwd_vid_worth
         self._ot_worth_count = self._ot_worth_count + 1 if pass_worth else 0
 
         _on_path = (opp_sit.fwd_dlat is not None
@@ -2713,32 +2980,73 @@ class MPCController(Node):
             engage_dist_dynamic=_engage_dist_dynamic, t_reach_profile=_t_reach_profile,
             gate=_gate)
 
+    def _room_to_wall(self, wp, lat: float, want_left: bool, clamp: bool = True) -> float:
+        """230節続報3(2026-07-29)追加: 「壁位置から相手車の該当側端までの空き幅」を
+        計算する共通式。_scan_traffic・_side_blocked_by_other_car・
+        _opponent_room_ahead・_plan_pass(3箇所)・_control内along_lat処理の
+        計7箇所で、この2行(want_left時: wp.ub-(lat+block_half)、それ以外:
+        (lat-block_half)-wp.lb)が手作業で複製されていた重複調査(230節続報)を受け、
+        共通ヘルパーへ集約した。
+
+        clamp引数は既存の呼び出し元ごとの挙動差を保つために必須: _scan_traffic・
+        _side_blocked_by_other_car・_plan_passの空き幅表示用途はclamp=True
+        (負値を0へ丸め、瞬時の「空きゼロ」として扱う)だったが、
+        _opponent_room_ahead・_plan_passのsteps蓄積・along_lat処理は意図的に
+        clamp=False(負値そのものが「既に食い込んでいる」量として後続のroom_exhausted
+        判定・最小値追跡に使われる)だった。全箇所を機械的にclamp=Trueへ統一すると
+        room_exhausted系の判定が壊れるため、呼び出し元ごとに明示的に指定する。"""
+        val = (float(wp.ub) - (lat + self._ot_block_half) if want_left
+               else (lat - self._ot_block_half) - float(wp.lb))
+        return max(0.0, val) if clamp else val
+
+    def _vid_changed_reset(self, current_vid, prev_attr: str) -> bool:
+        """233節続報(2026-07-29、監査結果④)追加: 「対象車IDが前回と変わった周期は
+        関連状態を仕切り直す」慣用句(_ot_worth_count/_ot_giveup_count/
+        _along_lane_emaの3箇所で、read→比較→prev更新の3行が手作業で複製されて
+        いた)を共通化した。
+
+        リセット対象そのもの(カウンタを0にする/EMAをNoneにする等)はサイトごとに
+        異なる(_along_lane_emaはNone化、他2つは0化)ため、本ヘルパーの責務は
+        「vidが変わったかどうかを判定し、prev_attrを更新する」ことのみに限定し、
+        実際のリセット処理は呼び出し元に残す(_room_to_wallのclamp引数と同様、
+        差異を吸収しようとして機械的に統一すると個々の意味が壊れるため)。"""
+        changed = current_vid != getattr(self, prev_attr)
+        setattr(self, prev_attr, current_vid)
+        return changed
+
     def _scan_traffic(self, v_ego: float, ego_lat: float):
         """統一検知: トラッカー全車(現在位置+平滑速度)を1回だけ走査し、追い越し判断・ICC追従・
         守り(被追い越し)が共有する事実を返す。旧3系統(analyzer=予測円/帯6.9m、context=帯3.9m、
         ACC=帯1.5m)が別々の答えを出していた矛盾を解消(2026-07-03一元化)。
         規約: ds=前+/後-[-L/2,L/2), lat=参照ライン基準+左/-右, dlat=|lat-ego_lat|=自車との実横間隔。
         戻り dict:
-          n_obs: 他車実台数 / cars: 前方(-along_min_length<ds<=max_consider、
-            2026-07-19追加(105節/110節、ds>0の崖対策)、|lat|<=コリドー帯)の
-            [(ds,lat,v_long,dlat)]
-          fwd_ds/lat/vopp/dlat: 最近傍前方車(無ければNone)
+          n_obs: 他車実台数 / cars: 前方(0.0<=ds<=max_consider、|lat|<=コリドー帯)の
+            [(ds,lat,v_long,dlat)]。2026-07-31(254節)からds>=0(真に前方の車のみ)に限定。
+          fwd_ds/lat/vopp/dlat: 最近傍前方車(無ければNone)。carsと同様、常にds>=0(真に前方)。
           left_free/right_free: 前方車群に対する実壁基準の左右空き幅(最小=律速)
           being_overtaken: 横並び/後方から「走っている」車が接近(G1: 停止・低速車では発動しない)
 
-        2026-07-19追加(105節発見→110節で2環境目再確認、ユーザー承認済み設計):
-        前方車判定の下限を厳密な0.0から車両全長分だけ緩和した。静止/低速の相手に
-        ごく至近距離まで詰めた場合、自車の弧長位置がわずかに相手を跨いだ瞬間に
-        fwd_ds=Noneへ落ち、OFFSET-RETURN(3468行目付近)が「通過完了」と誤判定して
-        全開加速する事象(ローカル・予選の2環境で実測確認)への対処。ds<0側でも
-        _g2_speed等の式は(ds-margin_center)がより負に振れるため自然に保守的側へ働き、
-        安全性が緩む経路は無い(横方向の半幅であるself._ot_block_halfではなく、縦方向
-        の量である車両全長を使うのが物理的に正しい、との当時からの設計意図)。
+        2026-07-19追加(105節発見→110節で2環境目再確認)→2026-07-31(254節)で撤回:
+        当初は前方車判定の下限を厳密な0.0から車両全長(along_min_length)分だけ緩和し、
+        自車の弧長位置がわずかに相手を跨いだ瞬間にfwd_ds=Noneへ落ちOFFSET-RETURNが
+        「通過完了」と誤判定して全開加速する事象への対処としていた。しかし2026-07-20
+        (129節続報)で、対象車選択(_ds_priority)に「前方候補が無ければ後方along_min_length
+        以内で代替する」フォールバックが追加されたことで、この負のds許容窓がicc_stop本体
+        (_follow_speed_limit)・n_fwd(_ot_state遷移の起点判定)・NO-VSAFEブリッジの3箇所で
+        意図せず共有されてしまい、「前方が完全に空いているのに、後方2m以内で減速/停止した
+        相手に同期してegoも停止し続ける」という実害(0731-03 wp243実測、design_docs 254節)
+        を引き起こしていた。ユーザー確認: 後方車両を追従する必要は無い。当初懸念していた
+        OFFSET-RETURNのcliff問題は、131-6節で当該消費箇所自身が既に`fwd_ds_now>0.0`を
+        明示チェックする独立した安全策を持っているため、この緩和(along_min_length許容窓)
+        が無くても再発しないことを確認した上で撤回し、cars/fwd_dsをds>=0限定に戻した
+        (④遡及効果: 129節のフォールバック分岐自体は_ds_priority関数内に残すが、carsが
+        ds>=0のみになったことで到達不能になる、以下_ds_priority docstring参照)。
         2026-07-20修正(128節続報): 実装は自転車モデルのホイールベース
         (self._mpc.model.length=1.087、spatial_bicycle_models.py既存の運動学
         パラメータ)を誤って「全長」として使っていた(公式車両仕様全長200cmとの
         乖離を128節で発見)。footprint_risk用に新設した公式全長ベースのalong_min_length
-        (2.00)へ置き換え、コメントが述べる本来の設計意図(車両全長)と実装を一致させる。"""
+        (2.00)へ置き換え、コメントが述べる本来の設計意図(車両全長)と実装を一致させる。
+        (along_min_length自体は他の消費箇所(footprint_risk等)で引き続き使用される既存定数。)"""
         import math as _math
         out = {"n_obs": 0, "cars": [], "fwd_ds": None, "fwd_lat": None,
                "fwd_vopp": None, "fwd_dlat": None, "fwd_vid": None, "fwd_wp": None,
@@ -2807,12 +3115,18 @@ class MPCController(Node):
             #   車両全長ではなかった(公式仕様全長200cmとの乖離を発見)。along_min_length
             #   (公式全長ベース、footprint_risk用に新設)へ置き換え、この行の元々の設計意図
             #   (縦方向の量=車両全長を使う、上記docstring参照)と実装を一致させる。
-            if -self._along_min_length < ds <= self._ot_max_consider and abs(lat) <= lat_band:
+            # 2026-07-31修正(254節、ユーザー指摘: 後方車両を追従する必要は無い):
+            #   従来の-along_min_length<dsという負のds許容窓を撤去しds>=0(真に前方の
+            #   車のみ)へ限定した。この許容窓は、icc_stop本体(_follow_speed_limit)・
+            #   n_fwd・NO-VSAFEブリッジの3箇所で共有され、前方が完全に空いていても
+            #   後方2m以内で減速/停止した相手にegoが同期して停止し続けるバグ
+            #   (0731-03 wp243実測)の直接原因だった。詳細は本メソッドのdocstring参照。
+            if 0.0 <= ds <= self._ot_max_consider and abs(lat) <= lat_band:
                 # vid/wp_i は ICC予測制動(速度マップ参照)用に添付(2026-07-04)
                 out["cars"].append((ds, lat, v_long, dlat, vid, wp_i))
                 # 実壁基準の左右空き幅(占有格子由来 wp.ub/lb から他車の横幅を除く)
-                lf = max(0.0, float(wp.ub) - (lat + self._ot_block_half))
-                rf = max(0.0, (lat - self._ot_block_half) - float(wp.lb))
+                lf = self._room_to_wall(wp, lat, want_left=True, clamp=True)
+                rf = self._room_to_wall(wp, lat, want_left=False, clamp=True)
                 # 2026-07-20修正(129節続報、A-2): 生のds比較(ds<best[0])は後方の車を
                 #   常に優先する逆転バグだった(_ds_priority docstring参照)。
                 if best is None or self._ds_priority(ds) < self._ds_priority(best[0]):
@@ -2952,10 +3266,7 @@ class MPCController(Node):
                 continue
             if (c_lat > 0.0) != (side > 0.0):
                 continue
-            if side > 0:
-                c_room = max(0.0, float(wp_t.ub) - (c_lat + self._ot_block_half))
-            else:
-                c_room = max(0.0, (c_lat - self._ot_block_half) - float(wp_t.lb))
+            c_room = self._room_to_wall(wp_t, c_lat, want_left=(side > 0), clamp=True)
             _combined = min(room, c_room)
             if _combined < need:
                 self.get_logger().info(
@@ -3221,10 +3532,7 @@ class MPCController(Node):
             if lat_o is None:
                 continue
             n_sampled += 1
-            if side > 0:
-                room = float(wps[i].ub) - (lat_o + self._ot_block_half)
-            else:
-                room = (lat_o - self._ot_block_half) - float(wps[i].lb)
+            room = self._room_to_wall(wps[i], lat_o, want_left=(side > 0), clamp=False)
             if room_min is None or room < room_min:
                 room_min = room
                 wp_at_min = i
@@ -3282,8 +3590,8 @@ class MPCController(Node):
                 return False, 0, 0.0
 
             wp_t = wps[wp_o % n]
-            lf0 = max(0.0, float(wp_t.ub) - (fwd_lat + self._ot_block_half))
-            rf0 = max(0.0, (fwd_lat - self._ot_block_half) - float(wp_t.lb))
+            lf0 = self._room_to_wall(wp_t, fwd_lat, want_left=True, clamp=True)
+            rf0 = self._room_to_wall(wp_t, fwd_lat, want_left=False, clamp=True)
             # 2026-07-09再修正: 旧実装は|kappa|>=閾値で問答無用に内側を禁止する粗いveto
             #   だったが、これは「動いている相手を追い越す際、内側車線がコーナーのアペックスで
             #   物理的に消滅する」動的収束問題への対策であり、静止した障害物には同じ理屈が
@@ -3311,8 +3619,8 @@ class MPCController(Node):
                         seg += total
                     if seg > clear_at:
                         break
-                    lf_i = max(0.0, float(wps[i].ub) - (fwd_lat + self._ot_block_half))
-                    rf_i = max(0.0, (fwd_lat - self._ot_block_half) - float(wps[i].lb))
+                    lf_i = self._room_to_wall(wps[i], fwd_lat, want_left=True, clamp=True)
+                    rf_i = self._room_to_wall(wps[i], fwd_lat, want_left=False, clamp=True)
                     lf_min = min(lf_min, lf_i)
                     rf_min = min(rf_min, rf_i)
                     _k = float(wps[i].kappa)
@@ -3533,8 +3841,8 @@ class MPCController(Node):
                 _near_lat_o = lat_o
                 _near_lat_src = "fallback" if _is_fallback else "learned"
             steps.append((seg,
-                          float(wps[i].ub) - (lat_o + self._ot_block_half),
-                          (lat_o - self._ot_block_half) - float(wps[i].lb)))
+                          self._room_to_wall(wps[i], lat_o, want_left=True, clamp=False),
+                          self._room_to_wall(wps[i], lat_o, want_left=False, clamp=False)))
             _k = float(wps[i].kappa)
             if k_corner is None and abs(_k) >= self._ot_pass_block_kappa:
                 k_corner = _k                          # 最初のきついコーナー(内側可否判定用)
@@ -3951,7 +4259,15 @@ class MPCController(Node):
         self._pf_work_sum = 0.0
         self._pf_work_max = 0.0
         self._pf_over25 = 0
-        self._pf_report_every = 400   # ≈10秒(40Hz)
+        self._pf_report_every = self._rate_scaled_cycles("_pf_report_every", 400)   # ≈10秒(40Hz)
+        # 2026-07-31追加(254節続報): [PERF]の周期超過判定閾値(旧: 0.025固定=40Hzの
+        #   周期そのもの)。毎周期呼ばれるホットパス(_pf_cycle_end)なので、ここで
+        #   1回だけ計算して保持し、_rate_scaled_cyclesのようなログ付きヘルパーは
+        #   使わない(毎周期ログが出てしまうため)。
+        self._pf_over_budget_s = 1.0 / self._cfg.mpc.control_rate  # type: ignore
+        self.get_logger().info(
+            f"[RATE-SCALE] pf_over_budget_s: 0.025000s@{self._RATE_SCALE_REFERENCE_HZ:.0f}Hz "
+            f"-> {self._pf_over_budget_s:.6f}s@{self._cfg.mpc.control_rate:.0f}Hz")  # type: ignore
         self._pf_gc_t0 = None
         self._pf_obs_max = 0   # 診断用(2026-07-09): 区間内でcorridorへ投入された障害物数の最大値
         # 2026-07-25追加(179節続報): dev3ローカル実測でdocker statsからCPU競合(cpus=3上限
@@ -3991,7 +4307,7 @@ class MPCController(Node):
         self._pf_work_sum += work
         if work > self._pf_work_max:
             self._pf_work_max = work
-        if work > 0.025:
+        if work > self._pf_over_budget_s:
             self._pf_over25 += 1
         self._pf_obs_max = max(self._pf_obs_max, getattr(self, "_dbg_n_dynobs", 0))
         if self._pf_report_every and self._pf_cycles >= self._pf_report_every:
@@ -4024,6 +4340,64 @@ class MPCController(Node):
             self._pf_work_max = 0.0
             self._pf_over25 = 0
             self._pf_obs_max = 0
+
+    # 2026-07-31追加(255節続報、レートスケーリングのクローズ作業Phase 2):
+    #   制御ループは`while rclpy.ok(): self._control()` + `rclpy.Rate.sleep()`
+    #   構造であり、周期超過は「コールバック欠落」ではなく「その周期の実行が
+    #   後ろ倒しになるだけ」として現れる(実装報告Geminiレビューで確認済みの
+    #   前提)。既存の[PERF]は_control()内の「処理時間work」(sleep除く)しか
+    #   見ておらず、rclpy.Rate.sleep()自体のジッタ・スケジューリング遅延を
+    #   含む「実際に何秒おきに_control()が呼ばれたか」(dt、_control()呼び出し
+    #   開始時刻の連続差分)は別の量として計測されていなかった。72Hz切替の
+    #   判定基準(実効平均レート・dtのp99・連続超過回数)を実測するための
+    #   専用計装[PERF-DT]をここに追加する。既存[PERF]/レートスケーリング
+    #   機構と同じ_pf_report_every窓・self._pf_over_budget_s(1/control_rate)
+    #   をそのまま再利用する(新規パラメータは追加しない)。
+    def _dtperf_init(self):
+        self._dtperf_cycles = 0
+        self._dtperf_dts = []
+        self._dtperf_over_count = 0
+        self._dtperf_cur_streak = 0
+        self._dtperf_max_streak = 0
+
+    def _dtperf_reset_window(self):
+        """レポート出力後の窓リセット。_dtperf_cur_streakだけは意図的に
+        リセットしない: 連続超過ストリークが窓境界をまたいでいる場合に
+        過小報告(見かけ上ストリークが途切れる)を防ぐため、次の窓へそのまま
+        引き継ぐ。"""
+        self._dtperf_cycles = 0
+        self._dtperf_dts = []
+        self._dtperf_over_count = 0
+        self._dtperf_max_streak = 0
+
+    def _dtperf_record(self, dt):
+        if not hasattr(self, '_dtperf_cycles'):
+            self._dtperf_init()
+        self._dtperf_cycles += 1
+        self._dtperf_dts.append(dt)
+        if dt > self._pf_over_budget_s:
+            self._dtperf_over_count += 1
+            self._dtperf_cur_streak += 1
+            self._dtperf_max_streak = max(self._dtperf_max_streak, self._dtperf_cur_streak)
+        else:
+            self._dtperf_cur_streak = 0
+
+        if self._pf_report_every and self._dtperf_cycles >= self._pf_report_every:
+            n = self._dtperf_cycles
+            dts = sorted(self._dtperf_dts)
+            dt_sum = sum(dts)
+            effective_rate = n / dt_sum if dt_sum > 1e-9 else 0.0
+            p50 = dts[int(n * 0.50)]
+            p95 = dts[min(n - 1, int(n * 0.95))]
+            p99 = dts[min(n - 1, int(n * 0.99))]
+            dt_max = dts[-1]
+            over_ratio = self._dtperf_over_count / n
+            print('[PERF-DT] n=%d p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms '
+                  'eff_rate=%.2fHz over_budget=%.2f%% max_consec_over=%d'
+                  % (n, p50 * 1000, p95 * 1000, p99 * 1000, dt_max * 1000,
+                     effective_rate, over_ratio * 100, self._dtperf_max_streak),
+                  flush=True)
+            self._dtperf_reset_window()
 
     def _g2_release_ready(self, scan, fwd_vopp, vtgt, left_free, right_free,
                            v_safe_pre_for_log, is_closing_trend: bool = False) -> bool:
@@ -4116,6 +4490,7 @@ class MPCController(Node):
         now = self.get_clock().now()
         t = (now - self._t_start).nanoseconds / 1e9
         dt = (now - self._last_t).nanoseconds / 1e9
+        self._dtperf_record(dt)
 
         self._last_t = now
         self._loop += 1
@@ -4183,7 +4558,10 @@ class MPCController(Node):
         # センシング切り分け計装D(2026-07-19、118節続報): USE_OBSTACLE_AVOIDANCEの
         #   有無に関わらず常に評価する(オーバーテイク非依存の一般センシング診断のため)。
         #   間引きは既存の「約1秒ごと」イディオム(4172行目 _opp_map_pub_loop と同じ考え方)。
-        if self._loop % int(max(1, self._mpc_cfg.control_rate)) == 0:
+        # 214節: enable_diag_log=falseの間はクロス相関計算(配列ループ)自体をスキップする
+        #   (3vCPU予選環境での計算負荷低減、既定true=従来通り)。
+        if (self._loop % int(max(1, self._mpc_cfg.control_rate)) == 0
+                and self._mpc_cfg.enable_diag_log):
             self._maybe_log_gnss_ekf_xcorr()
             self._maybe_log_steer_xcorr()
         # 208節続報: ピーク値追跡のため、上記の1秒間引きとは別に毎周期呼ぶ
@@ -4313,13 +4691,7 @@ class MPCController(Node):
                 f"[STUCK] detected (u0_last={self._stuck_u0_last:.2f} "
                 f"v={_v_odom_now:.2f} count={self._stuck_count} "
                 f"infeas={self._mpc.infeasibility_counter} path={self._stuck_trigger_path}) -> WAIT_REVERSE")
-            self._stuck_update_shuffle_cycle(now, pose)  # 184節追加
-            self._stuck_state = "WAIT_REVERSE"
-            self._stuck_count = 0
-            self._stuck_stall_count = 0
-            self._stuck_gear_wait_count = 0
-            self._ghost_block_logged = False
-            self._handle_stuck_recovery(now, pose)
+            self._stuck_enter_wait_reverse(now, pose)
             return
         elif _stall_stuck:
             # リトライ予算(2026-07-10, ユーザー承認済み): 経路3の初回発火から
@@ -4335,13 +4707,7 @@ class MPCController(Node):
                 self.get_logger().warn(
                     f"[STUCK] 完全停止検知(v={_v_odom_now:.2f} count={self._stuck_stall_count} "
                     f"path=3) -> WAIT_REVERSE(→PUSH予定)")
-                self._stuck_update_shuffle_cycle(now, pose)  # 184節追加
-                self._stuck_state = "WAIT_REVERSE"
-                self._stuck_count = 0
-                self._stuck_stall_count = 0
-                self._stuck_gear_wait_count = 0
-                self._ghost_block_logged = False
-                self._handle_stuck_recovery(now, pose)
+                self._stuck_enter_wait_reverse(now, pose)
                 return
             elif not self._stuck_stall_budget_exhausted_logged:
                 self._stuck_stall_budget_exhausted_logged = True
@@ -4420,6 +4786,10 @@ class MPCController(Node):
             #   STOPPING状態が欠落と過剰相関(時間占有14.5%に対し欠落23.0%)する原因区間を
             #   特定するため、scan_traffic/follow_speed_limit/壁際/along_latを個別計測する。
             self._pf_mark('scan')
+            # 2026-07-31(254節): _scan["cars"]がds>=0(真に前方)限定になったため、
+            #   _n_fwdは名前通り「前方の相手台数」を正しく表す(以前は後方2m以内の車も
+            #   混入し、後方車だけで_ot_state遷移判定全体(直後のif _n_fwd>0:)が
+            #   誤って起動していた)。
             _n_fwd = len(_scan["cars"])
             _left_free = _scan["left_free"]; _right_free = _scan["right_free"]
             # 被追い越し判定のデバウンス(2026-07-05): 生値は |ds|≈3m・dlat≈1.0m・v≈6km/h の
@@ -4680,9 +5050,8 @@ class MPCController(Node):
                     #   だけを見ているこのカウンタは気付かず連続扱いしてしまう。対象車IDが
                     #   変わった周期は仕切り直す(_ot_worth_countと同一の考え方)。
                     _fwd_vid_giveup = _opp_sit.fwd_vid
-                    if _fwd_vid_giveup != self._ot_giveup_prev_vid:
+                    if self._vid_changed_reset(_fwd_vid_giveup, "_ot_giveup_prev_vid"):
                         self._ot_giveup_count = 0
-                    self._ot_giveup_prev_vid = _fwd_vid_giveup
                     if (_opp_sit.fwd_vopp is not None
                             and _opp_sit.fwd_vopp >= self._opp_obstacle_speed
                             and (self._v_pot - _opp_sit.fwd_vopp) < self._opp_giveup_closing):
@@ -4815,11 +5184,57 @@ class MPCController(Node):
                         self._ot_room_exhausted_count = 0
                     _room_exhausted = self._ot_room_exhausted_count >= self._ot_giveup_cycles
                     if _room_exhausted and self._ot_room_exhausted_count == self._ot_giveup_cycles:
-                        self.get_logger().warn(
-                            f"[OT-ROOM-EXHAUSTED] side={_locked} "
-                            f"corr_bound={_room_ahead_locked:.3f} "
-                            f"count={self._ot_room_exhausted_count} -> giveup合流 "
-                            f"wp={self._mpc.model.wp_id}")
+                        # 247節(2026-07-30、ユーザー指摘: wp172でのオーバーテイク一時停止)
+                        #   giveupへ合流する前に、反対側で継続できないか最終確認する
+                        #   (190-7節の_plan_pass向けSIDE-FALLBACKと同じ発想をOVERTAKING
+                        #   継続中のroom_exhaustedへ水平展開)。
+                        #   2026-07-30ユーザー指示(実測wp172で反対側opp_space=2.207mが
+                        #   switchback_space_m=2.35mをわずかに割り込み不発になったことを
+                        #   確認した上での方針転換): 「一旦オーバーテイクを試みた後の
+                        #   反対サイド判定」は通常のswitchback判定(branch=A/A_dlat、
+                        #   switchback_space_m=2.35m)とは明示的に切り離した専用の緩和
+                        #   閾値とし、既存定数giveup_space_m(1.85m、通常のgiveup自体が
+                        #   既に許容している最低限の幅と同一値、新規の数値は導入しない)を
+                        #   使う。通常のswitchback_space_m判定(branch=A/A_dlat等)には
+                        #   一切触れず、この「room_exhausted直前の最終救済」という
+                        #   狭いスコープにのみ適用する。
+                        #   is_side_by_side/has_switched/new_side_wall_blocked/
+                        #   new_side_room_blocked/new_side_offset_blocked/
+                        #   fwd_ds_overlap_riskは通常のswitchbackと共通のまま緩和しない。
+                        #   ハンチング防止: has_switchedを共有するため、この経路が
+                        #   発火してもその後の通常switchback・この経路自身の再発火は
+                        #   同一エンゲージ内で二度と起きない(1エンゲージ1回の
+                        #   既存契約をそのまま踏襲)。
+                        _room_rescued = False
+                        if (not _lat_dec.has_switched and not _lat_dec.is_side_by_side
+                                and _lat_opp_space is not None
+                                and _lat_opp_space >= self._lat_ttc.giveup_space_m):
+                            _opp_locked = -_locked
+                            _room_ahead_opp = self._corr_bound_ahead(_opp_locked)
+                            if (np.isfinite(_room_ahead_opp) and _room_ahead_opp > 0.0
+                                    and not _new_side_wall_blocked and not _new_side_room_blocked
+                                    and not _new_side_offset_blocked and not _fwd_ds_overlap_risk):
+                                self._lat_ttc.force_rescue_switch()
+                                _locked = _opp_locked
+                                self._ot_side_locked = _locked
+                                self._ot_alpha = 0.0
+                                self._ot_room_exhausted_count = 0
+                                self._ot_last_valid_target_mag = None
+                                self._ot_cleared = False
+                                self._ot_reacquire_count = 0
+                                self.get_logger().warn(
+                                    f"[OT-ROOM-EXHAUSTED-RESCUE] side={_locked} "
+                                    f"room_ahead_opp={_room_ahead_opp:.3f} "
+                                    f"wp={self._mpc.model.wp_id}")
+                                _room_rescued = True
+                        if _room_rescued:
+                            _room_exhausted = False
+                        else:
+                            self.get_logger().warn(
+                                f"[OT-ROOM-EXHAUSTED] side={_locked} "
+                                f"corr_bound={_room_ahead_locked:.3f} "
+                                f"count={self._ot_room_exhausted_count} -> giveup合流 "
+                                f"wp={self._mpc.model.wp_id}")
                     _side_blocked = _lat_dec.force_giveup or _room_exhausted
                     if (self._ot_giveup_count >= self._ot_giveup_cycles
                             or _locked == 0 or _side_blocked):
@@ -4889,6 +5304,7 @@ class MPCController(Node):
                         self._ot_footprint_risk_clear_count = 0
                         self._ot_fp_clear_logged = False
                         self._ot_cleared = False
+                        self._reset_ot_offset_state()
                     else:
                         self._ot_side = _locked
                 else:
@@ -4966,6 +5382,7 @@ class MPCController(Node):
                     self._ot_worth_count = 0
                     self._ot_giveup_count = 0
                     self._ot_cleared = False
+                    self._reset_ot_offset_state()
 
             # 一時的な infeasible では完全停止せず OVERTAKING を維持（後段のクリープで前進）。
             # infeasible_stop 回 連続で解けない＝実際に通れない時のみ安全STOPへ落とす（最後の保険）。
@@ -4985,6 +5402,7 @@ class MPCController(Node):
                     self._ot_side_locked = 0   # A: 恒久失敗（実際に通れない）→ 側コミット解除して次で再選択
                     self._ot_giveup_count = 0
                     self._ot_cleared = False
+                    self._reset_ot_offset_state()
 
             # 2026-07-22追加(160節続報、issue⑤①): 155節のRAMP-BYPASS判定・下記の新規
             #   STOPPING分岐の両方が参照するため、if/elifより前に1回だけ計算する
@@ -5502,7 +5920,12 @@ class MPCController(Node):
                     #   ブリッジを適用する。遠い/対象車無しの場合は従来のMPC最適化に
                     #   委ねる(この場合はそもそも「近くに見落としている危険な相手がいる」
                     #   という前提が成立しないため、u0=v_maxのままでも実害の証拠がない)。
-                    if _fwd_ds is not None and abs(_fwd_ds) < self._along_min_length:
+                    # 2026-07-31修正(254節): _fwd_dsは_scan_traffic側の修正によりds>=0
+                    #   (真に前方)の場合のみ非None値を取るようになったため、abs()は
+                    #   もはや必要ない(以前は後方の車のds(負値)もここへ紛れ込み得た)。
+                    #   意味の変化はない(元々ds>=0の場合はabs(ds)==dsで同一)が、
+                    #   「後方車には適用されない」契約を式の上でも明示する。
+                    if _fwd_ds is not None and _fwd_ds < self._along_min_length:
                         _v_safe_pre = self._wall_slow_speed
                         _v_safe_cand.append(("stopping_no_vsafe(状態遷移ブリッジ)", self._wall_slow_speed))
                 elif self._stopping_no_vsafe_prev:
@@ -5667,14 +6090,27 @@ class MPCController(Node):
             #   判定(152節)と同一の式を共有することで、閾値変更時に3箇所が自動的に
             #   同期する(159節と同じ「同じ周期の同じ値を使う」原則)。
             elif _fp_near_zone:
-                _fp_frac = ((abs(_fwd_ds) - self._along_min_length)
-                            / (self._ot_pass_clear - self._along_min_length))
-                _umax = float(self._mpc.input_constraints["umax"][0])
-                _fp_taper_cap = self._wall_slow_speed + _fp_frac * (_umax - self._wall_slow_speed)
+                # 2026-07-29修正(230節、追突4件の根本原因調査): 旧実装(距離のみの
+                #   線形補間、closing rate非考慮)は、fwd_ds=2.95m(テーパー帯域の
+                #   97%地点)で相手速度に関係なくcap≈v_max(実測0729-03 wp171: 事故
+                #   直前の指令速度4.06m/sと式の予測値が完全一致=実質無制限)だった。
+                #   相手が遅い/停止しているほど閉じる速度が速いにもかかわらず、
+                #   この式は相手速度を一切見ないため、閉じる速度が速い場面ほど
+                #   手遅れになりやすい構造的欠陥があった(design_docs 157-3/161-1節
+                #   で既に「先回りして間隔を確保する縦方向の仕組みが存在しない」と
+                #   自己診断済みだったが未着手だった課題)。icc_stop等が既に使う
+                #   G2式(_g2_speed、制動距離ベースのキネマティック安全速度)と同じ
+                #   考え方を採用し、fwd_ds=along_min_lengthで相手速度に一致(それ以上
+                #   詰めない)・fwd_dsが大きいほど緩和される、相手速度(closing rate)
+                #   を反映したキャップへ置き換える(新規パラメータ0個、既存の
+                #   _fwd_a_brake/along_min_lengthを再利用)。
+                _fp_rad = (_fwd_vopp * _fwd_vopp
+                           + 2.0 * self._fwd_a_brake * (abs(_fwd_ds) - self._along_min_length))
+                _fp_taper_cap = float(np.sqrt(max(0.0, _fp_rad)))
                 _v_safe_pre = (_fp_taper_cap if _v_safe_pre is None
                                else min(_v_safe_pre, _fp_taper_cap))
                 _fwd_dbg["footprint_taper"] = round(abs(_fwd_ds), 2)
-                _v_safe_cand.append(("footprint_taper(接触リスク接近テーパー)", _fp_taper_cap))
+                _v_safe_cand.append(("footprint_taper(接触リスク接近テーパー、キネマティック版)", _fp_taper_cap))
 
             # 2026-07-22追加(issue④①、fallback_forwardの操舵盲目化対策): core/MPC.py
             #   のget_control()はinfeasibleが続く間、前回成功時の計画軌道を最大N-2周期
@@ -5721,10 +6157,7 @@ class MPCController(Node):
                     _lane_min = float("inf")
                     for _k in range(_n_ahead):
                         _w = _wps[(_idx + _k) % _n_wp]
-                        if _opp_right:
-                            _lane = float(_w.ub) - (_a_lat + self._ot_block_half)  # 相手左端→左壁
-                        else:
-                            _lane = (_a_lat - self._ot_block_half) - float(_w.lb)  # 右壁→相手右端
+                        _lane = self._room_to_wall(_w, _a_lat, want_left=_opp_right, clamp=False)
                         _lane_min = min(_lane_min, _lane)
                     # 2026-07-10簡素化: 瞬時値をEMAで平滑化(side_blockと同じ時定数)してから
                     #   閾値判定。コーナー通過中の一瞬の凹みで急減速しないようにする。
@@ -5732,10 +6165,8 @@ class MPCController(Node):
                     #   lane_minが混入しないよう新しい基準値へ静かに再スタートする
                     #   (LAT-TTCの_vid_changed処理と同一の考え方)。
                     _along_vid_now = _scan.get("along_vid")
-                    if (self._along_lane_ema is not None
-                            and _along_vid_now != self._along_lane_prev_vid):
+                    if self._vid_changed_reset(_along_vid_now, "_along_lane_prev_vid"):
                         self._along_lane_ema = None
-                    self._along_lane_prev_vid = _along_vid_now
                     if self._along_lane_ema is None:
                         self._along_lane_ema = _lane_min
                     else:
@@ -5865,7 +6296,11 @@ class MPCController(Node):
             self._r_delta_swing_update_count += 1
         self._pf_add('r_delta_swing_total', _time.perf_counter() - _t0_total)
         self._r_delta_swing_dbg_loop += 1
-        if self._r_delta_swing_dbg_loop % int(max(1, self._mpc_cfg.control_rate)) == 0:
+        # 214節: ここでバイパスするのはログ出力のみ。上記のswing計算/update_R呼び出しは
+        #   R[delta]動的引き上げという実際の制御機構(176節)そのものであり、diagnostic
+        #   ではないため enable_diag_log の対象外(バイパスすると制御挙動が変わってしまう)。
+        if (self._r_delta_swing_dbg_loop % int(max(1, self._mpc_cfg.control_rate)) == 0
+                and self._mpc_cfg.enable_diag_log):
             self.get_logger().info(
                 f"[R-DELTA-SWING] wp_id={self._mpc.model.wp_id} swing={_swing:.3f} "
                 f"smooth={_smooth_sw:.2f} r_delta_target={_r[1]:.1f} "

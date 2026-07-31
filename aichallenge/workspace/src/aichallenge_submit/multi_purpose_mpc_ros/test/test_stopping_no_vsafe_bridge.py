@@ -102,8 +102,10 @@ def test_bridge_uses_stopping_state_wall_slow_speed_not_a_hardcoded_literal():
 # 場合のみブリッジを適用するよう改良した。
 
 def _bridge_fires(fwd_ds, along_min_length=2.00):
-    """mpc_controller.pyの改良後ブリッジ条件のミラー実装。"""
-    return fwd_ds is not None and abs(fwd_ds) < along_min_length
+    """mpc_controller.pyの改良後ブリッジ条件のミラー実装。
+    2026-07-31(254節): _scan_trafficがds>=0(真に前方)限定になったことで、
+    fwd_dsはNoneでなければ常に非負値を取る契約になったため、abs()を撤去。"""
+    return fwd_ds is not None and fwd_ds < along_min_length
 
 
 def test_retroactive_0720_02_wp13_close_car_still_bridges():
@@ -129,11 +131,16 @@ def test_bridge_boundary_at_along_min_length():
     assert _bridge_fires(fwd_ds=2.00, along_min_length=2.00) is False
 
 
-def test_bridge_uses_absolute_value_for_negative_ds():
-    """境界: 相手がわずかに後方(ds負値)でも、近ければブリッジする
-    (footprint_riskのabs(fwd_ds)と同じ規約)。"""
-    assert _bridge_fires(fwd_ds=-1.5) is True
-    assert _bridge_fires(fwd_ds=-3.0) is False
+def test_bridge_no_longer_uses_absolute_value_since_fwd_ds_is_never_negative():
+    """254節(2026-07-31)で撤回: 以前はfwd_dsの負値(後方の車)もabs()経由で
+    ブリッジ対象になり得たが、_scan_trafficの修正でfwd_dsはNoneでなければ
+    常にds>=0(真に前方)を保証するようになったため、この分岐はもう存在しない
+    契約(仮に負値が渡ってもtrivialに発動してしまう、後方車を対象にしない
+    という上位の契約はscan側で保証する)。ここでは単にabs()を使わない新しい
+    ミラー式が0.0以上の値に対して従来通り機能することのみ確認する。"""
+    assert _bridge_fires(fwd_ds=0.0) is True
+    assert _bridge_fires(fwd_ds=1.999) is True
+    assert _bridge_fires(fwd_ds=2.0) is False
 
 
 def test_bridge_none_ds_does_not_fire():
@@ -152,8 +159,16 @@ def test_far_or_unknown_car_falls_back_to_prior_mpc_behavior():
     """①非矛盾性: 近さ条件を満たさない場合、_v_safe_preはNoneのまま
     (bridgeブロック外)であり、以前のMPC最適化任せの挙動へ委ねられる
     ことをソース構造上確認する(新しい代替候補を追加せず、単に発動条件を
-    絞っただけであることの確認)。"""
-    idx = _SRC.index("if _fwd_ds is not None and abs(_fwd_ds) < self._along_min_length:")
+    絞っただけであることの確認)。2026-07-31(254節): abs()を撤去した
+    条件式に追随。"""
+    idx = _SRC.index("if _fwd_ds is not None and _fwd_ds < self._along_min_length:")
     snippet = _SRC[idx:idx + 300]
     assert "_v_safe_pre = self._wall_slow_speed" in snippet
     assert '_v_safe_cand.append(("stopping_no_vsafe' in snippet
+
+
+def test_bridge_condition_no_longer_uses_abs():
+    """回帰防止(254節): ソース上のブリッジ条件式がabs()を使っていないことを
+    直接確認する(fwd_dsは_scan_traffic側でds>=0保証済みのため不要)。"""
+    idx = _SRC.index("if _fwd_ds is not None and _fwd_ds < self._along_min_length:")
+    assert "abs(_fwd_ds)" not in _SRC[max(0, idx - 50):idx + 60]
