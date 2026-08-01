@@ -43,6 +43,25 @@ except Exception:
     _OSQP_OK = {1, 2}
 
 
+def _resize_to_length(arr, n):
+    """2026-08-02追加(262節続報、Part A: MPC.py初期化クラッシュ防御)。長さが`n`と
+    異なる配列を安全側に整形する: 長すぎれば先頭n件を使用(コリドーは先頭=直近の
+    waypointほど重要なため)、短すぎれば末尾値で埋める(=直近既知の安全な幅を
+    延長するだけで、範囲外を「無限に安全」等の危険な値で埋めない)。空配列や
+    n<=0はそのまま返す(呼び出し側でxmin_dyn[0]等の別経路が処理する特殊ケース)。"""
+    arr = np.asarray(arr, dtype=float)
+    if n <= 0 or len(arr) == n:
+        return arr
+    if len(arr) > n:
+        return arr[:n]
+    if len(arr) == 0:
+        # 手がかりが全く無い場合のみ、_corridor()の既存の「infeasible」慣例
+        # (ub<lbをub=lb=0.0にする、上記_corridor参照)に倣い0.0で埋める。
+        return np.zeros(n)
+    pad = np.full(n - len(arr), arr[-1])
+    return np.concatenate([arr, pad])
+
+
 class MPC:
     def __init__(self, model, N, Q, R, QN, StateConstraints, InputConstraints,
                  ay_max, max_steering_rate, wp_id_offset, use_obstacle_avoidance,
@@ -311,6 +330,26 @@ class MPC:
             d['ub0'] = ub
             d['lb0'] = lb
             d['margin0'] = safety_margin
+
+        # 2026-08-02追加(262節続報、Part A: MPC.py初期化クラッシュ防御): ごく稀に
+        #   (実測1/10回程度、非循環経路[ピット等]終端付近で発生)`_corridor()`が
+        #   返すlb/ubの長さがNと一致しないことがあり、直後の`xmin_dyn[nx::nx]=lb`で
+        #   ValueError: could not broadcast input array (例: shape(20,)→shape(1,))と
+        #   なりノードごとクラッシュしていた。原因は本関数冒頭の
+        #   `self.model.wp_id += self.wp_id_offset`が、呼び出し元`get_control()`で
+        #   既に確定させたN(旧wp_id基準)より後に効くため、非循環経路の終端付近では
+        #   wp_id+N が n_waypoints を超えうること(高確度の仮説、コード解析による特定。
+        #   `update_path_constraints`内部の分岐まで完全にはトレースし切れていないため
+        #   「仮説」と明記する)。起動シーケンス(wp_id_offset加算タイミング)自体への
+        #   変更は本ガードのスコープ外とし、ここでは長さ不一致を検出した場合のみ
+        #   安全側に整形して大惨事(クラッシュ=数秒間の無制御)を防ぐ。長さ一致時
+        #   (通常の全周期)はこの分岐に入らず、既存の数値・挙動に一切影響しない。
+        if len(lb) != N or len(ub) != N:
+            print(f'[MPC-GUARD] corridor length mismatch: len(lb)={len(lb)} '
+                  f'len(ub)={len(ub)} N={N} wp_id={self.model.wp_id} -> '
+                  f'clamping to avoid crash', flush=True)
+            lb = _resize_to_length(lb, N)
+            ub = _resize_to_length(ub, N)
 
         xmin_dyn = np.kron(np.ones(N + 1), self.state_constraints['xmin'])
         xmax_dyn = np.kron(np.ones(N + 1), self.state_constraints['xmax'])
