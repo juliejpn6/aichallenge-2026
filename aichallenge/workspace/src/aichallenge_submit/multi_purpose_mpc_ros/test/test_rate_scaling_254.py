@@ -174,6 +174,18 @@ EXEMPT_PARAMS = [
     "shuffle_max_cycles",   # 試行回数のカウント、周期時間ではない
     "space_ema_alpha",       # self._ot_ema_alpha(既に換算済み)へのフォールバックのみ、
                              # 二重換算を避けるため直接ラップしない
+    "perf_dt_over_margin_ms",  # 2026-08-01追加(72Hz切替準備Phase 1): [PERF-DT]の
+                             # 周期超過判定に加えるマージン(計測の判定閾値であり
+                             # 制御には影響しないため、control_rateが変わっても
+                             # 自動換算しない)
+    "perf_spike_dump_factor",  # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3):
+                             # [PERF-SPIKE]の発火倍率(計測の判定閾値であり制御には
+                             # 影響しないため、perf_dt_over_margin_msと同じ理由で
+                             # 自動換算しない)
+    "cpu_affinity",          # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 4):
+                             # os.sched_setaffinityで使うCPUコア番号のリスト。実際の
+                             # CPUバインドという制御外の運用パラメータであり、周期時間や
+                             # 減衰係数ではないため自動換算しない
 ]
 
 
@@ -221,14 +233,26 @@ def test_exempt_params_not_wrapped():
     line2 = _SRC[max(0, idx2 - 40):line2_end]
     assert "_rate_scaled_gain(" not in line2
 
+    idx3 = _SRC.index('getattr(self._cfg.mpc, "perf_dt_over_margin_ms"')
+    line3_end = _SRC.index("\n", idx3)
+    line3 = _SRC[max(0, idx3 - 40):line3_end]
+    assert "_rate_scaled_gain(" not in line3
+    assert "_rate_scaled_cycles(" not in line3
+
+    idx4 = _SRC.index('getattr(self._cfg.mpc, "cpu_affinity"')
+    line4_end = _SRC.index("\n", idx4)
+    line4 = _SRC[max(0, idx4 - 40):line4_end]
+    assert "_rate_scaled_gain(" not in line4
+    assert "_rate_scaled_cycles(" not in line4
+
 
 def test_no_new_parameter_added_without_wrapping_or_exemption():
     """将来の回帰防止: 本テストのCATEGORY_A_PARAMS/CATEGORY_B_PARAMS/EXEMPT_PARAMSの
-    合計が、設計書が特定した23+2(exempt)件と一致することを確認する
+    合計が、設計書が特定した23+3(exempt)件と一致することを確認する
     (件数の見落とし・重複を機械的に検出する)。"""
     assert len(CATEGORY_A_PARAMS) == 17  # osqp_shadow_cyclesを含め17件
     assert len(CATEGORY_B_PARAMS) == 4  # beta(LAT-TTC)は別テストで確認するためここでは4件
-    assert len(EXEMPT_PARAMS) == 2
+    assert len(EXEMPT_PARAMS) == 5  # 262節続報Phase 4でcpu_affinityを追加
 
 
 # ---------------------------------------------------------------------------
@@ -247,11 +271,28 @@ def test_perf_over_budget_uses_control_rate():
     assert idx2 > idx
 
 
+def test_perf_print_label_reflects_actual_budget_not_hardcoded_25ms():
+    """2026-08-01追加(261節続報、72Hzスパイク調査Phase 2-2の回帰防止):
+    [PERF]の出力カウンタ(_pf_over25)は当初から正しくself._pf_over_budget_s
+    (=1/control_rate)を参照していたが、印字ラベルだけが">25ms="という
+    40Hz固定の文字列のまま取り残されていた(72Hz実測ログで発覚、カウンタ値
+    自体は常に正しかった表示のみのバグ)。ラベルが実際の予算[ms]を動的に
+    表示するよう修正したことを固定する。"""
+    idx = _SRC.index("def _pf_cycle_end(self, work, work_cpu=0.0):")
+    idx_end = _SRC.index("\n    # 2026-07-31追加(255節続報", idx)
+    snippet = _SRC[idx:idx_end]
+    assert ">25ms=" not in snippet, (
+        "[PERF]の印字ラベルが再び40Hz固定の\">25ms=\"へ戻っている(72Hz以外の"
+        "control_rateで誤解を招く表示バグの再発)")
+    assert ">%.1fms=" in snippet
+    assert "self._pf_over_budget_s * 1000" in snippet
+
+
 def test_perf_over_budget_not_recomputed_every_cycle():
     """性能確認: 周期超過判定のホットパス(_pf_cycle_end)では、事前計算済みの
     self._pf_over_budget_sを参照するのみで、毎周期self._rate_scaled_cycles等の
     ログ付きヘルパーを呼んでいないことを確認する(毎周期ログのスパム防止)。"""
-    idx = _SRC.index("def _pf_cycle_end(self, work):")
+    idx = _SRC.index("def _pf_cycle_end(self, work, work_cpu=0.0):")
     idx_end = _SRC.index("def ", idx + 10)
     snippet = _SRC[idx:idx_end]
     assert "_rate_scaled_cycles(" not in snippet

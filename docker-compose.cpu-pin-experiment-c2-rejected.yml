@@ -1,0 +1,21 @@
+# 2026-08-01(262節続報、プラットフォーム状態計装Phase 3): 72Hzスパイクの
+# 帰属実験用のCPUピニングoverride。docker composeはdocker-compose.yml +
+# docker-compose.override.ymlを自動マージするため、`-f`指定は不要
+# (`make dev`等の既存コマンドがそのまま拾う)。
+#
+# 使い方:
+#   実験時: このファイルをリポジトリ直下に docker-compose.override.yml として
+#           配置(コピー or シンボリックリンク)してから `make dev` する。
+#   実験後: docker-compose.override.yml を削除すれば通常構成へ即座に戻る。
+#
+# 意図: autoware(制御ノード本体)をsimulator(AWSIM)から物理コア単位で完全隔離する。
+#   AMD Ryzen 9 6900HS = 8物理コア×SMT2 = 論理CPU 0-15、兄弟スレッド対応は
+#   (0,1)(2,3)(4,5)...(14,15)(lscpu/thread_siblings_listで確認済み)。
+#   autowareは物理コア0-1(論理0-3、既存のcpus:"4"クォータと一致)に限定し、
+#   simulatorは物理コア2-7(論理4-15)に限定することで、SMT兄弟スレッド越しの
+#   競合も含めて排除する。
+services:
+  autoware:
+    cpuset: "0-3"
+  simulator:
+    cpuset: "4-15"

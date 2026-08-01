@@ -1,0 +1,32 @@
+# 2026-08-01(262節続報、判定基準改訂+work_cpu計装Phase 4): C3実験用override。
+# docker composeはdocker-compose.yml + docker-compose.override.ymlを自動マージ
+# するため、`-f`指定は不要(`make dev`等の既存コマンドがそのまま拾う)。ただし
+# このリポジトリの.envはCOMPOSE_FILEを明示指定しているため、override.ymlの
+# 自動マージは効かない。使用時は明示的に
+#   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml:docker-compose.c3-experiment.yml"
+# としてから`make dev`すること(2026-08-01のC1/C2実験と同じ手順)。
+#
+# 使い方:
+#   実験時: 上記exportをしてから`make dev`する。加えてconfig.yamlの
+#           mpc.cpu_affinity を一時的に[2, 3]等へ設定する(mpc_controller
+#           プロセス自身をこのコアペアへ固定するため)。
+#   実験後: exportを解除(新しいシェルにする)し、config.yamlのcpu_affinityを
+#           []へ戻す。
+#
+# C2(コンテナ全体をcpuset 0-3/4-15へ隔離)は失敗——autowareコンテナには
+# mpc_controller以外にも複数のROS2ノードが同居しており、コンテナ全体を狭い
+# コア集合へ縛ると、それらノード間でSMT兄弟スレッドを奪い合う内部競合を
+# 起こしeff_rateが急落した(272件の[PERF-SPIKE]・nivcsw約1.9倍で確認)。
+#
+# C3はこれを踏まえ、コンテナ単位のcpusetは使わない(このoverride自体は
+# cpusetを一切設定しない)。代わりに:
+#   1. autowareの`cpus`クォータを16へ緩和(実質無制限。デフォルトの4だと
+#      mpc_controllerを特定コアへ固定しても、コンテナ全体の合計CPU時間が
+#      引き続き4コア相当に絞られたままで、他ノードとの内部競合の余地が残る)
+#   2. mpc_controllerプロセス自身はos.sched_setaffinity(config.yamlの
+#      mpc.cpu_affinity経由)で専有コアへ固定する(このoverride ではなく
+#      config.yaml側の変更)
+#   3. simulatorは現状維持(制限なし)
+services:
+  autoware:
+    cpus: "16"

@@ -4,6 +4,7 @@ import yaml
 import gc as _gc
 import resource as _resource
 import time as _time
+import glob as _glob
 from collections import deque
 from typing import List, Tuple, Optional, NamedTuple, Dict
 import dataclasses
@@ -4258,6 +4259,8 @@ class MPCController(Node):
         self._pf_cycles = 0
         self._pf_work_sum = 0.0
         self._pf_work_max = 0.0
+        self._pf_work_cpu_sum = 0.0
+        self._pf_work_cpu_max = 0.0
         self._pf_over25 = 0
         self._pf_report_every = self._rate_scaled_cycles("_pf_report_every", 400)   # ≈10秒(40Hz)
         # 2026-07-31追加(254節続報): [PERF]の周期超過判定閾値(旧: 0.025固定=40Hzの
@@ -4270,6 +4273,18 @@ class MPCController(Node):
             f"-> {self._pf_over_budget_s:.6f}s@{self._cfg.mpc.control_rate:.0f}Hz")  # type: ignore
         self._pf_gc_t0 = None
         self._pf_obs_max = 0   # 診断用(2026-07-09): 区間内でcorridorへ投入された障害物数の最大値
+        # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): work>予算×factorの
+        #   周期を1行でダンプする[PERF-SPIKE]計装。factorはconfig.yamlの
+        #   mpc.perf_spike_dump_factor(既定2.0、計測の判定閾値でありレート
+        #   スケーリング対象外、perf_dt_over_margin_msと同じ扱い)から読む。
+        self._pf_spike_dump_factor = float(
+            getattr(self._cfg.mpc, "perf_spike_dump_factor", 2.0))  # type: ignore
+        self._pf_last_cycle = {}          # このサイクルの区間別実測値(name -> 秒)
+        self._pf_cycle_gen2_flag = False  # このサイクル内にGC世代2回収が発生したか
+        self._pf_cycle_gen2_duration = 0.0
+        self._pf_prev_cache_builds = 0
+        self._pf_prev_nivcsw = _resource.getrusage(_resource.RUSAGE_SELF).ru_nivcsw
+        self._pf_prev_nseg = None
         # 2026-07-25追加(179節続報): dev3ローカル実測でdocker statsからCPU競合(cpus=3上限
         #   への張り付き)を直接確認できたが、予選環境はdocker host側の計測手段が無い。
         #   同じ診断能力をプロセス内部から得るため、resource.getrusage(RUSAGE_SELF)の
@@ -4278,13 +4293,173 @@ class MPCController(Node):
         #   壁時計時間(work avg)に対し実CPU時間が明らかに少なければ「計算コストではなく
         #   スケジューリング待ちで遅れている」ことを直接示せる。
         self._pf_rusage_prev = _resource.getrusage(_resource.RUSAGE_SELF)
+        # 2026-08-01追加(262節続報、プラットフォーム状態計装Phase 1): CPU周波数
+        #   (DVFS/電源制限によるスロットリング)を[PERF-SPIKE]・窓集計へ加える。
+        #   出力制限解除の前後比較(72Hz再実測)で改善が見られたことから、
+        #   仮説(b)「CPU競合」には競合(nivcsw、既存計装で追跡済み)だけでなく
+        #   周波数変動(DVFS、nivcswには現れない)も含まれる可能性があるため、
+        #   直接観測する。コンテナ内でsysfsのcpufreqが不可視な環境(権限/名前空間の
+        #   都合)では読み取りに失敗するため、起動時に1回だけ可否を確認し、
+        #   以降は毎サイクルの失敗ログを出さずに全フィールドをN/A扱いにする。
+        self._pf_freq_paths = sorted(_glob.glob(
+            '/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq'))
+        # 2026-08-01追加(262節続報、判定基準改訂+コア限定化Phase 1): 全コア平均は
+        #   遊休コアのクロック低下を拾って解釈を歪める(cpuset未指定時は16コア中
+        #   ほとんどが遊休のことが多い)。core_id -> path のマップを持っておき、
+        #   毎サイクルos.sched_getaffinity(0)(このプロセスが実際に乗りうるコア
+        #   集合、Phase 4でアフィニティ固定後はその固定コアだけになる)へ絞って
+        #   読む。取得できない場合は全コアへフォールバックする。
+        self._pf_freq_path_by_core = {}
+        for p in self._pf_freq_paths:
+            try:
+                core_id = int(os.path.basename(os.path.dirname(os.path.dirname(p)))[3:])
+                self._pf_freq_path_by_core[core_id] = p
+            except (ValueError, IndexError):
+                pass
+        self._pf_freq_available = len(self._pf_freq_paths) > 0
+        if self._pf_freq_available and self._pf_read_cpu_freqs_khz() is None:
+            self._pf_freq_available = False
+        if self._pf_freq_available:
+            self.get_logger().info(
+                f"[PERF-SPIKE] cpu freq sampling enabled: "
+                f"{len(self._pf_freq_paths)} cores")
+        else:
+            self.get_logger().warn(
+                "[PERF-SPIKE] scaling_cur_freq not readable (sysfs cpufreq "
+                "invisible in this container/environment?) - frequency fields "
+                "will report N/A. If DVFS attribution matters here, run a "
+                "host-side parallel sampler instead (see design doc Phase 1).")
+        self._pf_freq_win_sum = 0.0
+        self._pf_freq_win_min = None
+        self._pf_freq_win_max = None
+        self._pf_freq_win_samples = 0
+        self._pf_cur_freq_avg_mhz = None
+        self._pf_cur_freq_min_mhz = None
+        self._pf_cur_freq_max_mhz = None
+        # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 4、C3実験用):
+        #   mpc_controllerプロセス自身を指定コアへsched_setaffinityで固定する。
+        #   config.yamlのmpc.cpu_affinity(既定[]=無効)から読み、空なら何もしない
+        #   (現状と完全に同一挙動)。BLASワーカースレッド等が後から生成される場合に
+        #   制限を確実に継承させるため、可能な限り早いタイミング(このノードの
+        #   計装初期化=事実上最初の_control()呼び出し冒頭)で設定する。
+        cpu_affinity = getattr(self._cfg.mpc, "cpu_affinity", [])  # type: ignore
+        if cpu_affinity:
+            try:
+                os.sched_setaffinity(0, set(int(c) for c in cpu_affinity))
+            except (AttributeError, OSError, ValueError) as e:
+                self.get_logger().warn(
+                    f"[PERF-PLATFORM] cpu_affinity={list(cpu_affinity)} requested but "
+                    f"os.sched_setaffinity failed ({e}) - ignoring, running unpinned")
+        self._pf_log_platform_checklist()
         _gc.callbacks.append(self._pf_gc_cb)
+
+    def _pf_log_platform_checklist(self):
+        """2026-08-01追加(262節続報、プラットフォーム状態計装Phase 1): 起動時に1回、
+        governor・周波数上限・判明する範囲の電源制限状態を記録する。「出力制限
+        解除」前後の実測比較を後から検証できるようにするための証跡であり、
+        制御には一切影響しない。読み取れない項目はN/Aとし、失敗しても起動を
+        止めない(sysfsが見えないコンテナ環境を想定)。"""
+        governors = set()
+        max_freqs_khz = []
+        for p in self._pf_freq_paths:
+            core_dir = os.path.dirname(p)
+            try:
+                with open(os.path.join(core_dir, 'scaling_governor'), 'r') as f:
+                    governors.add(f.read().strip())
+            except OSError:
+                pass
+            try:
+                with open(os.path.join(core_dir, 'scaling_max_freq'), 'r') as f:
+                    max_freqs_khz.append(int(f.read().strip()))
+            except (OSError, ValueError):
+                pass
+        governor_str = ','.join(sorted(governors)) if governors else 'N/A'
+        max_freq_str = ('%.0fMHz' % (max(max_freqs_khz) / 1000.0)) if max_freqs_khz else 'N/A'
+        rapl_uw = None
+        for rapl_path in _glob.glob(
+                '/sys/class/powercap/intel-rapl:*/constraint_0_power_limit_uw'):
+            try:
+                with open(rapl_path, 'r') as f:
+                    rapl_uw = int(f.read().strip())
+                    break
+            except (OSError, ValueError):
+                continue
+        rapl_str = ('%.1fW' % (rapl_uw / 1e6)) if rapl_uw is not None else 'N/A'
+        # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 4、C3実験用):
+        #   実効アフィニティ(os.sched_getaffinity(0)の実測値)を記録する。
+        #   cpu_affinity未設定時も「制限なし=全コア」がそのまま出るので、
+        #   C0-C3のログを見比べるだけで設定漏れに気づける。
+        try:
+            effective_affinity = sorted(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            effective_affinity = 'N/A'
+        self.get_logger().info(
+            f"[PERF-PLATFORM] governor={governor_str} "
+            f"scaling_max_freq={max_freq_str} rapl_power_limit={rapl_str} "
+            f"cores_sampled={len(self._pf_freq_paths)} "
+            f"cpu_affinity={effective_affinity}")
+
+    def _pf_read_cpu_freqs_khz(self, paths=None):
+        """指定パス(既定は全コア)のscaling_cur_freq[kHz]をリストで返す。1コアでも
+        読み取りに失敗したらNoneを返す(部分的な値は帰属分析を歪めるため使わない)。"""
+        target_paths = self._pf_freq_paths if paths is None else paths
+        vals = []
+        for p in target_paths:
+            try:
+                with open(p, 'r') as f:
+                    vals.append(int(f.read().strip()))
+            except (OSError, ValueError):
+                return None
+        return vals if vals else None
+
+    def _pf_affinity_freq_paths(self):
+        """このプロセスの現在のCPUアフィニティ(os.sched_getaffinity(0))に
+        含まれるコアのscaling_cur_freqパスだけを返す。アフィニティが取得できない・
+        既知コアと一致しない場合は全コアへフォールバックする(N/A化はしない、
+        「限定できないなら従来通り全体を見る」という安全側の挙動)。"""
+        try:
+            affinity = os.sched_getaffinity(0)
+        except (AttributeError, OSError):
+            return self._pf_freq_paths
+        paths = [self._pf_freq_path_by_core[c] for c in sorted(affinity)
+                 if c in self._pf_freq_path_by_core]
+        return paths if paths else self._pf_freq_paths
+
+    def _pf_sample_cpu_freq(self):
+        """毎サイクル1回、CPU周波数[MHz]をサンプルしてこのサイクルの代表値
+        (アフィニティ内コアの平均・最小・最大)を self._pf_cur_freq_* へ格納し、
+        窓集計(min/avg/max)も同時に更新する。読み取り不可の環境ではNoneのまま。"""
+        if not self._pf_freq_available:
+            return
+        freq_khz = self._pf_read_cpu_freqs_khz(self._pf_affinity_freq_paths())
+        if freq_khz is None:
+            return
+        avg_mhz = sum(freq_khz) / len(freq_khz) / 1000.0
+        min_mhz = min(freq_khz) / 1000.0
+        max_mhz = max(freq_khz) / 1000.0
+        self._pf_cur_freq_avg_mhz = avg_mhz
+        self._pf_cur_freq_min_mhz = min_mhz
+        self._pf_cur_freq_max_mhz = max_mhz
+        self._pf_freq_win_sum += avg_mhz
+        self._pf_freq_win_samples += 1
+        if self._pf_freq_win_min is None or avg_mhz < self._pf_freq_win_min:
+            self._pf_freq_win_min = avg_mhz
+        if self._pf_freq_win_max is None or avg_mhz > self._pf_freq_win_max:
+            self._pf_freq_win_max = avg_mhz
 
     def _pf_gc_cb(self, phase, info):
         if phase == 'start':
             self._pf_gc_t0 = _time.perf_counter()
+            self._pf_gc_gen = info.get('generation')
         elif self._pf_gc_t0 is not None:
-            self._pf_add('gc', _time.perf_counter() - self._pf_gc_t0)
+            dt = _time.perf_counter() - self._pf_gc_t0
+            self._pf_add('gc', dt)
+            # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3、GC仮説(c)):
+            #   世代2(最も重い)回収がこのサイクル内で発生したかをフラグ化する。
+            #   [PERF-SPIKE]用でありcycle開始時にリセットされる(_control()参照)。
+            if getattr(self, '_pf_gc_gen', None) == 2:
+                self._pf_cycle_gen2_flag = True
+                self._pf_cycle_gen2_duration += dt
             self._pf_gc_t0 = None
 
     def _pf_add(self, name, dt):
@@ -4296,28 +4471,53 @@ class MPCController(Node):
             acc[2] += 1
             if dt > acc[1]:
                 acc[1] = dt
+        # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): [PERF-SPIKE]用に
+        #   このサイクルの区間別実測値を保持する(cycle開始時にリセットされる、
+        #   _control()参照)。既存の窓集計(_pf_acc、上記)には一切影響しない。
+        if hasattr(self, '_pf_last_cycle'):
+            self._pf_last_cycle[name] = dt
 
     def _pf_mark(self, name):
         t = _time.perf_counter()
         self._pf_add(name, t - self._pf_last)
         self._pf_last = t
 
-    def _pf_cycle_end(self, work):
+    def _pf_cycle_end(self, work, work_cpu=0.0):
         self._pf_cycles += 1
         self._pf_work_sum += work
+        self._pf_sample_cpu_freq()
         if work > self._pf_work_max:
             self._pf_work_max = work
         if work > self._pf_over_budget_s:
             self._pf_over25 += 1
+        # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 1): wallの
+        #   窓集計と並行してスレッドCPU時間(work_cpu)も窓集計する。
+        self._pf_work_cpu_sum += work_cpu
+        if work_cpu > self._pf_work_cpu_max:
+            self._pf_work_cpu_max = work_cpu
         self._pf_obs_max = max(self._pf_obs_max, getattr(self, "_dbg_n_dynobs", 0))
+        # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): [PERF-SPIKE]用の
+        #   「前サイクルからの差分」追跡は窓境界と無関係に毎サイクル行う(そうで
+        #   ないとスパイク発火時だけ差分を取ることになり、直前が別のスパイク
+        #   だった場合に差分の意味がずれる)。getrusage呼び出しは実測0.7μs/回
+        #   程度で毎サイクルのコストとして無視できる水準。
+        self._pf_dump_spike_if_needed(work, work_cpu)
         if self._pf_report_every and self._pf_cycles >= self._pf_report_every:
             k = self._pf_cycles
             parts = ' | '.join(
                 '%s a=%.1f m=%.1f' % (n, a[0] / max(a[2], 1) * 1000, a[1] * 1000)
                 for n, a in sorted(self._pf_acc.items()) if n != 'sleep')
-            print('[PERF] n=%d work avg=%.1fms max=%.1fms >25ms=%d回 n_dynobs_max=%d | %s'
+            # 2026-08-01修正(261節続報、72Hzスパイク調査Phase 2-2): カウンタ
+            #   自体(_pf_over25)は既にself._pf_over_budget_s(=1/control_rate、
+            #   72Hzなら13.9ms)を正しく参照していたが、ラベル文字列だけが
+            #   "25ms"の固定表記のまま取り残されていた(表示のみのバグ、
+            #   カウンタ値そのものは常に正しい)。実際の予算[ms]を動的に表示する。
+            print('[PERF] n=%d work avg=%.1fms max=%.1fms >%.1fms=%d回 '
+                  'work_cpu avg=%.1fms max=%.1fms n_dynobs_max=%d | %s'
                   % (k, self._pf_work_sum / k * 1000, self._pf_work_max * 1000,
-                     self._pf_over25, self._pf_obs_max, parts), flush=True)
+                     self._pf_over_budget_s * 1000,
+                     self._pf_over25, self._pf_work_cpu_sum / k * 1000,
+                     self._pf_work_cpu_max * 1000, self._pf_obs_max, parts), flush=True)
             # 179節続報: docker statsが使えない予選環境でも同じ診断ができるよう、
             #   このプロセス自身の実CPU時間と不随意コンテキストスイッチ数を[PERF]と
             #   同じ窓で報告する。cpu_ratio(実CPU時間/壁時計時間)が1に近ければ純粋な
@@ -4330,9 +4530,18 @@ class MPCController(Node):
             _nvcsw = _ru.ru_nvcsw - _prev.ru_nvcsw
             _wall_time = self._pf_work_sum
             _cpu_ratio = _cpu_time / _wall_time if _wall_time > 1e-9 else float('nan')
+            # 2026-08-01追加(262節続報、プラットフォーム状態計装Phase 1): この窓の
+            #   CPU周波数min/avg/maxを同じ行に含める。読み取り不可の環境ではN/A。
+            if self._pf_freq_available and self._pf_freq_win_samples > 0:
+                _freq_str = 'freq_avg=%.0fMHz freq_min=%.0fMHz freq_max=%.0fMHz' % (
+                    self._pf_freq_win_sum / self._pf_freq_win_samples,
+                    self._pf_freq_win_min, self._pf_freq_win_max)
+            else:
+                _freq_str = 'freq_avg=N/A freq_min=N/A freq_max=N/A'
             print('[PERF-RUSAGE] n=%d cpu_time=%.2fs wall_time=%.2fs cpu_ratio=%.2f '
-                  'nivcsw=%d nvcsw=%d'
-                  % (k, _cpu_time, _wall_time, _cpu_ratio, _nivcsw, _nvcsw), flush=True)
+                  'nivcsw=%d nvcsw=%d %s'
+                  % (k, _cpu_time, _wall_time, _cpu_ratio, _nivcsw, _nvcsw, _freq_str),
+                  flush=True)
             self._pf_rusage_prev = _ru
             self._pf_acc = {}
             self._pf_cycles = 0
@@ -4340,6 +4549,65 @@ class MPCController(Node):
             self._pf_work_max = 0.0
             self._pf_over25 = 0
             self._pf_obs_max = 0
+            self._pf_work_cpu_sum = 0.0
+            self._pf_work_cpu_max = 0.0
+            self._pf_freq_win_sum = 0.0
+            self._pf_freq_win_min = None
+            self._pf_freq_win_max = None
+            self._pf_freq_win_samples = 0
+
+    def _pf_dump_spike_if_needed(self, work, work_cpu=0.0):
+        """2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): work>予算×factorの
+        周期を[PERF-SPIKE]として1行ダンプする。72Hz実測で発見したwork maxの
+        スパイク(45〜65ms、予算の3〜4.7倍)の原因を切り分けるための計装であり、
+        4つの容疑仮説(a: reference_path再構築バースト、b: CPU競合、
+        c: Python GC世代2、d: OSQPフルセットアップ再実行)それぞれの直接的な
+        証拠(cache_builds差分・nivcsw差分・gen2 GCフラグ・コリドーセグメント数
+        変化)を同一行へまとめる。差分計算(nivcsw・cache_builds・nseg)は
+        毎サイクル軽量に行い、文字列整形とprintは発火時のみ行う(オーバーヘッド
+        規律)。"""
+        rp = getattr(self, '_reference_path', None)
+        cache_builds = getattr(rp, '_perfc_cache_build_count', 0) if rp is not None else 0
+        cache_builds_diff = cache_builds - self._pf_prev_cache_builds
+        self._pf_prev_cache_builds = cache_builds
+
+        nivcsw = _resource.getrusage(_resource.RUSAGE_SELF).ru_nivcsw
+        nivcsw_diff = nivcsw - self._pf_prev_nivcsw
+        self._pf_prev_nivcsw = nivcsw
+
+        nseg = (getattr(rp, 'dbg_nseg0', None), getattr(rp, 'dbg_nseg1', None),
+                getattr(rp, 'dbg_nseg2', None)) if rp is not None else (None, None, None)
+        nseg_changed = (self._pf_prev_nseg is not None and nseg != self._pf_prev_nseg)
+        self._pf_prev_nseg = nseg
+
+        if work > self._pf_over_budget_s * self._pf_spike_dump_factor:
+            parts = ' '.join(
+                '%s=%.2f' % (n, dt * 1000) for n, dt in sorted(self._pf_last_cycle.items()))
+            # 2026-08-01追加(262節続報、プラットフォーム状態計装Phase 1): 発火時点の
+            #   CPU周波数(全コア平均・最小・最大)を同じ行に含める。DVFS(電源制限による
+            #   周波数低下)がスパイクと同時に起きているかを直接確認するための項目。
+            if self._pf_freq_available and self._pf_cur_freq_avg_mhz is not None:
+                freq_str = 'freq_avg=%.0fMHz freq_min=%.0fMHz freq_max=%.0fMHz' % (
+                    self._pf_cur_freq_avg_mhz, self._pf_cur_freq_min_mhz,
+                    self._pf_cur_freq_max_mhz)
+            else:
+                freq_str = 'freq_avg=N/A freq_min=N/A freq_max=N/A'
+            # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 1): wall(work)と
+            #   スレッドCPU時間(work_cpu)を並べて記録する。wall≫cpuならこのサイクルは
+            #   スケジューラに横取りされて待たされていた証拠、wall≈cpuなら本当に計算量が
+            #   増えた証拠——帰属の直接判定材料になる。ただしOSQP/numpyのBLASが内部で
+            #   複数スレッドを使う場合、work_cpuは呼び出しスレッド単体のCPU時間のため
+            #   ヘルパースレッド分を含まず、健全な高負荷サイクルでもwall>cpuになりうる
+            #   点に注意(解釈時は[PERF-RUSAGE]のプロセス全体cpu_ratioと突き合わせること)。
+            print(
+                '[PERF-SPIKE] loop=%d loop_mod100=%d work=%.2fms work_cpu=%.2fms budget=%.2fms '
+                'cache_builds_diff=%d nivcsw_diff=%d gen2_gc=%s gen2_gc_dur=%.2fms '
+                'nseg=%s nseg_changed=%s %s | %s'
+                % (self._loop, self._loop % 100, work * 1000, work_cpu * 1000,
+                   self._pf_over_budget_s * 1000, cache_builds_diff, nivcsw_diff,
+                   self._pf_cycle_gen2_flag, self._pf_cycle_gen2_duration * 1000,
+                   nseg, nseg_changed, freq_str, parts),
+                flush=True)
 
     # 2026-07-31追加(255節続報、レートスケーリングのクローズ作業Phase 2):
     #   制御ループは`while rclpy.ok(): self._control()` + `rclpy.Rate.sleep()`
@@ -4359,6 +4627,20 @@ class MPCController(Node):
         self._dtperf_over_count = 0
         self._dtperf_cur_streak = 0
         self._dtperf_max_streak = 0
+        # 2026-08-01追加(257節続報、72Hz切替準備Phase 1): rclpy.Rateの起床
+        #   ジッタにより、健全な周期でもdtは予算を中心に上下へ散らばる。
+        #   マージン無しの「dt>予算」判定は、ジッタが予算の内側で収まって
+        #   いても約半数の周期で真になりうる誤検出を招くため、40Hzベースライン
+        #   の実測(ε較正)から決めるマージンをconfig.yaml
+        #   (mpc.perf_dt_over_margin_ms、既定0.0=旧挙動と同一)から読む。
+        #   この値は計測の判定閾値であり制御には一切影響しないため、
+        #   レートスケーリングの換算対象外とする(test_rate_scaling_254.pyの
+        #   EXEMPT_PARAMSに理由付きで登録済み)。
+        self._dtperf_over_margin_s = float(
+            getattr(self._cfg.mpc, "perf_dt_over_margin_ms", 0.0)) / 1000.0  # type: ignore
+        self.get_logger().info(
+            f"[PERF-DT] over_margin: {self._dtperf_over_margin_s * 1000:.3f}ms "
+            f"(config: mpc.perf_dt_over_margin_ms, レートスケーリング対象外)")
 
     def _dtperf_reset_window(self):
         """レポート出力後の窓リセット。_dtperf_cur_streakだけは意図的に
@@ -4375,7 +4657,9 @@ class MPCController(Node):
             self._dtperf_init()
         self._dtperf_cycles += 1
         self._dtperf_dts.append(dt)
-        if dt > self._pf_over_budget_s:
+        # 2026-08-01追加(72Hz切替準備Phase 1): 超過判定に較正済みマージンを
+        #   加える(margin=0.0なら旧挙動と完全に同一)。
+        if dt > self._pf_over_budget_s + self._dtperf_over_margin_s:
             self._dtperf_over_count += 1
             self._dtperf_cur_streak += 1
             self._dtperf_max_streak = max(self._dtperf_max_streak, self._dtperf_cur_streak)
@@ -4393,9 +4677,10 @@ class MPCController(Node):
             dt_max = dts[-1]
             over_ratio = self._dtperf_over_count / n
             print('[PERF-DT] n=%d p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms '
-                  'eff_rate=%.2fHz over_budget=%.2f%% max_consec_over=%d'
+                  'eff_rate=%.2fHz over_budget=%.2f%% max_consec_over=%d margin=%.3fms'
                   % (n, p50 * 1000, p95 * 1000, p99 * 1000, dt_max * 1000,
-                     effective_rate, over_ratio * 100, self._dtperf_max_streak),
+                     effective_rate, over_ratio * 100, self._dtperf_max_streak,
+                     self._dtperf_over_margin_s * 1000),
                   flush=True)
             self._dtperf_reset_window()
 
@@ -4486,11 +4771,31 @@ class MPCController(Node):
     def _control(self):
         if not hasattr(self, '_pf_acc'):
             self._pf_init()
+        # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): [PERF-SPIKE]用の
+        #   サイクル内状態をこのサイクル開始時にリセットする(_pf_add/_pf_gc_cb
+        #   経由でこのサイクル中に上書きされていく)。
+        self._pf_last_cycle = {}
+        self._pf_cycle_gen2_flag = False
+        self._pf_cycle_gen2_duration = 0.0
         self._pf_last = _time.perf_counter()
         now = self.get_clock().now()
         t = (now - self._t_start).nanoseconds / 1e9
         dt = (now - self._last_t).nanoseconds / 1e9
-        self._dtperf_record(dt)
+        # 2026-08-01追加(72Hz切替準備Phase 1): [PERF-DT]専用の壁時計ベースdt。
+        #   既存のdt(上記、self.get_clock()由来)は制御ロジック(ramp_step等)が
+        #   使い続けるため一切変更しない。AWSIM接続時はuse_sim_time:=trueで
+        #   起動され(run_autoware.bash)、self.get_clock().now()は/clockトピック
+        #   由来のシミュレーション時刻を返す。シミュレータが壁時計の1倍速で
+        #   進んでいない(GPU/CPU負荷でレンダリングが遅れる等)場合、このdtは
+        #   実際のrclpy.Rate.sleep()のジッタを反映しなくなり、72Hz予算(13.9ms)
+        #   との比較が歪む。そこで[PERF-DT]計装だけはtime.perf_counter()
+        #   (常に壁時計)で独立に測る。
+        _now_wall = _time.perf_counter()
+        if not hasattr(self, '_dtperf_last_wall'):
+            self._dtperf_last_wall = _now_wall
+        _wall_dt = _now_wall - self._dtperf_last_wall
+        self._dtperf_last_wall = _now_wall
+        self._dtperf_record(_wall_dt)
 
         self._last_t = now
         self._loop += 1
@@ -4502,6 +4807,13 @@ class MPCController(Node):
         self._control_rate.sleep()
         self._pf_mark('sleep')
         _pf_work0 = _time.perf_counter()
+        # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 1): workは壁時計
+        #   (perf_counter)のためスケジューラによる横取り待ちを含んでしまい、
+        #   「計算量が増えた」のか「CPUを取り上げられて待たされた」のかを区別
+        #   できない。呼び出しスレッド自身のCPU時間(thread_time)を並行して測り、
+        #   wall≫cpuならスケジューラ起因、wall≈cpuなら真の計算量増と判定する
+        #   材料にする(_pf_cycle_endへ渡す)。
+        _pf_work_cpu0 = _time.thread_time()
 
         if self._loop % 100 == 0:
             # update reference path
@@ -6540,7 +6852,8 @@ class MPCController(Node):
             self._publish_overtake_status(_fwd_dbg, u)
             self._pf_add('overtake_status', _time.perf_counter() - _t0)
         self._pf_mark('pubtail')
-        self._pf_cycle_end(_time.perf_counter() - _pf_work0)
+        self._pf_cycle_end(_time.perf_counter() - _pf_work0,
+                            _time.thread_time() - _pf_work_cpu0)
 
     def run(self) -> None:
         self._wait_until_clock_received()
