@@ -1,0 +1,31 @@
+# 2026-08-01(262節続報、判定基準改訂+work_cpu計装Phase 4): C4実験用override
+# (C3の一方通行アフィニティを双方向へ拡張)。docker composeはdocker-compose.yml +
+# docker-compose.override.ymlを自動マージするが、このリポジトリの.envは
+# COMPOSE_FILEを明示指定しているため自動マージは効かない。使用時は
+#   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml:docker-compose.c4-experiment.yml"
+# としてから`make dev`すること(C1-C3実験と同じ手順)。
+#
+# 使い方: 上記exportに加え、config.yamlのmpc.cpu_affinityを一時的に
+#   [2, 3, 4, 5](論理4コア=物理2コア、コア1のペア+コア2のペア)へ設定する。
+#   実験後はexportを解除し、config.yamlのcpu_affinityを[]へ戻す。
+#
+# C3(mpc_controllerプロセスのみを一方的にアフィニティ固定)は外部競合(nivcsw)を
+# 減らしたが、他の同居ノード(rviz2・ekf_localizer・autostart_orchestrator等)は
+# mpc専有コアへ自由に侵入でき、双方向の隔離になっていなかった。
+#
+# C4はこれを解消する:
+#   1. autowareの`cpus`クォータは16のまま(C3から継続、実質無制限)
+#   2. AUTOWARE_OTHER_NODES_CPU_AFFINITY環境変数(run_autoware.bash側で解釈)で
+#      `ros2 launch`親プロセス自体をtasksetし、mpc_controllerの専有コア(2-5)の
+#      補集合(0,1,6-15)へ制限する。taskset無しで起動される子プロセス(rviz2等)は
+#      通常このアフィニティを継承するため、他ノードのソースコードやそれぞれの
+#      launchファイルには一切手を加えずに済む
+#   3. mpc_controllerプロセス自身は起動直後にos.sched_setaffinity(config.yamlの
+#      mpc.cpu_affinity経由)で自分だけ[2,3,4,5]へ上書きする(このoverride ではなく
+#      config.yaml側の変更)
+#   4. simulatorは現状維持(制限なし)
+services:
+  autoware:
+    cpus: "16"
+    environment:
+      - AUTOWARE_OTHER_NODES_CPU_AFFINITY=0,1,6-15

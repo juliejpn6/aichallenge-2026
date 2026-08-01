@@ -4261,6 +4261,7 @@ class MPCController(Node):
         self._pf_work_max = 0.0
         self._pf_work_cpu_sum = 0.0
         self._pf_work_cpu_max = 0.0
+        self._pf_work_cpu_over = 0
         self._pf_over25 = 0
         self._pf_report_every = self._rate_scaled_cycles("_pf_report_every", 400)   # ≈10秒(40Hz)
         # 2026-07-31追加(254節続報): [PERF]の周期超過判定閾値(旧: 0.025固定=40Hzの
@@ -4398,6 +4399,46 @@ class MPCController(Node):
             f"scaling_max_freq={max_freq_str} rapl_power_limit={rapl_str} "
             f"cores_sampled={len(self._pf_freq_paths)} "
             f"cpu_affinity={effective_affinity}")
+        # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 4、C4実験
+        #   「双方向アフィニティ」用): 同居する主要プロセス(rviz2・component_container
+        #   [ekf_localizer/gnss_poser等が composition で同居]・autostart_orchestrator・
+        #   v2x_marker_publisher)の実効アフィニティを/procから走査して記録する。
+        #   run_autoware.bashのtaskset(AUTOWARE_OTHER_NODES_CPU_AFFINITY)が実際に
+        #   これらへ効いているか、mpc_controllerの専有コアへ侵入していないかを、
+        #   ログだけで確認できるようにするための診断であり、制御には一切影響しない。
+        #   走査に失敗しても起動を止めない。
+        self._pf_log_colocated_affinity()
+
+    def _pf_log_colocated_affinity(self):
+        targets = ('rviz2', 'component_container', 'autostart_orchestrator',
+                   'v2x_marker_publisher')
+        found = {}
+        try:
+            pids = [e for e in os.listdir('/proc') if e.isdigit()]
+        except OSError:
+            pids = []
+        for pid in pids:
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    cmdline = f.read().decode('utf-8', errors='replace')
+            except OSError:
+                continue
+            match = next((t for t in targets if t in cmdline), None)
+            if match is None or match in found:
+                continue
+            try:
+                with open(f'/proc/{pid}/status') as f:
+                    for line in f:
+                        if line.startswith('Cpus_allowed_list:'):
+                            found[match] = line.split(':', 1)[1].strip()
+                            break
+            except OSError:
+                continue
+        if found:
+            self.get_logger().info(f"[PERF-PLATFORM] colocated_affinity={found}")
+        else:
+            self.get_logger().info(
+                "[PERF-PLATFORM] colocated_affinity=N/A (target processes not found)")
 
     def _pf_read_cpu_freqs_khz(self, paths=None):
         """指定パス(既定は全コア)のscaling_cur_freq[kHz]をリストで返す。1コアでも
@@ -4495,6 +4536,13 @@ class MPCController(Node):
         self._pf_work_cpu_sum += work_cpu
         if work_cpu > self._pf_work_cpu_max:
             self._pf_work_cpu_max = work_cpu
+        # 2026-08-01追加(262節続報、判定基準改訂Phase 2、work基準の関心分離): work
+        #   (wall)には既にover25(_pf_over25)があるが、work_cpu側の予算超過回数は
+        #   未計装だった。「計算余裕はwork_cpuで判定」という改訂基準を検証可能に
+        #   するため、work基準(_pf_over25)と全く同じ閾値(self._pf_over_budget_s)で
+        #   work_cpu版のカウンタを追加する。
+        if work_cpu > self._pf_over_budget_s:
+            self._pf_work_cpu_over += 1
         self._pf_obs_max = max(self._pf_obs_max, getattr(self, "_dbg_n_dynobs", 0))
         # 2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): [PERF-SPIKE]用の
         #   「前サイクルからの差分」追跡は窓境界と無関係に毎サイクル行う(そうで
@@ -4513,11 +4561,12 @@ class MPCController(Node):
             #   "25ms"の固定表記のまま取り残されていた(表示のみのバグ、
             #   カウンタ値そのものは常に正しい)。実際の予算[ms]を動的に表示する。
             print('[PERF] n=%d work avg=%.1fms max=%.1fms >%.1fms=%d回 '
-                  'work_cpu avg=%.1fms max=%.1fms n_dynobs_max=%d | %s'
+                  'work_cpu avg=%.1fms max=%.1fms >%.1fms=%d回 n_dynobs_max=%d | %s'
                   % (k, self._pf_work_sum / k * 1000, self._pf_work_max * 1000,
                      self._pf_over_budget_s * 1000,
                      self._pf_over25, self._pf_work_cpu_sum / k * 1000,
-                     self._pf_work_cpu_max * 1000, self._pf_obs_max, parts), flush=True)
+                     self._pf_work_cpu_max * 1000, self._pf_over_budget_s * 1000,
+                     self._pf_work_cpu_over, self._pf_obs_max, parts), flush=True)
             # 179節続報: docker statsが使えない予選環境でも同じ診断ができるよう、
             #   このプロセス自身の実CPU時間と不随意コンテキストスイッチ数を[PERF]と
             #   同じ窓で報告する。cpu_ratio(実CPU時間/壁時計時間)が1に近ければ純粋な
@@ -4551,6 +4600,7 @@ class MPCController(Node):
             self._pf_obs_max = 0
             self._pf_work_cpu_sum = 0.0
             self._pf_work_cpu_max = 0.0
+            self._pf_work_cpu_over = 0
             self._pf_freq_win_sum = 0.0
             self._pf_freq_win_min = None
             self._pf_freq_win_max = None

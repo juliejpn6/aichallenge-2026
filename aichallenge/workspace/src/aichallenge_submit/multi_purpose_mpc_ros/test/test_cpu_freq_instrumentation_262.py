@@ -317,6 +317,23 @@ def test_platform_checklist_logs_effective_affinity():
     assert "cpu_affinity={effective_affinity}" in snippet
 
 
+def test_pf_work_cpu_over_counter_uses_same_threshold_as_work():
+    """262節続報Phase 2(work基準の関心分離): work_cpu側の予算超過回数も
+    work(_pf_over25)と全く同じ閾値(self._pf_over_budget_s)でカウントすること。"""
+    idx = _SRC.index("def _pf_cycle_end(self, work, work_cpu=0.0):")
+    idx_end = _SRC.index("\n    def _pf_dump_spike_if_needed", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "if work_cpu > self._pf_over_budget_s:" in snippet
+    assert "self._pf_work_cpu_over += 1" in snippet
+
+
+def test_pf_work_cpu_over_reset_after_report():
+    idx = _SRC.index("'[PERF-RUSAGE]")
+    idx_end = _SRC.index("\n    def _pf_dump_spike_if_needed", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "self._pf_work_cpu_over = 0" in snippet
+
+
 def test_cpu_affinity_registered_in_config_default():
     """config.yamlのデフォルトが空リスト(=無効、現状と同一挙動)であることの確認。"""
     cfg_path = os.path.join(
