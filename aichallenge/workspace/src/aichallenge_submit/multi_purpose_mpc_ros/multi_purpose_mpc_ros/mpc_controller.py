@@ -4422,11 +4422,37 @@ class MPCController(Node):
             effective_affinity = sorted(os.sched_getaffinity(0))
         except (AttributeError, OSError):
             effective_affinity = 'N/A'
+        # 2026-08-02追加(263節、予選環境ギャップ分析準備Phase 1): 予選環境が
+        #   sim time(非等速再生の可能性)で走行しているかは、[PERF-DT]の
+        #   perf_counterベースdtの解釈(実時間との対応)に直結するため、
+        #   起動時1回のプラットフォーム記録へ含める。
         self.get_logger().info(
             f"[PERF-PLATFORM] governor={governor_str} "
             f"scaling_max_freq={max_freq_str} rapl_power_limit={rapl_str} "
             f"cores_sampled={len(self._pf_freq_paths)} "
-            f"cpu_affinity={effective_affinity}")
+            f"cpu_affinity={effective_affinity} use_sim_time={self.use_sim_time}")
+        # 2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2): 「Autowareに
+        #   約3vCPU/12GiB割当」(2026-07-24時点の推定値、精度に留保あり)を
+        #   実測で確定させるため、cgroup制限・CPUモデル・論理コア数を記録する。
+        #   あわせて、この行以下の項目それぞれが読み取れたか(OK/N-A)を1行で
+        #   サマリし、予選環境で「どこまで比較できるか」が起動ログだけで
+        #   判るようにする。
+        cgroup = self._pf_read_cgroup_limits()
+        cpu_model = self._pf_read_cpu_model()
+        cpu_count = os.cpu_count() or 'N/A'
+        self.get_logger().info(
+            f"[PERF-PLATFORM] cgroup={cgroup['version']} "
+            f"cpu_quota_cores={cgroup['cpu_quota_str']} "
+            f"cpuset_cpus={cgroup['cpuset_str']} "
+            f"memory_max={cgroup['memory_max_str']} "
+            f"cpu_model=\"{cpu_model}\" cpu_count={cpu_count}")
+        self.get_logger().info(
+            "[PERF-PLATFORM] availability: "
+            f"scaling_cur_freq={'OK' if self._pf_freq_available else 'N/A'} "
+            f"sched_schedstats={'OK' if self._pf_run_delay_available else 'N/A'} "
+            f"cgroup_cpu_quota={'OK' if cgroup['cpu_quota_readable'] else 'N/A'} "
+            f"cgroup_cpuset={'OK' if cgroup['cpuset_readable'] else 'N/A'} "
+            f"cgroup_memory_max={'OK' if cgroup['memory_readable'] else 'N/A'}")
         # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 4、C4実験
         #   「双方向アフィニティ」用): 同居する主要プロセス(rviz2・component_container
         #   [ekf_localizer/gnss_poser等が composition で同居]・autostart_orchestrator・
@@ -4436,6 +4462,126 @@ class MPCController(Node):
         #   ログだけで確認できるようにするための診断であり、制御には一切影響しない。
         #   走査に失敗しても起動を止めない。
         self._pf_log_colocated_affinity()
+
+    def _pf_find_cgroup_v2_root(self):
+        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2): このプロセス
+        自身のCPUクォータが読めるcgroup v2ディレクトリを返す(見つからなければ
+        None)。cgroup v2はcpu.maxのようなコントローラファイルを「親が
+        cgroup.subtree_controlで委譲した」階層にしか置かない仕様のため、
+        自分の葉cgroup(/proc/self/cgroupが示すパス)に無くても祖先のどこかに
+        あることがある(開発ホストでの実地検証で確認: 葉には無くsystemd
+        user.sliceレベルにあった)。葉から/sys/fs/cgroupまで祖先を1段ずつ
+        遡り、cpu.maxが最初に見つかった階層を使う。"""
+        candidates = []
+        try:
+            with open('/proc/self/cgroup', 'r') as f:
+                for line in f:
+                    parts = line.strip().split(':', 2)
+                    if len(parts) == 3 and parts[0] == '0' and parts[2]:
+                        p = '/sys/fs/cgroup' + parts[2]
+                        while p.startswith('/sys/fs/cgroup'):
+                            candidates.append(p)
+                            if p == '/sys/fs/cgroup':
+                                break
+                            p = os.path.dirname(p)
+        except OSError:
+            pass
+        if '/sys/fs/cgroup' not in candidates:
+            candidates.append('/sys/fs/cgroup')
+        for cand in candidates:
+            if os.path.exists(os.path.join(cand, 'cpu.max')):
+                return cand
+        return None
+
+    def _pf_read_cgroup_limits(self):
+        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2): cgroup v2を
+        優先し、無ければv1(レガシーなコントローラ別階層)へフォールバックして
+        CPUクォータ・cpuset・メモリ上限を読む。「約3vCPU/12GiB」という予選環境の
+        推定値(2026-07-24時点、精度に留保あり)を実測で確定させるための計装。
+        「unlimited」(制限ファイル自体は読めたが上限が設定されていない)と
+        「N/A」(ファイルが読めない/存在しない)を区別して返す。読み取れない
+        項目があっても他項目やノード起動全体を止めない。"""
+        result = {
+            'version': 'N/A',
+            'cpu_quota_str': 'N/A', 'cpu_quota_readable': False,
+            'cpuset_str': 'N/A', 'cpuset_readable': False,
+            'memory_max_str': 'N/A', 'memory_readable': False,
+        }
+        v2_root = self._pf_find_cgroup_v2_root()
+        if v2_root is not None:
+            result['version'] = 'v2'
+            try:
+                with open(os.path.join(v2_root, 'cpu.max'), 'r') as f:
+                    quota_str, period_str = f.read().split()
+                result['cpu_quota_readable'] = True
+                result['cpu_quota_str'] = (
+                    'unlimited' if quota_str == 'max'
+                    else '%.2f' % (int(quota_str) / int(period_str)))
+            except (OSError, ValueError):
+                pass
+            for cpuset_name in ('cpuset.cpus.effective', 'cpuset.cpus'):
+                try:
+                    with open(os.path.join(v2_root, cpuset_name), 'r') as f:
+                        cpuset_val = f.read().strip()
+                except OSError:
+                    continue
+                if cpuset_val:
+                    result['cpuset_readable'] = True
+                    result['cpuset_str'] = cpuset_val
+                    break
+            try:
+                with open(os.path.join(v2_root, 'memory.max'), 'r') as f:
+                    mem_str = f.read().strip()
+                result['memory_readable'] = True
+                result['memory_max_str'] = (
+                    'unlimited' if mem_str == 'max'
+                    else '%.2fGiB' % (int(mem_str) / (1024 ** 3)))
+            except (OSError, ValueError):
+                pass
+            return result
+        v1_quota_path = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us'
+        v1_period_path = '/sys/fs/cgroup/cpu/cpu.cfs_period_us'
+        if os.path.exists(v1_quota_path):
+            result['version'] = 'v1'
+            try:
+                with open(v1_quota_path, 'r') as f:
+                    quota_us = int(f.read().strip())
+                with open(v1_period_path, 'r') as f:
+                    period_us = int(f.read().strip())
+                result['cpu_quota_readable'] = True
+                result['cpu_quota_str'] = (
+                    'unlimited' if quota_us <= 0 else '%.2f' % (quota_us / period_us))
+            except (OSError, ValueError):
+                pass
+            try:
+                with open('/sys/fs/cgroup/cpuset/cpuset.cpus', 'r') as f:
+                    result['cpuset_str'] = f.read().strip()
+                result['cpuset_readable'] = True
+            except OSError:
+                pass
+            try:
+                with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
+                    mem_bytes = int(f.read().strip())
+                result['memory_readable'] = True
+                # v1の「無制限」は極端に大きな値(例: 9223372036854771712)で表現される。
+                result['memory_max_str'] = (
+                    'unlimited' if mem_bytes >= (1 << 62)
+                    else '%.2fGiB' % (mem_bytes / (1024 ** 3)))
+            except (OSError, ValueError):
+                pass
+        return result
+
+    def _pf_read_cpu_model(self):
+        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2): /proc/cpuinfoの
+        'model name'を返す。読み取れなければ'N/A'。"""
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('model name'):
+                        return line.split(':', 1)[1].strip()
+        except OSError:
+            pass
+        return 'N/A'
 
     def _pf_log_colocated_affinity(self):
         targets = ('rviz2', 'component_container', 'autostart_orchestrator',
