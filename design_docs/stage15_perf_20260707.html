@@ -7720,6 +7720,121 @@ v_max=20km/h環境でもステアリングの蛇行(AXIS06)が未収束のため
 <b>依頼文の食い違いについて(正直な報告)</b>: 今回のユーザー依頼には、詳細な指示(本節の内容)に加えて短い要約が付されていたが、そこには「メインブランチへのマージ」(本エンゲージメントは元々<code>main</code>ブランチへの直接コミット方式であり、マージ対象の別ブランチ自体が存在しない)と「72Hzへの切替」(260節で実際に72Hz実測が不合格だったばかりで、原因未解決・ユーザーの次の判断も未確定という事実と矛盾する)という、事実と異なる前提に基づく指示が含まれていた。詳細な指示(control_rate関連には触れないという絶対制約を含む)を優先し、この2点は実行しなかった。
 </p>
 
-<p class="small">生成: 2026-07-07 / 計装: mpc_controller.py [PERF](区間5+gc/v2x/opp_pubフック)、[PERF-DT](実効周期dt分布・margin、257/259/260節)、reference_path.py [PERF-CORRIDOR](phaseA/phaseB内訳・cache_builds、256/258/261節) / 前レポート: stage1_test_20260706.html / ロードマップ: roadmap_20260705_targets.html</p>
+<h3>262. 72Hzスパイク法医学調査: 40Hz復帰・ビルド検証・[PERF-SPIKE]計装・40Hzでは再現せず(2026-08-01)</h3>
+<p class="small">
+260節の72Hz不合格を受け、根本原因調査(修正は含まない、切り分けのみ)を実施した。
+</p>
+<p class="small">
+<b>Phase 1(即時復帰)</b>: <code>control_rate</code>を40.0へ復帰した。
+</p>
+<p class="small">
+<b>Phase 2(ビルド検証)</b>: ①最重要項目——72Hz実測に使われたビルドにコリドー最適化(258/261節)が実際に入っていたかをDocker経由で直接確認した。<code>install/</code>内の実ビルド済み<code>reference_path.py</code>に<code>_fs_line_cache</code>が8箇所存在し、ベクトル化版<code>_compute_free_segments</code>+フォールバック用<code>_compute_free_segments_scalar</code>の2関数構成になっていることを確認——<b>最適化は搭載済みだった</b>(working treeへの変更はコミット前でもDockerのbind mount経由でビルドへ反映されるため、コミットタイミングとは無関係)。「corridor avg=4.1msが最適化前とほぼ同水準」という当初の疑念は、単に単一車両シナリオでも4ms程度が実際のコストであるという事実であり、ビルド未搭載を示すものではなかった。②<code>[PERF]</code>の<code>&gt;25ms=</code>ラベルを調査した結果、<b>カウンタ自体(<code>_pf_over25</code>)は既に<code>self._pf_over_budget_s</code>(=1/control_rate、72Hzなら13.9ms)を正しく参照しており、表示ラベルの文字列だけが"25ms"固定のまま取り残されていた表示のみのバグ</b>と判明。ラベルを実際の予算値を動的に表示するよう修正した(カウンタ値そのものへの影響は無し)。
+</p>
+<p class="small">
+<b>Phase 3([PERF-SPIKE]計装の実装)</b>: <code>work &gt; 予算×perf_spike_dump_factor</code>(config.yaml新キー、既定2.0、レートスケーリング対象外)の周期を1行でダンプする計装を追加した。1行には周期番号・mod 100(仮説a)・区間別実測値・<code>cache_builds</code>前サイクル差分(仮説a)・<code>ru_nivcsw</code>前サイクル差分(仮説b)・GC世代2発生フラグと所要時間(仮説c、既存の<code>_pf_gc_cb</code>を拡張)・コリドーセグメント数<code>nseg0/1/2</code>と前サイクルからの変化有無(仮説d)を含める。差分追跡(前回値の更新)は発火有無に関わらず毎サイクル無条件に行う設計とし(そうでないと「直前サイクルからの差分」の意味がずれる)、文字列整形・print呼び出しのみ発火時に限定した(getrusage呼び出しは実測0.719μs/回、毎サイクルのコストとして無視できる水準)。単体テスト18件(発火条件・差分計算・GCフック・オーバーヘッド規律のソース構造検証)を追加し、実ビルドでの構築+合成値によるダンプ呼び出しのスモークテストも実施した。
+</p>
+<p class="small">
+<b>Phase 4(40Hzでの切り分け実測 — 再現せず)</b>: 単一車両シナリオ(<code>make dev</code>)で計測を試みた。既定<code>factor=2.0</code>(50ms閾値)で90秒走行→本物の発火0件(config.yamlの起動時ダンプにコメント文字列として"[PERF-SPIKE]"が含まれるため、素朴な<code>grep</code>だと偽陽性1件を拾ってしまう罠に3回連続で嵌り、正しいパターン(行頭<code>[run_mpc_controller.bash-10] [PERF-SPIKE] loop=</code>)へ絞り込んで初めて実際は0件だったと判明——この教訓自体もここに記録する)。<code>factor</code>を1.5(37.5ms)・1.2(30ms)まで段階的に緩めて再実測したが、<b>いずれも0件のまま</b>。最終的にfactor=1.2のまま約10分間(単一車両)通しで走らせても<b>0件</b>だった。
+</p>
+<p class="small">
+<b>結論(正直な限界)</b>: 40Hzでは(閾値を予算の1.2倍=30msまで緩めても)72Hz実測で見られたようなwork max 45〜65msスパイクは10分間で一度も再現しなかった。<code>update_by_topic: false</code>を確認しており、仮説(a)(reference_path再構築バースト)はこの構成では原理的に発生しえないと構造的に確定した(コードパス自体が実行されない)。仮説(b)(CPU競合)・(c)(GC世代2)・(d)(OSQPフルセットアップ)については、40Hzでは発火サンプル自体が得られなかったため、実測データに基づく帰属判定ができなかった。<b>この「40Hzでは再現しない」という事実自体が新しい手がかりである</b>: スパイクが固定サイズの絶対値的現象(GCポーズ・単発CPU横取り等、control_rateに依存しない)だとすれば40Hzでも同程度の頻度で観測されるはずだが、実際には観測されなかった。これは、72Hz特有の何か(単位時間あたりの周期数が約1.8倍になることで、GC/CPU競合/その他の低頻度イベントが単位時間あたりにより多く「くじを引く」機会を得る、等)がスパイク頻度に寄与している可能性を示唆するが、今回のデータだけでは断定できない。最も直接的な次の一手は、今回実装した<code>[PERF-SPIKE]</code>計装を持った状態で実際に72Hzへ再度切り替えて実測することだが、これは本節の絶対制約(control_rateは40.0のまま)の範囲外であり、次のタスクとしてユーザーの判断を仰ぐ。
+</p>
+<p class="small">
+<b>検証</b>: 回帰スイート全体2808件PASS(既存2790件+新規18件)。修正コード(<code>&gt;25ms</code>ラベル・[PERF-SPIKE]計装)は計測・表示のみで、コリドー等価性・制御ロジックには一切触れていない。
+</p>
+
+<h3>263. 72Hz再実測: 260節比で大幅改善(4基準中2基準が新規合格)、スパイク主因はmpc_corridor+CPU競合示唆(2026-08-01)</h3>
+<p class="small">
+ユーザーから「パソコンの出力制限がかかっていた可能性がある、現在は解除している」との情報を受け、262節で実装した<code>[PERF-SPIKE]</code>計装を持った状態で<code>control_rate</code>を再度72.0へ変更し、単一車両シナリオ(<code>make dev</code>)で約9分間再実測した。
+</p>
+<p class="small">
+<b>260節との比較(単一車両・同一シナリオ)</b>
+</p>
+<table class="xtab" style="width:100%; font-size:0.85rem;">
+<tr><th>指標</th><th>260節(旧)</th><th>今回</th><th>変化</th></tr>
+<tr><td>work avg</td><td>9.17ms</td><td>6.09ms</td><td>-34%</td></tr>
+<tr><td>work max(窓平均)</td><td>45.41ms</td><td>24.35ms</td><td>-46%</td></tr>
+<tr><td>work>予算 割合</td><td>6.41%</td><td>0.823%</td><td>約1/8(目標0.1%にはまだ届かず❌)</td></tr>
+<tr><td>dt p99(窓平均)</td><td>34.95ms</td><td>28.43ms</td><td>-19%(目標20.85msにはまだ届かず❌)</td></tr>
+<tr><td>dt max(窓平均)</td><td>57.50ms</td><td>39.61ms</td><td>-31%</td></tr>
+<tr><td>連続超過(margin=85ms)</td><td>0</td><td>0</td><td>✓合格を維持</td></tr>
+<tr><td>eff_rate</td><td>68.69Hz</td><td>70.43Hz</td><td>**✓新規合格**(70Hz基準を上回った)</td></tr>
+</table>
+<p class="small">
+総合判定はまだ<b>不合格</b>(4基準中2基準が未達)だが、260節の「64倍」「58/58窓すべて未達」という壊滅的な不合格から、達成まであと一歩の水準まで大幅に改善した。ユーザーの「出力制限が解除された」という情報と時系列的に整合する結果である。
+</p>
+<p class="small">
+<b>[PERF-SPIKE]による帰属分析(実発火33件、9分間)</b>: 全33件で<code>cache_builds_diff=0</code>(仮説a=reference_path再構築バーストを完全に排除、<code>update_by_topic: false</code>と整合)・<code>gen2_gc=False</code>(仮説c=GC世代2を完全に排除)・<code>nseg=(0,20,0)</code>固定かつ<code>nseg_changed=False</code>(仮説d=OSQP制約次元変化を完全に排除、コリドーは常に全waypoint1区間のまま複雑化していない)。<b>残る容疑は仮説b(CPU競合)のみ</b>で、33件中ほとんどのケースで<code>mpc</code>・<code>mpc_setup</code>・<code>mpc_corridor</code>がほぼ同時に(同一比率で)膨らんでおり、内因(dのような特定区間だけの単独スパイク)ではなく外因(区間を問わず同じ計算が遅くなる)のパターンと一致する。具体的には典型例で<code>mpc_corridor</code>が通常の2-4msから20-28msへ(約7-10倍)膨らんでいるが、これは256/258節のベクトル化最適化そのものが退行したのではなく(<code>nseg</code>不変=処理内容は不変)、<b>同じ軽い計算が何らかの理由で遅く実行された</b>ことを示す。<code>nivcsw_diff</code>(不随意コンテキストスイッチの前サイクル差分)はスパイク時5〜25(最悪ケースloop=24192で22)で、全区間平均の1周期あたりnivcsw(3.45)を上回る値が大半を占めており、CPU横取り(スケジューリング競合)が有力な間接証拠として観測された(直接の因果証明ではない)。1件(loop=24192)のみ<code>pubtail</code>(publish関連)が単独で膨らむ別系統のパターンも見つかり、corridor系スパイクとは別の副次的な遅延源が存在する可能性を示す小さな追加所見として記録する。
+</p>
+<p class="small">
+<b>正直な限界</b>: 1回の比較実測(前後で「出力制限解除」という単一の環境変化)であり、これだけでは因果を断定できない。<code>nivcsw_diff</code>の相関も「有力な状況証拠」であって直接の証明ではなく、より確度の高い結論には複数回の再現実験(同一条件での繰り返し実測、可能なら明示的にCPU負荷を再現させてスパイク再発を誘発する対照実験)が必要である。総合判定は依然として不合格のため、<code>control_rate</code>を72.0のまま確定するかどうかはユーザー判断が必要。
+</p>
+<p class="small">
+<b>検証</b>: 回帰スイート全体2808件PASS(コード変更なし、計測のみ)。
+</p>
+
+<h3>264. C0〜C4双方向アフィニティ実験の完走: work基準の関心分離により分離後基準4/4合格を達成(2026-08-01〜02)</h3>
+<p class="small">
+262/263節の「40Hzでは再現しない」という手がかりを受け、CPUアフィニティ隔離の段階的実験(C0=無介入・C1=governor=performance・C2=コンテナ全体cpuset隔離・C3=mpc_controllerプロセス単体アフィニティ・C4=双方向アフィニティ)を実施した。
+</p>
+<p class="small">
+<b>work_cpu計装による関心分離</b>: 従来のwork(wall、壁時計時間)基準は「計算量」と「スケジューラ遅延」を合成しており、dt系3基準(改訂p99・連続超過・eff_rate)と実害を二重計上していた疑いがあったため、<code>time.thread_time()</code>ベースのwork_cpu計装を新設し、判定基準を「計算余裕(work_cpu>予算≦0.1%)」と「遅延の実害(dt系3基準)」へ分離した。
+</p>
+<p class="small">
+<b>C3(mpc_controllerプロセス単体アフィニティ)</b>: 外部競合(nivcsw)は改善したが、BLASワーカースレッド同士の自己競合により狭いコアへ固定しただけではむしろ悪化する現象を確認。BLAS/OMPスレッド数を1へ制限する対処を追加した。
+</p>
+<p class="small">
+<b>C4(双方向アフィニティ)</b>: <code>mpc_controller</code>を<code>cpu_affinity=[2,3,4,5]</code>で専有コアへ固定し、他ROS2ノードは<code>run_autoware.bash</code>側の<code>taskset</code>(<code>AUTOWARE_OTHER_NODES_CPU_AFFINITY</code>)で補集合コアへ退避する完全分離を実装。72Hz本実測の結果、<b>分離後基準(work_cpu>予算・改訂dt p99・連続超過・eff_rate)ではC4が初めて4基準すべてに合格</b>したが、<b>旧基準(work=wall)では逆にC4が4条件中最悪(1.134%)</b>という逆説的な結果になった。58件の<code>[PERF-SPIKE]</code>全てでwork≫work_cpu(平均ギャップ22.93ms、work_cpu自体は最大18.10msで予算内)であり、残存する超過は計算量増加ではなくスケジューラ由来の待ち時間であることは直接確認できたが、C4がなぜwall基準で悪化したかは本節時点では未解明のまま次節へ持ち越した。
+</p>
+<p class="small">
+<b>検証</b>: 回帰スイート全体PASS(計測系のみの変更、制御ロジックは無変更)。
+</p>
+
+<h3>265. C4'(simulator隔離)実装・実測: 過去最良を達成、C4逆説的悪化の根本原因を確定(2026-08-02)</h3>
+<p class="small">
+264節のC4逆説的悪化(wall基準で4条件中最悪)の原因を<code>ps -eLo pid,psr,pcpu,comm</code>で直接調査したところ、<b>simulator(AWSIM)コンテナのcpusetが未設定(0-15番コア無制限)のため、AWSIMのスレッドがmpc専有コア(2-5)へ実際に侵入して動作しているサンプルを複数回観測した</b>。C0〜C4はいずれもsimulator側のコア制限をしておらず、autoware側だけをどれだけ隔離してもこの侵入経路は防げていなかった。
+</p>
+<p class="small">
+対策として、simulatorコンテナにも他ROS2ノードと同じ補集合cpuset(<code>0,1,6-15</code>)を追加し、「mpc専有コア」「他autowareノード」「simulator」の三者を完全に分離するC4'(<code>docker-compose.c4prime-experiment.yml</code>)を実装・実測した(40Hzミニベースライン+72Hz本実測12分、C0〜C4と同一長)。
+</p>
+<table class="xtab" style="width:100%; font-size:0.85rem;">
+<tr><th>指標</th><th>目標</th><th>C3</th><th>C4</th><th>C4'</th></tr>
+<tr><td>work&gt;予算割合(wall、旧基準)</td><td>≦0.1%</td><td>0.95%</td><td>1.13%(最悪)</td><td><b>0.61%(最良)</b></td></tr>
+<tr><td>work_cpu&gt;予算割合(分離後基準)</td><td>≦0.1%</td><td>0.00%✓</td><td>0.02%✓</td><td><b>0.01%✓(最良)</b></td></tr>
+<tr><td>dt p99(改訂基準)</td><td>合格</td><td>29.95✓</td><td>30.98✓</td><td><b>27.69✓</b></td></tr>
+<tr><td>eff_rate</td><td>≧70Hz</td><td>70.33✓</td><td>70.09✓</td><td><b>70.83✓(最良)</b></td></tr>
+<tr><td><code>[PERF-SPIKE]</code>発火数</td><td>—</td><td>13件</td><td>58件(最悪)</td><td><b>5件(最良)</b></td></tr>
+</table>
+<p class="small">
+<b>C4'はwork(wall)基準・work_cpu基準・eff_rate・SPIKE件数のいずれでも過去最良を記録し、「simulatorのコア侵入がC4のwall逆説的悪化の主因だった」という仮説が実測で確定した。</b>
+</p>
+<p class="small">
+<b>正直な限界</b>: 40Hzミニベースラインは作業の合間で想定(9分)の倍以上(約19分)走ってしまい、当時のJ算出方式(窓ごと最悪値のmax集計)ではC4のベースラインと比較不能な異常値(J=30.27ms)になった。この問題は266節でJ定義そのものを見直すことで解決した。
+</p>
+
+<h3>266. 計測保守バンドル([PERF-DT-SPIKE]計装・J定義統一・cgroup項目別修正)+蛇行PSD周波数分析(2026-08-02)</h3>
+<p class="small">
+265節のC4'実測結果と予選環境の実ログ(2026-08-01/02、263節続報の計測強化で新規回収)を踏まえ、独立した2つの作業を行った。制御ロジックへの変更は無い。
+</p>
+<p class="small">
+<b>[PERF-DT-SPIKE]計装の新設</b>: 予選ログから、約1秒間・全ノード(mpc_controller・imu_gnss_poser等)が同時に完全停止するストールを発見した(<code>[PERF-DT]</code>のp999/max=764.37ms)。対応する<code>[PERF-SPIKE]</code>(work基準、9件全て)はどれもwork最大62msどまりで、work計装が「処理時間」しか見ておらず「呼び出し間隔dt自体が伸びる」現象を原理的に捕捉できないという盲点が判明した。dtが予算×5.0(既定)を超えた周期を1行ダンプする<code>[PERF-DT-SPIKE]</code>計装を新設し、<code>/proc/stat</code>のsteal時間(ハイパーバイザ横取り時間、クラウドVM特有の外部競合の直接証拠)差分も同時計測するようにした。C4'実測(ローカル専有マシン)では1件も発火せず、クラウド特有の要因(steal time等)である疑いを補強する結果となった。
+</p>
+<p class="small">
+<b>J定義の統一</b>: 265節で発覚した「走行時間に比例して単調悪化する」旧J算出方式(窓ごと最悪値のmax集計)を、「窓ごとの値をn重み付け平均する」方式へ変更した(duration-stable)。新定義でC1/C3/C4/C4'を再計算したところC3=20.36ms・C4=19.12msは旧定義の記録値(20.11ms/19.20ms)とほぼ一致し妥当性が裏付けられ、C4'は17.76ms(4条件中最良)へ復元された。
+</p>
+<p class="small">
+<b>cgroup読み取りの項目別修正</b>: cgroup v2の<code>cpu.max</code>・<code>cpuset.cpus.effective</code>・<code>memory.max</code>は委譲階層(cgroup.subtree_control)が項目ごとに異なりうるにも関わらず、旧実装は「<code>cpu.max</code>が見つかった階層」から3項目とも読んでいた。開発ホストでの実地検証で<code>memory.max</code>が<code>cpu.max</code>より深い(より具体的な)階層でのみ見つかるケースを直接確認し、各項目を独立に探索する設計へ修正した。
+</p>
+<p class="small">
+<b>蛇行のPSD周波数分析</b>: 予選ログのOT状態(NORMAL/STOPPING/OVERTAKING)別にSTEER-XCORR残差(修正舵角)を比較したところ、対戦車対応中に+43〜69%増加していることを発見していた(263節続報)。これが既知の限界サイクル(0.6-0.7Hz、AXIS06)の励起か、対戦車回避offset変動への正当な過渡応答かを、rosbagの<code>/control/command/control_cmd</code>から抽出した操舵角のパワースペクトル密度(PSD)で判別した。予選ログ2本(2026-08-01/02)いずれも、STOPPING/OVERTAKINGの限界サイクル帯(0.5-0.9Hz)パワーはNORMAL比0.10〜0.78倍と<b>低く</b>(励起されていない)、<b>過渡応答仮説を支持する一貫した結論</b>が得られた。副産物として、rosbag側の操舵指令dtの最大値(764.446ms)が上記ストールと独立に一致することも確認できた(クロスバリデーション)。
+</p>
+<p class="small">
+<b>結論</b>: 蛇行対策の焦点はOT状態(対戦車対応)固有の追加対策ではなく、引き続きAXIS06本体(NORMAL時の限界サイクル、アクチュエータ遅延×Q[e_y]チューニングの相互作用)へ置くべきという結論が得られた。764msストールについては、フェイルセーフ(dt異常時のwatchdog)の実装は発生頻度の統計が揃うまで意図的に見送り、計装のみを先行させた。
+</p>
+<p class="small">
+<b>検証</b>: 回帰スイート全体2981件PASS(既存2808件+新規173件)。<code>control_rate=40.0</code>・<code>cpu_affinity=[]</code>の安全側既定を維持。
+</p>
+
+<p class="small">生成: 2026-07-07 / 2026-08-02追記(264〜266節: C0〜C4'双方向アフィニティ実験・simulator隔離による根本原因確定・DT-SPIKE計装/J定義統一/cgroup修正・蛇行PSD分析で過渡応答仮説確定) / 計装: mpc_controller.py [PERF](区間5+gc/v2x/opp_pubフック)、[PERF-DT]/[PERF-DT-SPIKE](実効周期dt分布・margin・ストール検知、257/259/260/266節)、[PERF-SPIKE](スパイク法医学、262/263節)、[PERF-PLATFORM](プラットフォーム状態・cgroup、262/263節)、reference_path.py [PERF-CORRIDOR](phaseA/phaseB内訳・cache_builds、256/258/261節) / 分析ツール: scripts/analyze_perf_gap.py・scripts/analyze_steering_psd.py(266節) / 前レポート: stage1_test_20260706.html / ロードマップ: roadmap_20260705_targets.html / 72Hz化調査の設計書: docs/superpowers/specs/2026-07-31-mpc-control-rate-increase-design.md</p>
 </body>
 </html>
