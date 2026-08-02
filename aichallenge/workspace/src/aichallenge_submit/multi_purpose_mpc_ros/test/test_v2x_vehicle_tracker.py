@@ -338,6 +338,76 @@ def test_velocity_cap_invokes_warn_callback():
     assert any("d2" in m for m in msgs)
 
 
+# --- クランプ時の直前値保持(2026-08-03、Part2/PartB-1) ---
+# 0803-02実測: V2X速度クランプが対戦車'd2'固有で継続発生(前回比4.7-6.2倍)し、
+# fwd_vopp=0への強制が「相手完全停止」誤認識→closing_est過大評価という危険な穴に
+# なりうることが判明した。既定(clamp_hold_enabled=False)では現行の0クランプを
+# 完全に維持し、有効化時のみ直前値保持→鮮度切れ後は保守的フォールバックへ倒す。
+
+
+def test_clamp_hold_disabled_by_default_matches_legacy_zero_behavior():
+    """既定(clamp_hold_enabled省略=False)は、直前に有効な速度があってもクランプ時は
+    従来通り(0,0)になる(回帰なし)。"""
+    tracker = V2XVehicleTracker(v_max_safety=6.0, position_jump_threshold=200.0)
+    tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    tracker.update(_msg(1.0, [("d2", 4.0, 0.0)]))  # 4.0 m/s、正常
+    assert tracker.velocity("d2") == pytest.approx((4.0, 0.0))
+    tracker.update(_msg(1.1, [("d2", 100.0, 0.0)]))  # 960 m/s相当、クランプ発生
+    assert tracker.velocity("d2") == (0.0, 0.0)
+
+
+def test_clamp_hold_enabled_returns_last_valid_velocity_within_freshness():
+    """有効化時、クランプ直後(鮮度期限内)は直前の有効速度をそのまま返す。"""
+    tracker = V2XVehicleTracker(
+        v_max_safety=6.0, position_jump_threshold=200.0,
+        clamp_hold_enabled=True, clamp_hold_freshness_s=0.5)
+    tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    tracker.update(_msg(1.0, [("d2", 4.0, 0.0)]))  # 4.0 m/s、正常値として記録
+    assert tracker.velocity("d2") == pytest.approx((4.0, 0.0))
+    tracker.update(_msg(1.1, [("d2", 100.0, 0.0)]))  # クランプ発生、0.1s後
+    assert tracker.velocity("d2") == pytest.approx((4.0, 0.0))  # 直前値を保持
+
+
+def test_clamp_hold_falls_back_to_conservative_speed_after_freshness_expires():
+    """鮮度切れ後は0ではなく、直前の進行方向を維持しつつ大きさをclamp_fallback_mps
+    へ差し替える(相手を実際より遅く見積もる=安全側)。"""
+    tracker = V2XVehicleTracker(
+        v_max_safety=6.0, position_jump_threshold=200.0,
+        clamp_hold_enabled=True, clamp_hold_freshness_s=0.5,
+        clamp_fallback_mps=5.0)
+    tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    tracker.update(_msg(1.0, [("d2", 4.0, 0.0)]))  # 方向+x、4.0 m/s
+    tracker.update(_msg(1.1, [("d2", 100.0, 0.0)]))  # クランプ開始(t=1.1)
+    tracker.update(_msg(1.8, [("d2", 200.0, 0.0)]))  # 鮮度切れ(0.7s > 0.5s)後もクランプ継続
+    vx, vy = tracker.velocity("d2")
+    assert vx == pytest.approx(5.0)  # 方向は+xのまま、大きさがfallbackへ
+    assert vy == pytest.approx(0.0)
+
+
+def test_clamp_fallback_defaults_to_v_max_safety_when_unspecified():
+    """clamp_fallback_mps未指定時は、保守的な想定値としてv_max_safety自体を使う。"""
+    tracker = V2XVehicleTracker(
+        v_max_safety=6.0, position_jump_threshold=200.0,
+        clamp_hold_enabled=True, clamp_hold_freshness_s=0.1)
+    tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    tracker.update(_msg(1.0, [("d2", 4.0, 0.0)]))
+    tracker.update(_msg(1.05, [("d2", 100.0, 0.0)]))  # クランプ開始
+    tracker.update(_msg(1.3, [("d2", 200.0, 0.0)]))  # 鮮度切れ(0.25s > 0.1s)
+    vx, _ = tracker.velocity("d2")
+    assert vx == pytest.approx(6.0)  # v_max_safetyへフォールバック
+
+
+def test_clamp_hold_no_prior_valid_velocity_stays_zero():
+    """直前の有効速度が一度も無い車両(起動直後からクランプされ続ける)は、
+    有効化時でも従来通り(0,0)のまま(フォールバックしようがない、安全側・退行なし)。"""
+    tracker = V2XVehicleTracker(
+        v_max_safety=6.0, position_jump_threshold=200.0,
+        clamp_hold_enabled=True, clamp_hold_freshness_s=0.5)
+    tracker.update(_msg(0.0, [("d2", 0.0, 0.0)]))
+    tracker.update(_msg(0.05, [("d2", 100.0, 0.0)]))  # 初回からクランプ
+    assert tracker.velocity("d2") == (0.0, 0.0)
+
+
 def test_warn_callback_optional_default_is_silent():
     # Construct without a callback; clamp fires must not raise.
     tracker = V2XVehicleTracker(v_max_safety=30.0, position_jump_threshold=5.0)

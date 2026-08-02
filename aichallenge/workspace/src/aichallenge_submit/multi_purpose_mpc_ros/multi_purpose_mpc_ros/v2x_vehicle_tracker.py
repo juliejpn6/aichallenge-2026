@@ -20,7 +20,10 @@ class V2XVehicleTracker:
     constant-velocity predictions over a caller-provided time grid."""
 
     def __init__(self, v_max_safety: float, position_jump_threshold: float,
-                 warn_callback=None, speed_window: int = 6):
+                 warn_callback=None, speed_window: int = 6,
+                 clamp_hold_enabled: bool = False,
+                 clamp_hold_freshness_s: float = 0.5,
+                 clamp_fallback_mps: float = None):
         self._v_max_safety = float(v_max_safety)
         self._jump_thresh = float(position_jump_threshold)
         self._warn = warn_callback if warn_callback is not None else (lambda _msg: None)
@@ -29,6 +32,25 @@ class V2XVehicleTracker:
         self._samples: Dict[str, Deque[Tuple[float, float, float]]] = {}
         self._velocities: Dict[str, Tuple[float, float]] = {}
         self._active: List[str] = []
+        # 264節続報Task1と対になる防御(2026-08-03、Part2/PartB-1): V2X速度クランプが
+        #   継続する対戦車(0803-02実測、d2固有・数千件規模)に対し、下流のfwd_vopp計算
+        #   (mpc_controller.py)がクランプ=速度0=「完全停止」と誤認しclosing_est(追い越し
+        #   判断)を過大評価する穴への対処。既定は無効(現行の0クランプ挙動を完全維持)。
+        #   有効時:
+        #   (a) クランプ発生から`clamp_hold_freshness_s`以内は直前の有効速度をそのまま返す。
+        #   (b) 鮮度切れ後は0(相手停止=closing過大評価という穴そのもの)には戻さず、直前の
+        #       進行方向を維持しつつ大きさだけ`clamp_fallback_mps`(未指定ならv_max_safety
+        #       自体、=物理的に想定しうる最大速度という保守的な値)へ差し替える。これにより
+        #       closing_estが常に相手を実際より遅く見積もる側(安全マージンを確保する側)へ
+        #       倒れる。直前の有効値が一度も無い車両(起動直後等)はフォールバックしようが
+        #       ないため、既存どおり0のまま(安全側、退行なし)。
+        self._clamp_hold_enabled = bool(clamp_hold_enabled)
+        self._clamp_hold_freshness_s = float(clamp_hold_freshness_s)
+        self._clamp_fallback_mps = (
+            float(clamp_fallback_mps) if clamp_fallback_mps is not None
+            else self._v_max_safety)
+        self._last_valid_velocity: Dict[str, Tuple[float, float]] = {}
+        self._last_valid_time: Dict[str, float] = {}
 
     def update(self, msg) -> None:
         active: List[str] = []
@@ -63,16 +85,33 @@ class V2XVehicleTracker:
                     vx = (x1 - x0) / dt
                     vy = (y1 - y0) / dt
                     if math.hypot(vx, vy) > self._v_max_safety:
-                        self._velocities[vid] = (0.0, 0.0)
+                        self._velocities[vid] = self._clamp_fallback_velocity(vid, t)
                         self._warn(
                             f"V2X: velocity for vehicle '{vid}' exceeds "
                             f"{self._v_max_safety} m/s — clamped to zero")
                     else:
                         self._velocities[vid] = (vx, vy)
+                        self._last_valid_velocity[vid] = (vx, vy)
+                        self._last_valid_time[vid] = t
                 else:
                     self._velocities[vid] = (0.0, 0.0)
             active.append(vid)
         self._active = active
+
+    def _clamp_fallback_velocity(self, vid: str, t: float) -> Tuple[float, float]:
+        """クランプ発生時の速度を決める(既定=常に(0,0)、clamp_hold_enabled時のみ
+        直前値保持→鮮度切れ後は保守的フォールバックへ切り替える)。"""
+        if not self._clamp_hold_enabled or vid not in self._last_valid_time:
+            return (0.0, 0.0)
+        age = t - self._last_valid_time[vid]
+        lvx, lvy = self._last_valid_velocity[vid]
+        if age <= self._clamp_hold_freshness_s:
+            return (lvx, lvy)
+        lspeed = math.hypot(lvx, lvy)
+        if lspeed <= 1e-6:
+            return (0.0, 0.0)
+        scale = self._clamp_fallback_mps / lspeed
+        return (lvx * scale, lvy * scale)
 
     def velocity(self, vehicle_id: str) -> Tuple[float, float]:
         return self._velocities.get(vehicle_id, (0.0, 0.0))

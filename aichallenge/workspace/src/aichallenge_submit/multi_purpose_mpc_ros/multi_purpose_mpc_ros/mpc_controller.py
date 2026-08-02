@@ -772,11 +772,16 @@ class MPCController(Node):
             self._dynamic_obstacles: List[Obstacle] = []
             self._obstacles_updated = bool(self._static_obstacles)
             v2x_cfg = self._cfg.v2x_obstacle_avoidance  # type: ignore
+            _clamp_fallback_mps = getattr(v2x_cfg, "clamp_fallback_mps", None)
             self._v2x_tracker = V2XVehicleTracker(
                 v_max_safety=float(v2x_cfg.v_max_safety),
                 position_jump_threshold=float(v2x_cfg.position_jump_threshold),
                 warn_callback=self.get_logger().warn,
                 speed_window=int(getattr(v2x_cfg, "speed_window", 6)),
+                clamp_hold_enabled=bool(getattr(v2x_cfg, "clamp_hold_enabled", False)),
+                clamp_hold_freshness_s=float(getattr(v2x_cfg, "clamp_hold_freshness_s", 0.5)),
+                clamp_fallback_mps=(float(_clamp_fallback_mps)
+                                     if _clamp_fallback_mps is not None else None),
             )
             self._v2x_vehicle_radius = float(v2x_cfg.vehicle_radius)
             # 2026-07-14追加(ユーザー指摘: 「壁の向こう側にいる相手」誤認識対策):
