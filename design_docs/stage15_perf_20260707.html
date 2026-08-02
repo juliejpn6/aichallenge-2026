@@ -7835,6 +7835,16 @@ v_max=20km/h環境でもステアリングの蛇行(AXIS06)が未収束のため
 <b>検証</b>: 回帰スイート全体2981件PASS(既存2808件+新規173件)。<code>control_rate=40.0</code>・<code>cpu_affinity=[]</code>の安全側既定を維持。
 </p>
 
-<p class="small">生成: 2026-07-07 / 2026-08-02追記(264〜266節: C0〜C4'双方向アフィニティ実験・simulator隔離による根本原因確定・DT-SPIKE計装/J定義統一/cgroup修正・蛇行PSD分析で過渡応答仮説確定) / 計装: mpc_controller.py [PERF](区間5+gc/v2x/opp_pubフック)、[PERF-DT]/[PERF-DT-SPIKE](実効周期dt分布・margin・ストール検知、257/259/260/266節)、[PERF-SPIKE](スパイク法医学、262/263節)、[PERF-PLATFORM](プラットフォーム状態・cgroup、262/263節)、reference_path.py [PERF-CORRIDOR](phaseA/phaseB内訳・cache_builds、256/258/261節) / 分析ツール: scripts/analyze_perf_gap.py・scripts/analyze_steering_psd.py(266節) / 前レポート: stage1_test_20260706.html / ロードマップ: roadmap_20260705_targets.html / 72Hz化調査の設計書: docs/superpowers/specs/2026-07-31-mpc-control-rate-increase-design.md</p>
+<h3>267. dt異常フェイルセーフ(watchdog)の実装: 統計収集を待たず即時対応へ優先度シフト(2026-08-02)</h3>
+<p class="small">
+266節時点では、764msストール(263/266節発見、<code>[PERF-DT]</code>のp999/max=764.37ms)に対するフェイルセーフの実装は「発生頻度の統計が揃うまで意図的に見送り、計装([PERF-DT-SPIKE])のみを先行させる」方針だった。この方針をGeminiレビューで再検討したところ、<b>「レース中に約1秒間の完全停止から復帰した直後、MPCが最大1秒弱前の古い状態量に基づく指令をそのまま発行する」ワインドアップは、発生頻度の多寡にかかわらず1回でも起きればCRASH/WALL相当の致命的リスクになりうる</b>との指摘を受け、統計収集を待たずに即時実装する方針へ優先度をシフトした。
+</p>
+<p class="small">
+<b>実装方針</b>: <code>_publish_control_command()</code>(通常フロー・STUCK復帰経路の双方が経由する実発行の唯一の合流点、issue④③・201節参照)冒頭に、このサイクルの壁時計dt(<code>_control()</code>で計測・保持する<code>_last_wall_dt_s</code>、既存の<code>[PERF-DT]</code>計装基盤をそのまま再利用)が<code>mpc.failsafe_dt_threshold_ms</code>(既定200ms)を超えていた場合のみ発火するガードを追加した。発火時は実発行コマンドを安全側(操舵=直前発行値を保持=急な切り増しをしない、速度=0・加速度=<code>a_min</code>でブレーキ)へ上書きする。閾値<code>&lt;=0</code>で無効化できる既存の<code>debug_extra_actuator_delay_s</code>等と同じ規約に合わせた。<b>MPC本体の計算・内部状態(QPソルバ・コリドー等)には一切触れず、このサイクルの発行値のみを上書きする</b>ため、次サイクル以降は通常通りMPCが実際の現在状態から再計画する設計であり、恒久的な機能停止やフェイルセーフの多重発火による別種の不具合を生まない。
+</p>
+<p class="small">
+<b>検証</b>: 実際に観測した764msストールを模した単体テスト(<code>test_failsafe_dt_watchdog_264.py</code>、発火条件・非発火境界・閾値無効化・操舵保持・速度/加速度オーバーライド・<code>_last_u</code>簿記との順序・MPC本体への不干渉・config既定値登録を網羅)を新規追加し、回帰スイート全体2996件PASS(既存2981件+新規15件、制御ロジックの他部分は無変更)。<code>control_rate=40.0</code>・<code>cpu_affinity=[]</code>・<code>failsafe_dt_threshold_ms=200.0</code>の安全側既定を維持。
+</p>
+<p class="small">生成: 2026-07-07 / 2026-08-02追記(264〜267節: C0〜C4'双方向アフィニティ実験・simulator隔離による根本原因確定・DT-SPIKE計装/J定義統一/cgroup修正・蛇行PSD分析で過渡応答仮説確定・dt異常フェイルセーフ実装) / 計装: mpc_controller.py [PERF](区間5+gc/v2x/opp_pubフック)、[PERF-DT]/[PERF-DT-SPIKE](実効周期dt分布・margin・ストール検知、257/259/260/266節)、[PERF-SPIKE](スパイク法医学、262/263節)、[PERF-PLATFORM](プラットフォーム状態・cgroup、262/263節)、[FAILSAFE](dt異常時の安全側コマンド上書き、267節)、reference_path.py [PERF-CORRIDOR](phaseA/phaseB内訳・cache_builds、256/258/261節) / 分析ツール: scripts/analyze_perf_gap.py・scripts/analyze_steering_psd.py(266節) / 前レポート: stage1_test_20260706.html / ロードマップ: roadmap_20260705_targets.html / 72Hz化調査の設計書: docs/superpowers/specs/2026-07-31-mpc-control-rate-increase-design.md</p>
 </body>
 </html>
