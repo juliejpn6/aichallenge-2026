@@ -1636,6 +1636,32 @@ class MPCController(Node):
         return ackerman_boost_cmd
 
     def _publish_control_command(self, stamp, u, acc, bug_acc_enabled):
+        # 2026-08-02追加(264節続報Task1、Geminiレビュー最優先課題): dtが異常に
+        #   長かった周期(764ms級のプロセス全体停止ストール、263/266節でDT-SPIKE
+        #   計装により発見、原因はクラウド特有の外部要因[ハイパーバイザのCPU
+        #   steal time等]が濃厚)から復帰した直後、MPCが古い(最大1秒弱前の)状態量
+        #   に基づいて算出した過大な指令をそのまま発行してしまう「ワインドアップ」
+        #   を防ぐ。このサイクルの壁時計dt(_control()で計測、STUCK復帰経路含め
+        #   本メソッドが実発行の唯一の合流点であるため、ここで一括して守る)が
+        #   閾値(mpc.failsafe_dt_threshold_ms、既定200ms)を超えていた場合のみ、
+        #   実発行コマンドを安全側(操舵=直前発行値を保持=急な切り増しをしない、
+        #   速度=0・加速度=a_min[既存のハード制約下限、実測較正済みの最大制動値]
+        #   でブレーキ)へ上書きする。閾値<=0で無効化できる(既存の
+        #   debug_extra_actuator_delay_s等と同じ「<=0で無効」規約)。
+        #   MPC本体の計算・内部状態には一切触れない(このサイクルの発行値のみ
+        #   上書きするため、次サイクル以降は通常通りMPCが実際の現在状態から
+        #   再計画する)。
+        _failsafe_threshold_s = float(
+            getattr(self._mpc_cfg, "failsafe_dt_threshold_ms", 200.0)) / 1000.0  # type: ignore
+        _wall_dt_s = getattr(self, '_last_wall_dt_s', 0.0)
+        if _failsafe_threshold_s > 0.0 and _wall_dt_s > _failsafe_threshold_s:
+            self.get_logger().warn(
+                f"[FAILSAFE] dt={_wall_dt_s * 1000:.1f}ms > "
+                f"threshold={_failsafe_threshold_s * 1000:.1f}ms — "
+                f"overriding command (steer=hold last, speed=0, "
+                f"accel={self._mpc_cfg.a_min})")  # type: ignore
+            u = [0.0, self._last_u[1]]
+            acc = self._mpc_cfg.a_min  # type: ignore
         # 2026-07-22追加(issue④③、_last_u/_last_accの陳腐化対策): 従来はこの2値の
         #   更新が通常の_control()フロー内(旧5070-5071/5069行目)にしかなく、
         #   STUCK復帰(_handle_stuck_recovery)は本メソッドを直接呼ぶだけでこの更新を
@@ -5245,6 +5271,12 @@ class MPCController(Node):
         _wall_dt = _now_wall - self._dtperf_last_wall
         self._dtperf_last_wall = _now_wall
         self._dtperf_record(_wall_dt)
+        # 2026-08-02追加(264節続報Task1、フェイルセーフ): _publish_control_command
+        #   (このサイクルの遥か後方、STUCK復帰経路からも呼ばれる唯一の発行箇所)から
+        #   参照できるよう、壁時計dtをインスタンス属性として保持する。764ms級の
+        #   全ノード同時停止ストール(263/266節)から復帰した直後、MPCが古い状態量
+        #   に基づいて算出した指令をそのまま発行する「ワインドアップ」を防ぐため。
+        self._last_wall_dt_s = _wall_dt
 
         self._last_t = now
         self._loop += 1
