@@ -128,14 +128,17 @@ def test_helper_preserves_gate_string_format():
 
 def test_helper_preserves_worth_count_mutation_with_vid_reset():
     """94節で追加されたworth_countのvid切替リセットが、抽出後も維持されて
-    いることを確認する(_ot_worth_prev_vidの更新順序を含む)。"""
+    いることを確認する。233節続報(2026-07-29、監査結果④)で
+    _vid_changed_reset()ヘルパー経由に統一されたが、リセット→増分の
+    順序自体は不変(ヘルパー内でprev_vid更新まで完了してから戻り値を返すため、
+    呼び出し元の増分処理は常に更新後の状態に対して行われる)。"""
     snippet = _helper_method_snippet()
-    idx_check = snippet.index("if _fwd_vid_worth != self._ot_worth_prev_vid:")
+    idx_check = snippet.index(
+        'if self._vid_changed_reset(_fwd_vid_worth, "_ot_worth_prev_vid"):')
     idx_reset = snippet.index("self._ot_worth_count = 0")
-    idx_prev_update = snippet.index("self._ot_worth_prev_vid = _fwd_vid_worth")
     idx_increment = snippet.index(
         "self._ot_worth_count = self._ot_worth_count + 1 if pass_worth else 0")
-    assert idx_check < idx_reset < idx_prev_update < idx_increment
+    assert idx_check < idx_reset < idx_increment
 
 
 def test_helper_preserves_dlat_ttc_veto_wiring_to_opponent_situation():

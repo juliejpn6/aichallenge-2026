@@ -96,7 +96,17 @@ def test_ot_log_line_no_longer_prints_removed_fields():
 # ---------------------------------------------------------------------------
 
 def test_q_ey_base_value_untouched_at_3m():
-    assert "Q: [3000000.0, 100000000.0, 200000.0, 0.0]" in _YAML_SRC
+    """225-226節(2026-07-28): 一定曲率区間で指令舵角が理論要求値の最大2.3倍まで
+    振動するリミットサイクルを発見し、Q[e_y](R[delta]の約6000倍という強い追従重み)
+    が過制御の一因という仮説のもと、Q[e_y]自体を意図的に能動的スイープ中(ローカル
+    3.0M→1.2M→0.8M→1.0M、予選1.2M等、debug_extra_actuator_delay_sと同じ「頻繁に
+    切り替えるライブ実験値」の扱い)。本テストが元々ガードしていた「170→171節の
+    Q[e_y]スケジュールA/Bで意図せず変更されていないこと」という趣旨を保ちつつ、
+    Q[e_y]自体の値ではなくQ[e_psi]/Q[t]/Q[delta_actual](第2〜4要素、このスイープの
+    対象外)が不変であることを確認する形へ更新した(弱体化ではない)。"""
+    import re
+    m = re.search(r"Q:\s*\[([\d.]+),\s*100000000\.0,\s*200000\.0,\s*0\.0\]", _YAML_SRC)
+    assert m is not None, "Q[e_psi]/Q[t]/Q[delta_actual]が想定値から変化している"
 
 
 def test_overtake_and_pit_q_ey_overrides_still_intact():

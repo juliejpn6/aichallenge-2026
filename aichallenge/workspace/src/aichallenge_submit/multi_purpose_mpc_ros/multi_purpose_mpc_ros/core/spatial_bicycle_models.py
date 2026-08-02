@@ -222,6 +222,13 @@ class SpatialBicycleModel(ABC):
             e_y, e_psi = None, None
             exit(1)
 
+        # AXIS07 State Sanitizer(220節続報): EKFの横方向誤差は曲率に比例することが
+        # 実測済み(diff=ekf_ey-gnss_ey ≈ -slope*kappa-intercept)。EKF本体やローカリ
+        # ゼーションには一切触れず、MPCへ渡す直前のe_yのみをここで補正する。
+        if self.use_curvature_bias_correction:
+            e_y = e_y + self.curvature_bias_slope * reference_waypoint.kappa \
+                + self.curvature_bias_intercept
+
         # time state can be set to zero since it's only relevant for the MPC
         # prediction horizon
         t = 0.0
@@ -396,7 +403,9 @@ class SpatialBicycleModel(ABC):
 #################
 
 class BicycleModel(SpatialBicycleModel):
-    def __init__(self, reference_path, length, width, Ts, actuator_lag_tau_s=0.19):
+    def __init__(self, reference_path, length, width, Ts, actuator_lag_tau_s=0.19,
+                 use_curvature_bias_correction=False,
+                 curvature_bias_slope=0.772, curvature_bias_intercept=0.016):
         """
         Simplified Spatial Bicycle Model. Spatial Reformulation of Kinematic
         Bicycle Model. Uses Simplified Spatial State.
@@ -404,6 +413,16 @@ class BicycleModel(SpatialBicycleModel):
         :param length: length of the car in m
         :param width: with of the car in m
         :param Ts: sampling time of model in s
+        :param use_curvature_bias_correction: AXIS07(EKFの曲率依存横方向誤差)への
+            State Sanitizer対処。既定False。Trueの場合、t2s()で算出したe_yに対し
+            `e_y += curvature_bias_slope*kappa + curvature_bias_intercept`を適用する。
+            既定係数0.772/0.016は211節(|kappa| vs |ekf_ey-gnss_ey|回帰、n=774、r=0.702)由来。
+            220節続報で符号付き回帰による検証(0728-02、n=2101)を実施し、
+            diff(ekf_ey-gnss_ey) = -0.747*kappa - 0.012(r=-0.703、符号は+0.747/+0.012が
+            正しい補正方向であることを確認)、既定値と近い値であることを確認済み。
+            EKF本体・ローカリゼーションには一切触れず、MPCへ渡す直前の値のみを補正する。
+        :param curvature_bias_slope: 上記補正式の傾き(kappaに対する係数)。
+        :param curvature_bias_intercept: 上記補正式の切片。
         :param actuator_lag_tau_s: delta_actual状態(第4状態)の一次遅れ時定数 | [s]。
             2026-07-27再実装(201節続報、AXIS06): 差分のみ(tau=55ms)は、MPCのホライズン
             ステップが表す実時間(delta_s/v_ref、典型的に0.1-0.4s)より常に小さく、
@@ -423,6 +442,9 @@ class BicycleModel(SpatialBicycleModel):
                                            width=width, Ts=Ts)
 
         self.actuator_lag_tau_s = max(0.0, actuator_lag_tau_s)
+        self.use_curvature_bias_correction = bool(use_curvature_bias_correction)
+        self.curvature_bias_slope = float(curvature_bias_slope)
+        self.curvature_bias_intercept = float(curvature_bias_intercept)
 
         # Initialize spatial state
         self.spatial_state = SimpleSpatialState()

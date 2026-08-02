@@ -147,9 +147,15 @@ def test_ot_room_exhausted_verification_log_present():
     assert "corr_bound={_room_ahead_locked:.3f}" in snippet
     assert "count={self._ot_room_exhausted_count}" in snippet
     # エッジ検知(==giveup_cycles到達周期のみ)であり、continued cyclesで連打しないこと。
+    # 247節(2026-07-30)でこのif節内に反対側の最終救済チェック(_room_rescued)が
+    # 追加されたため、guard直後ではなく「else節(救済失敗時)の中」に位置するように
+    # なった——window自体は広げたが、依然として同一のif節内であることを
+    # _side_blocked合流行より前であることで確認する(guardとの直接近接は保証しない)。
     idx_guard = _SRC.index("if _room_exhausted and self._ot_room_exhausted_count == self._ot_giveup_cycles:")
     idx_log = _SRC.index('"[OT-ROOM-EXHAUSTED] side={_locked} "')
-    assert idx_guard < idx_log < idx_guard + 400
+    idx_side_blocked = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
+    assert idx_guard < idx_log < idx_side_blocked
+    assert "if _room_rescued:" in _SRC[idx_guard:idx_side_blocked]
 
 
 # ---------------------------------------------------------------------------

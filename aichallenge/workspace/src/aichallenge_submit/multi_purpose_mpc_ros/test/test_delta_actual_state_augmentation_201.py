@@ -79,11 +79,9 @@ def test_bicycle_model_n_states_is_4():
 def test_default_tau_is_190ms_when_unspecified():
     """mpc_controller.py/path_constraints_provider.pyのcreate_car()はtau引数を
     渡していないため、この既定値がそのまま使われる(config.yaml非依存、201節)。
-    202節続報: 55ms(差分のみ)はホライズン粒度に対して無効と判明したため、
-    アクチュエータ自体の実測フル遅延(ローカル130ms)へ変更した。203節続報:
-    実装バグ(e_psi行の代入ミス、修正済み)により198節のtau実験結果が過小評価
-    されていた疑いが生じたため、修正後の実装で予選環境相当のtau=190msを
-    探索的に再検証するため一時変更した。"""
+    202/203節続報を経てtau=190msを確定・AXIS06クローズ(208節)。213節でtau=240ms
+    (Test A、持続直線蛇行対策)を試したが、実測で持続直線std 3.17→4.40°・コーナー
+    立ち上がり後std 6.10→7.14°と両方悪化したため190msへ復元した。"""
     car = BicycleModel(reference_path=_RefPathStub(), length=1.0, width=0.5, Ts=0.1)
     assert car.actuator_lag_tau_s == pytest.approx(0.19)
 

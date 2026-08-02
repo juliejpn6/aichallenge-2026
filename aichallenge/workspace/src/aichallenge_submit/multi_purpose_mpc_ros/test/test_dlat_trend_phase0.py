@@ -203,9 +203,13 @@ def test_dlat_trend_tracker_reuses_existing_ema_and_clamp_params_no_new_tuning_v
 def test_reset_episode_docstring_does_not_reset_dlat_fields_in_source():
     """reset_episode()本体(docstringの解説文ではなく実際の代入文)に
     _dlat_ema等への代入が無い(=巻き添えリセットしない設計が実際に
-    ソース上も維持されている)ことを確認する。"""
+    ソース上も維持されている)ことを確認する。
+    2026-07-30(247節): reset_episode()の直後にforce_rescue_switch()
+    (room_exhausted救済専用、dlatトレンドを意図的にリセットする別メソッド)が
+    追加されたため、終端マーカーを次の"def "(直後のメソッド定義)へ変更した
+    (reset_episode()自身の範囲だけを正しく切り出すため)。"""
     idx = _LAT_TTC_SRC.index("def reset_episode(self)")
-    idx_end = _LAT_TTC_SRC.index("def _update_dlat_trend(")
+    idx_end = _LAT_TTC_SRC.index("\n    def ", idx + 10)
     snippet = _LAT_TTC_SRC[idx:idx_end]
     assert "self._dlat_ema =" not in snippet
     assert "self._prev_dlat_ema =" not in snippet

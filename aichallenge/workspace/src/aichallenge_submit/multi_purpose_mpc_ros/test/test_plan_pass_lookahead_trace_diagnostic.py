@@ -111,7 +111,11 @@ def test_dbg_plan_trace_reset_at_top_of_plan_pass_edge_triggered():
 
 
 def test_trace_appended_inside_obstacle_branch_lookahead_loop():
-    idx_loop = _SRC.index("rf_i = max(0.0, (fwd_lat - self._ot_block_half) - float(wps[i].lb))")
+    """230節続報3(2026-07-29): lf_i/rf_iの計算式は共通ヘルパー_room_to_wall()
+    (clamp=True、他6箇所の重複と合わせて集約)経由に変わったが、trace記録が
+    同じループ内・同じ変数を使っている構造自体は不変であることを確認する。"""
+    idx_loop = _SRC.index(
+        "rf_i = self._room_to_wall(wps[i], fwd_lat, want_left=False, clamp=True)")
     idx_append = _SRC.index("self._dbg_plan_trace.append(", idx_loop)
     idx_kcorner = _SRC.index("if k_corner is None and abs(_k) >= self._ot_pass_block_kappa:", idx_loop)
     assert idx_loop < idx_append < idx_kcorner

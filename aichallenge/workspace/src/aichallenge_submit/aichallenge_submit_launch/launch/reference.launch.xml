@@ -66,7 +66,16 @@
   </group>
 
     <!-- Localization -->
-  <let name="pose_additional_delay_var" value="0.14" />
+  <!-- 2026-07-30(242/243/244節、AXIS08): [GNSS-EKF-XCORR]実測(直近8ログ・クリア条件2173件)で
+       lag_ms中央値-140msがpose_additional_delay=0.14sとほぼ完全一致し続けていることを確認。
+       resid_at_best/resid_at_zero比0.182というノイズでは説明できない強い系統信号のため、
+       「実際のGNSS伝送遅延は想定(140ms)より小さく、EKFが過剰に未来へ外挿している」という
+       120節の仮説を検証する。セットB(0.07)に続きセットA(完全撤去、0.0)を試す:
+       仮説が正しければlag_msが0ms付近まで戻るはず。元の値(0.14)・セットB(0.07)は
+       コメントで保持。単独変数A/Bのため他パラメータ(proc_stddev_wz_c等)は無変更。 -->
+  <!-- <let name="pose_additional_delay_var" value="0.14" /> -->
+  <!-- <let name="pose_additional_delay_var" value="0.07" /> -->
+  <let name="pose_additional_delay_var" value="0.0" />
   <group>
     <push-ros-namespace namespace="localization"/>
     <include file="$(find-pkg-share gyro_odometer)/launch/gyro_odometer.launch.xml">

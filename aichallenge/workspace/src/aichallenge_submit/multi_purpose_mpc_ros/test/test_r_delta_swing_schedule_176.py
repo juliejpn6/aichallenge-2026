@@ -169,7 +169,9 @@ def test_verification_log_present_with_swing_and_update_count():
 
 
 def test_verification_log_throttled_to_1hz_like_existing_ot_log():
+    """214節でログ出力のみをenable_diag_logでガードする説明コメントが追加され
+    間隔が広がったため、窓を300→600へ拡大した(検証内容自体は変更なし)。"""
     idx = _SRC.index("self._r_delta_swing_dbg_loop += 1")
-    idx_end = idx + 300
+    idx_end = idx + 600
     snippet = _SRC[idx:idx_end]
     assert "self._r_delta_swing_dbg_loop % int(max(1, self._mpc_cfg.control_rate)) == 0" in snippet

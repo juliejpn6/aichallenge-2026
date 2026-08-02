@@ -33,7 +33,7 @@ def _extract_methods(names):
 
 
 _METHOD_NAMES = ["_plan_pass", "_side_blocked_by_other_car", "_plan_obs_log",
-                 "_room_debounce_ok"]
+                 "_room_debounce_ok", "_room_to_wall"]
 _METHODS_SRC = _extract_methods(_METHOD_NAMES)
 _NS = {"np": np}
 for _name, _src in _METHODS_SRC.items():
@@ -109,6 +109,7 @@ def make_self(waypoints, wp_id=0, engage_debounce=1):
     m._side_blocked_by_other_car = types.MethodType(_NS["_side_blocked_by_other_car"], m)
     m._plan_obs_log = types.MethodType(_NS["_plan_obs_log"], m)
     m._room_debounce_ok = types.MethodType(_NS["_room_debounce_ok"], m)
+    m._room_to_wall = types.MethodType(_NS["_room_to_wall"], m)
     return m
 
 

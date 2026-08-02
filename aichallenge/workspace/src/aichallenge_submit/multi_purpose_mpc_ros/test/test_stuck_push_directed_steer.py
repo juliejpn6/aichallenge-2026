@@ -106,7 +106,9 @@ def test_push_entry_computes_steer_once():
     idx = _SRC.index('self._stuck_state = "PUSH"')
     # 2026-07-26追加(186節続報): giveup_streak反転リトライ用のside_flip適用ブロックが
     #   steer計算とu=[...]の間に挿入されたため、窓を広げた(意味的な変更はない)。
-    idx_end = idx + 1300
+    # 2026-07-31追加(252節): 衝突疑い検知(v_prev/v_window)のリセット行が
+    #   steer計算より前に挿入されたため、さらに窓を広げた(意味的な変更はない)。
+    idx_end = idx + 1400
     snippet = _SRC[idx:idx_end]
     assert "self._stuck_push_steer = self._compute_stuck_push_steer(pose)" in snippet
     assert "u = [self._stuck_push_speed, self._stuck_push_steer]" in snippet

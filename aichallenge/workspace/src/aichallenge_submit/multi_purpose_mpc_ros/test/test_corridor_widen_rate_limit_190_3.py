@@ -175,8 +175,10 @@ def test_controller_computes_widen_step_from_config_before_ref_path_construction
 
 
 def test_controller_sets_widen_step_at_initial_construction():
+    """214節続報・215節続報2でcreate_ref_path()直後に[CONFIG]起動時ログが2つ
+    挿入され間隔が広がったため、窓を200→600へ拡大した(検証内容自体は変更なし)。"""
     idx = _CTRL_SRC.index("self._reference_path = create_ref_path(self._map)")
-    snippet = _CTRL_SRC[idx:idx + 200]
+    snippet = _CTRL_SRC[idx:idx + 700]
     assert "self._reference_path.corridor_widen_step_m = self._corridor_widen_step_m" in snippet
 
 

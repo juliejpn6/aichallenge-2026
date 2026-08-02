@@ -174,11 +174,18 @@ def test_log_line_contains_required_fields():
 
 def test_called_every_cycle_not_gated_by_1s_throttle():
     """③検証ロギング: ピーク値追跡には毎周期の呼び出しが必要なため、既存の
-    1秒間引きイディオム(_maybe_log_steer_xcorr等)とは別に呼ばれていることを確認。"""
-    idx = _SRC.index("self._maybe_log_hotspot_deviation()")
-    snippet_before = _SRC[max(0, idx - 300):idx]
-    # 直前が1秒間引きのif閉じ括弧の外(インデントが浅い)であることを確認
-    assert "if self._loop % int(max(1, self._mpc_cfg.control_rate)) == 0:" in snippet_before
+    1秒間引きイディオム(_maybe_log_steer_xcorr等)とは別に呼ばれていることを確認。
+    214節でSTEER-XCORR側の1秒間引きifにenable_diag_log条件が追加され複数行に
+    分割されたため、単一行の完全一致ではなく行単位でトップレベル文であることを
+    検証する形へ更新した(既存テストの弱体化ではなく、判定方法の追従)。"""
+    lines = _SRC.splitlines()
+    call_line_idx = next(
+        i for i, l in enumerate(lines) if "self._maybe_log_hotspot_deviation()" in l)
+    call_line = lines[call_line_idx]
+    # 呼び出しが1秒間引きifの内側(深いインデント)ではなく、トップレベル文であること
+    assert call_line.startswith("        self.")
+    snippet_before = _SRC[max(0, _SRC.index(call_line) - 300):_SRC.index(call_line)]
+    assert "self._loop % int(max(1, self._mpc_cfg.control_rate)) == 0" in snippet_before
 
 
 def test_does_not_modify_qp_or_control_command():

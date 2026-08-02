@@ -182,7 +182,8 @@ def test_source_last_u_and_last_acc_consolidated_in_publish_control_command():
     """③: _last_u/_last_accの更新が_publish_control_command内へ一本化され、
     通常フロー側(旧位置)には代入が残っていないことを確認する。"""
     idx = _CTRL_SRC.index("def _publish_control_command(self, stamp, u, acc, bug_acc_enabled):")
-    snippet = _CTRL_SRC[idx:idx + 900]
+    idx_end = _CTRL_SRC.index("_XCORR_WINDOW_S = 3.5", idx)
+    snippet = _CTRL_SRC[idx:idx_end]
     assert "self._last_u[0] = float(u[0])" in snippet
     assert "self._last_u[1] = float(u[1])" in snippet
     assert "self._last_acc = float(acc)" in snippet

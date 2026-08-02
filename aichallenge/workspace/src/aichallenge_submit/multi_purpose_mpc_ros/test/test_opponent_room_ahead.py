@@ -190,11 +190,20 @@ with open(_SRC_PATH) as _f:
 
 
 def test_opponent_room_ahead_reuses_ot_block_half_no_new_magic_number():
+    """230節続報3(2026-07-29): 壁基準の空き幅計算は_room_to_wall()へ集約された
+    (_scan_traffic等、他6箇所の重複と合わせて共通ヘルパー化)。self._ot_block_half/
+    wps[i].ub/lbは_room_to_wall内部で参照される形になったため、ここでは
+    _opponent_room_aheadが同ヘルパーをclamp=False(このサイトは意図的に非クランプ)で
+    正しく呼び出していることを確認する。"""
     idx = _SRC.index("def _opponent_room_ahead")
     snippet = _SRC[idx:idx + 2200]
-    assert "self._ot_block_half" in snippet
-    assert "wps[i].ub" in snippet
-    assert "wps[i].lb" in snippet
+    assert "self._room_to_wall(wps[i], lat_o, want_left=(side > 0), clamp=False)" in snippet
+
+    idx_helper = _SRC.index("def _room_to_wall")
+    helper_snippet = _SRC[idx_helper:idx_helper + 900]
+    assert "self._ot_block_half" in helper_snippet
+    assert "wp.ub" in helper_snippet
+    assert "wp.lb" in helper_snippet
 
 
 def test_reverse_room_check_log_only_fires_for_a_rescue_relaxed_branch():

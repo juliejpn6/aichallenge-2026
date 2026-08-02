@@ -265,6 +265,31 @@ class LateralTTCMonitor:
         # 2026-07-17追加(92節①): カーブ起因のTTC猶予の連続周期数。
         self._critical_curvature_run: int = 0
 
+    def force_rescue_switch(self) -> None:
+        """247節(2026-07-30)追加: OVERTAKING継続中にroom_exhausted(既存側の
+        先読みroomが尽きた)がgiveupへ合流する直前、mpc_controller.py側が
+        反対側の安全性(is_side_by_side/switchback_space_m/new_side_*_blocked/
+        fwd_ds_overlap_risk、通常のswitchbackと全く同一の可否条件)を確認した
+        上で、最終手段として側を切り替えると決めた時に呼ぶ。
+
+        中身はbranch=A/A_dlat成立時の状態リセット(586-598行目付近)と完全に
+        同一(①非矛盾性: 経路が違うだけで「側が変わった」という事実に対する
+        後始末は1種類のみ)。has_switchedもここで消費するため、通常の
+        switchback同様「1エンゲージにつき1回」の制限にそのまま従う
+        (③ハンチング防止: 新しいラッチを増やさず既存のhas_switchedを共有する
+        ことで、この経路が発火してもその後の通常switchbackやこの経路自身の
+        再発火が同一エンゲージ内では起きない)。"""
+        self.has_switched = True
+        self._prev_space = None
+        self._space_ema = None
+        self._v_corridor_ema = 0.0
+        self._shrink_run = 0
+        self._critical_curvature_run = 0
+        self._dlat_ema = None
+        self._prev_dlat_ema = None
+        self._v_dlat_ema = 0.0
+        self._dlat_shrink_run = 0
+
     def _update_dlat_trend(self, fwd_dlat: Optional[float], fwd_vid: Optional[str],
                             dt: float) -> None:
         """2026-07-20追加(132節、Gap①Phase0、診断専用): fwd_dlatの縮小トレンドを

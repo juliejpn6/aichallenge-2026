@@ -190,6 +190,11 @@ EXEMPT_PARAMS = [
                              # [PERF-DT-SPIKE]の発火倍率(計測の判定閾値であり制御には
                              # 影響しないため、perf_dt_over_margin_msと同じ理由で
                              # 自動換算しない)
+    "failsafe_dt_threshold_ms",  # 2026-08-02追加(264節続報Task1): dt異常フェイルセーフの
+                             # 発火閾値。絶対時間(ms)で意味を持つ値であり、control_rateが
+                             # 変わっても「何ms以上ならワインドアップの恐れがあるか」という
+                             # 物理的な意味は変わらないため自動換算しない(actuator_lag_tau_s
+                             # と同じ扱い)
 ]
 
 
@@ -255,6 +260,12 @@ def test_exempt_params_not_wrapped():
     assert "_rate_scaled_gain(" not in line5
     assert "_rate_scaled_cycles(" not in line5
 
+    idx6 = _SRC.index('getattr(self._mpc_cfg, "failsafe_dt_threshold_ms"')
+    line6_end = _SRC.index("\n", idx6)
+    line6 = _SRC[max(0, idx6 - 40):line6_end]
+    assert "_rate_scaled_gain(" not in line6
+    assert "_rate_scaled_cycles(" not in line6
+
 
 def test_no_new_parameter_added_without_wrapping_or_exemption():
     """将来の回帰防止: 本テストのCATEGORY_A_PARAMS/CATEGORY_B_PARAMS/EXEMPT_PARAMSの
@@ -262,7 +273,7 @@ def test_no_new_parameter_added_without_wrapping_or_exemption():
     (件数の見落とし・重複を機械的に検出する)。"""
     assert len(CATEGORY_A_PARAMS) == 17  # osqp_shadow_cyclesを含め17件
     assert len(CATEGORY_B_PARAMS) == 4  # beta(LAT-TTC)は別テストで確認するためここでは4件
-    assert len(EXEMPT_PARAMS) == 6  # 263節続報Part A-1でperf_dt_spike_factorを追加
+    assert len(EXEMPT_PARAMS) == 7  # 264節続報Task1でfailsafe_dt_threshold_msを追加
 
 
 # ---------------------------------------------------------------------------

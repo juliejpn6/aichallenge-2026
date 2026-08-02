@@ -33,28 +33,29 @@ def test_reference_pattern_plan_room_ok_count_unchanged():
 
 def test_ot_worth_count_resets_on_fwd_vid_change():
     """①_ot_worth_countが、_pass_worth判定の前にfwd_vidの変化を検知して
-    リセットしていることを確認する。"""
+    リセットしていることを確認する。233節続報(2026-07-29、監査結果④)で
+    read→比較→prev更新の3行は_vid_changed_reset()ヘルパーへ集約されたが、
+    「変化を検知した周期にカウンタを0にする」という挙動自体は不変。"""
     idx = _SRC.index("self._ot_worth_count = self._ot_worth_count + 1 if pass_worth else 0")
     snippet = _SRC[max(0, idx - 400):idx]
     # 2026-07-22修正(00節監査): scan.get("fwd_vid")からopp_sit.fwd_vid経由へ変更(値は同一)。
     assert "_fwd_vid_worth = opp_sit.fwd_vid" in snippet
-    assert "if _fwd_vid_worth != self._ot_worth_prev_vid:" in snippet
+    assert 'if self._vid_changed_reset(_fwd_vid_worth, "_ot_worth_prev_vid"):' in snippet
     assert "self._ot_worth_count = 0" in snippet
-    assert "self._ot_worth_prev_vid = _fwd_vid_worth" in snippet
 
 
 def test_ot_giveup_count_resets_on_fwd_vid_change():
     """②_ot_giveup_countが、closing判定の前にfwd_vidの変化を検知して
-    リセットしていることを確認する。"""
+    リセットしていることを確認する。233節続報(2026-07-29、監査結果④)で
+    _vid_changed_reset()ヘルパー経由に統一。"""
     # 2026-07-22修正(00節監査): _scan.get("fwd_vid")からopp_sit経由へ変更(値は同一)。
     idx = _SRC.index("_fwd_vid_giveup = _opp_sit.fwd_vid")
     snippet = _SRC[idx:idx + 600]
-    assert "if _fwd_vid_giveup != self._ot_giveup_prev_vid:" in snippet
+    assert 'if self._vid_changed_reset(_fwd_vid_giveup, "_ot_giveup_prev_vid"):' in snippet
     assert "self._ot_giveup_count = 0" in snippet
-    assert "self._ot_giveup_prev_vid = _fwd_vid_giveup" in snippet
     # このリセットが実際のclosing判定(self._ot_giveup_count += 1)より前に
     # 位置していることを確認する(順序が逆だと今周期の判定に間に合わない)。
-    assert snippet.index("self._ot_giveup_prev_vid = _fwd_vid_giveup") < snippet.index(
+    assert snippet.index("self._ot_giveup_count = 0") < snippet.index(
         "self._ot_giveup_count += 1")
 
 
@@ -71,12 +72,12 @@ def test_scan_traffic_tracks_along_vid():
 def test_along_lane_ema_resets_on_along_vid_change():
     """③_along_lane_emaが、along_vidの変化を検知してリセットしている
     ことを確認する。非適用状態への遷移時(else節)でも
-    _along_lane_prev_vidが_along_lane_emaと共にリセットされる。"""
+    _along_lane_prev_vidが_along_lane_emaと共にリセットされる。233節続報
+    (2026-07-29、監査結果④)で_vid_changed_reset()ヘルパー経由に統一。"""
     idx = _SRC.index("_along_vid_now = _scan.get(\"along_vid\")")
-    snippet = _SRC[idx:idx + 300]
-    assert "_along_vid_now != self._along_lane_prev_vid" in snippet
+    snippet = _SRC[idx:idx + 200]
+    assert 'if self._vid_changed_reset(_along_vid_now, "_along_lane_prev_vid"):' in snippet
     assert "self._along_lane_ema = None" in snippet
-    assert "self._along_lane_prev_vid = _along_vid_now" in snippet
 
     idx2 = _SRC.index("# 非適用状態への遷移時はリセット")
     snippet2 = _SRC[idx2:idx2 + 150]
@@ -89,3 +90,15 @@ def test_all_three_prev_vid_trackers_initialized():
     assert "self._ot_worth_prev_vid = None" in _SRC
     assert "self._ot_giveup_prev_vid = None" in _SRC
     assert "self._along_lane_prev_vid = None" in _SRC
+
+
+def test_vid_changed_reset_helper_updates_prev_and_returns_changed_flag():
+    """233節続報(2026-07-29、監査結果④)追加: 共通ヘルパー_vid_changed_reset()
+    自体が「比較→prev_attr更新→変化有無を返す」を正しく行うことを確認する
+    (実際のリセット処理自体は呼び出し元の責務のまま、意図的に持たない)。"""
+    idx = _SRC.index("def _vid_changed_reset(self, current_vid, prev_attr: str) -> bool:")
+    idx_end = _SRC.index("\n    def ", idx + 10)
+    snippet = _SRC[idx:idx_end]
+    assert "changed = current_vid != getattr(self, prev_attr)" in snippet
+    assert "setattr(self, prev_attr, current_vid)" in snippet
+    assert "return changed" in snippet
