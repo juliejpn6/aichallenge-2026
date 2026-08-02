@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gate2「前方車の追い越し」課題 まとめ</title>
+<style>
+  :root{
+    --bg:#0f172a; --card:#ffffff; --ink:#1e293b; --muted:#64748b;
+    --problem:#dc2626; --cause:#d97706; --fix:#2563eb; --result:#16a34a;
+    --line:#e2e8f0; --accent:#0ea5e9;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,"Segoe UI","Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;
+    color:var(--ink);background:#f1f5f9;line-height:1.7;}
+  header{background:linear-gradient(135deg,#0f172a,#1e3a8a);color:#fff;padding:40px 24px;}
+  header h1{margin:0 0 6px;font-size:26px;}
+  header p{margin:0;color:#cbd5e1;font-size:14px;}
+  .wrap{max-width:1000px;margin:0 auto;padding:24px;}
+  section{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:22px 26px;margin:18px 0;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+  h2{font-size:20px;border-left:5px solid var(--accent);padding-left:12px;margin:4px 0 16px;}
+  h3{font-size:16px;color:#334155;margin:18px 0 8px;}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px;}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top;}
+  th{background:#f8fafc;font-weight:600;}
+  code{background:#f1f5f9;padding:1px 6px;border-radius:5px;font-size:13px;color:#0f766e;}
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;color:#fff;}
+  .t-problem{background:var(--problem);} .t-cause{background:var(--cause);}
+  .t-fix{background:var(--fix);} .t-result{background:var(--result);}
+  .phase{border:1px solid var(--line);border-radius:10px;padding:0;margin:14px 0;overflow:hidden;}
+  .phase>.ph-head{background:#f8fafc;padding:12px 16px;font-weight:700;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:10px;}
+  .ph-num{background:var(--accent);color:#fff;width:26px;height:26px;border-radius:50%;
+    display:inline-flex;align-items:center;justify-content:center;font-size:13px;flex:0 0 auto;}
+  .ph-body{padding:12px 16px;}
+  .ph-row{display:grid;grid-template-columns:84px 1fr;gap:10px;margin:8px 0;align-items:start;}
+  .muted{color:var(--muted);font-size:13px;}
+  .ok{color:var(--result);font-weight:700;}
+  .kpi{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0;}
+  .kpi div{background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;padding:10px 14px;min-width:150px;}
+  .kpi b{display:block;font-size:22px;color:#0369a1;}
+  .note{background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;font-size:13px;}
+  ul{margin:6px 0 6px 0;padding-left:22px;}
+  li{margin:3px 0;}
+  .small{font-size:12px;color:var(--muted);}
+  footer{text-align:center;color:var(--muted);font-size:12px;padding:24px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>gate2「前方車の追い越し」課題 — 対応まとめ</h1>
+  <p>自動運転AIチャレンジ2026 / Sim-to-Real SW部門 ・ MPC制御レーシングカート　|　ROS2 Humble + Autoware + AWSIM</p>
+</header>
+
+<div class="wrap">
+
+<!-- 概要 -->
+<section>
+  <h2>1. 課題の概要</h2>
+  <p>gate2 は安全ゲートの一つで、<b>コース上に停車した他車3台（レースライン上に縦列）を、接触せず追い越して走行を継続する</b>課題。
+  走行制御はデフォルトのMPC（OSQPベース、障害物回避コリドー）を使用する。</p>
+  <table>
+    <tr><th>項目</th><th>内容（実測・仕様より）</th></tr>
+    <tr><td>自車カート</td><td>全長 200cm / <b>全幅 145cm（横半幅 0.725m）</b> / ホイールベース 108.7cm</td></tr>
+    <tr><td>相手車(NPC)</td><td>同型レーシングカート想定（横半幅 0.725m）・<b>レースライン上に縦列で停車</b></td></tr>
+    <tr><td>配置（正しい接線基準 e_y: +左/−右）</td><td>自車スタート <b>e_y=+2.0（ラインの2m左）</b>／相手 d2,d3,d4 = e_y≈+0.3、前方 ds=7,15,23m</td></tr>
+    <tr><td>幾何的要点</td><td>左は壁が近く通れない。<b>右側が開いている</b>ため「右へ寄って3台を追い越す」のが正解挙動</td></tr>
+  </table>
+  <div class="note"><b>初期状態の問題：</b>発進後そのまま前方車両に追突（追い越し挙動が一切成立しない）。回避部品は存在したが、前方車検知で「即停止（gate1挙動）」に固定されていた。</div>
+</section>
+
+<!-- 結論 -->
+<section>
+  <h2>2. 結論（最終結果）</h2>
+  <div class="kpi">
+    <div><span class="small">3台の追い越し</span><b class="ok">成功</b></div>
+    <div><span class="small">他車・壁への接触</span><b class="ok">なし</b></div>
+    <div><span class="small">追い越し後のライン復帰</span><b class="ok">成功</b></div>
+    <div><span class="small">第一コーナー通過</span><b class="ok">成功</b></div>
+    <div><span class="small">最高速度</span><b>4.9 m/s</b></div>
+  </div>
+  <p>最終走行では、<b>発進直後から右へ寄せ → 減速せず加速しながら3台を追い越し（e_y +2.0→−3.0）→ 戻りfunnelで滑らかにライン復帰（−3.0→−1.0）→ 第一コーナー通過</b>、を達成した。</p>
+</section>
+
+<!-- 診断と対策の経緯 -->
+<section>
+  <h2>3. 診断と対策の経緯</h2>
+  <p class="muted">走行ログ（rosbag/mcap）を毎回独自解析し、「症状 → 真因 → 対策 → 結果」を一段ずつ確定して進めた。重要な技術的教訓は最後にまとめる。</p>
+
+  <div class="phase">
+    <div class="ph-head"><span class="ph-num">1</span>追い越し判断ロジックの導入</div>
+    <div class="ph-body">
+      <div class="ph-row"><span class="tag t-problem">症状</span><div>前方車を検知すると常に「停止（gate1挙動）」になり、追い越さない。</div></div>
+      <div class="ph-row"><span class="tag t-cause">真因</span><div>前方車検知で <code>use_obstacle_avoidance=False</code> に倒し、直進＋減速停止に固定されていた。左右の空き判定・追い越し実行が無い。</div></div>
+      <div class="ph-row"><span class="tag t-fix">対策</span><div><b>ステートマシン（NORMAL / OVERTAKING / STOPPING）</b>を新設。前方車の<b>符号付き左右位置</b>と左右の空き幅を解析し、片側が空いていれば OVERTAKING、両側塞がりなら STOPPING（gate1保全）。ヒステリシスで状態のチャタリング防止。</div></div>
+      <div class="ph-row"><span class="tag t-result">結果</span><div>OVERTAKING には入るが、まだ追い越せない（次フェーズへ）。</div></div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="ph-head"><span class="ph-num">2</span>空き幅判定を実コース壁ベースへ（修正1）</div>
+    <div class="ph-body">
+      <div class="ph-row"><span class="tag t-problem">症状</span><div>「右が空き」のはずなのに STOPPING に倒れ続ける。</div></div>
+      <div class="ph-row"><span class="tag t-cause">真因</span><div>空き幅を <code>固定ボックス(max_width/2=3.0)</code> で近似していた。実際の壁(片側6m以上)を見ておらず、空き幅を過小評価。</div></div>
+      <div class="ph-row"><span class="tag t-fix">対策</span><div>各ウェイポイントが持つ<b>実際の壁距離 wp.ub/wp.lb</b> を用いて左右の空きを算出。</div></div>
+      <div class="ph-row"><span class="tag t-result">結果</span><div>右が空き(Rfree≈4.0)と正しく判定し OVERTAKING 発火。だが車体が右へ動かない（次フェーズ）。</div></div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="ph-head"><span class="ph-num">3</span>コリドーの「即右端」要求 → infeasible（funnel導入）</div>
+    <div class="ph-body">
+      <div class="ph-row"><span class="tag t-problem">症状</span><div>前方車手前で急減速→停止→詰まる。「加速して抜ける」べき所でブレーキ。</div></div>
+      <div class="ph-row"><span class="tag t-cause">真因</span><div>前方車が視界に入るとコリドー左境界が <code>+1.8 → −1.7</code> へ<b>一段でジャンプ</b>。左寄りの自車はそこへ飛び移れず <b>MPC infeasible → 安全STOP → ブレーキ</b>。</div></div>
+      <div class="ph-row"><span class="tag t-fix">対策</span><div><b>「徐々に右」funnel</b>：コリドーを現在の自車位置から、先のウェイポイントへ向けて滑らかに遷移させる（近傍は自車を含むよう広げ、先で回避形状へ）。常に feasible を保つ。</div></div>
+      <div class="ph-row"><span class="tag t-result">結果</span><div>ブレーキ消滅。減速せず加速しながら右へ寄れるように。だが寄せ量が不足（次フェーズ）。</div></div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="ph-head"><span class="ph-num">4</span>発進直後の自己位置(ヨー)誤りによる左操舵ロス（修正B）</div>
+    <div class="ph-body">
+      <div class="ph-row"><span class="tag t-problem">症状</span><div>発進直後にまず<b>左</b>へ操舵してしまい、貴重な接近距離を浪費。</div></div>
+      <div class="ph-row"><span class="tag t-cause">真因</span><div>EKFの初期姿勢が <code>yaw=0 / 共分散=100000（向き情報なし）</code> で、発進後の動きから<b>約3秒かけてヨーが収束</b>。その間の誤ったヨーでMPCが誤操舵。<br>さらに根本は、起動シーケンスが <code>/set_initial_pose</code> を<b>GNSS到着前に1回だけ呼び→失敗→スキップ</b>して発進していたこと。</div></div>
+      <div class="ph-row"><span class="tag t-fix">対策</span><div><b>imu_gnss_poser の自動初期姿勢にレースライン向きを適用</b>（<code>try_apply_raceline_yaw</code>）。GNSS到着時の最初の初期姿勢に正しい向き(~128°)が入り、起動タイミングに依存せず EKF が整列状態で開始。</div></div>
+      <div class="ph-row"><span class="tag t-result">結果</span><div>発進直後から正しく<b>右へ操舵</b>。左ロス解消。</div></div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="ph-head"><span class="ph-num">5</span>寄せ量不足 — 相手実寸とマージンの適正化＋crab前倒し</div>
+    <div class="ph-body">
+      <div class="ph-row"><span class="tag t-problem">症状</span><div>右へ寄るが届かず、前方車にギリギリ接触。</div></div>
+      <div class="ph-row"><span class="tag t-cause">真因</span><div>MPCは正しい右経路を<b>計画</b>しているが実行が後ろ倒し（受信ホライズンで先送り）。加えて <code>安全マージン1.63m</code> が過保守で、クリアに <b>e_y≤−1.8</b> が必要（出せるcrab約20°では届かない）。さらに <code>障害物半径0.5</code> は相手カートの実横半幅(0.725)を<b>過小表現</b>していた。</div></div>
+      <div class="ph-row"><span class="tag t-fix">対策</span><div>
+        ① <b>相手半径 0.5→0.8</b>（実寸是正＝接触防止）<br>
+        ② <b>追い越し時マージン 1.63→0.8</b>（自車実footprintまで縮小。壁・相手共通。合計クリアランス1.6m＝安全最小）<br>
+        ③ <b>Q[e_y] を 6e5→5e6 に前倒し</b>（計画した右経路を早期実行）<br>
+        ④ <b>安全網</b>：寄せ切れない時は実車位置基準で減速し接触を防ぐ
+      </div></div>
+      <div class="ph-row"><span class="tag t-result">結果</span><div><span class="ok">3台の追い越しに成功（gate2クリア）。</span></div></div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="ph-head"><span class="ph-num">6</span>追い越し後のライン復帰（戻りfunnel・d_off調整）</div>
+    <div class="ph-body">
+      <div class="ph-row"><span class="tag t-problem">症状</span><div>追い越し後にライン復帰できず、ゴールゲートの<b>内側壁に接触</b>。</div></div>
+      <div class="ph-row"><span class="tag t-cause">真因</span><div>右へ寄せ過ぎ(e_y=−3.4)＋復帰機構が無く、ゴールゲートで内壁が迫って通常コリドー外＝<b>infeasible → 内壁へ流れる</b>。</div></div>
+      <div class="ph-row"><span class="tag t-fix">対策</span><div><b>戻りfunnel</b>：追い越し後にライン外なら、コリドーを現在位置からラインへ徐々に寄せて feasible に復帰。加えて <b>d_off を 3.0 に調整</b>（確実にクリアしつつ深入りしすぎない）。</div></div>
+      <div class="ph-row"><span class="tag t-result">結果</span><div><span class="ok">クリア後 e_y −3.0→−1.0 へ滑らかに復帰、内壁回避、第一コーナーも通過。</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- 最終構成 -->
+<section>
+  <h2>4. 最終解決策の構成（追い越しモード）</h2>
+  <table>
+    <tr><th>要素</th><th>役割</th></tr>
+    <tr><td>ステートマシン（NORMAL/OVERTAKING/STOPPING）</td><td>前方車の左右分布から「追い越す/止まる/通常走行」を毎周期判定。gate1（両側塞がり→停止）も保全。</td></tr>
+    <tr><td>実壁ベースの空き判定（修正1）</td><td>固定ボックスでなく実際の壁距離で左右の空きを評価。</td></tr>
+    <tr><td>「徐々に右」funnel</td><td>コリドーを現在位置から滑らかに遷移させ infeasible を回避（ブレーキ・詰まり防止）。</td></tr>
+    <tr><td>ヘディング前倒し（d_off / Q[e_y] / psi_bias）</td><td>計画した右経路を早期に実行。MPCの支配項を右へ向ける。</td></tr>
+    <tr><td>実寸ベースのマージン（相手0.8 / 自車0.8）</td><td>接触しない範囲で最大限寄せられるよう、過剰バッファを削り実寸を死守。</td></tr>
+    <tr><td>安全網（接触防止）</td><td>寄せ切れない時は実車位置基準で減速・停止し、突っ込みを防止。</td></tr>
+    <tr><td>戻りfunnel</td><td>追い越し後、ライン外から滑らかにレースラインへ復帰（内壁回避）。</td></tr>
+    <tr><td>初期姿勢ヨー補正（修正B）</td><td>発進時のヨー誤りを解消し、発進直後から正しく操舵。</td></tr>
+  </table>
+  <p class="small">補足：判定はオドメトリ実測ベース、制御則はMPCに統一（別制御器を足さない）方針を維持。</p>
+</section>
+
+<!-- パラメータ -->
+<section>
+  <h2>5. 主要パラメータ（config.yaml）</h2>
+  <table>
+    <tr><th>パラメータ</th><th>値</th><th>意味</th></tr>
+    <tr><td><code>v2x …/vehicle_radius</code></td><td>0.8</td><td>相手カートの実横半幅＋余裕（過小表現是正）</td></tr>
+    <tr><td><code>overtake.min_gap</code></td><td>2.5</td><td>追い越し可能とみなす片側空き幅しきい値</td></tr>
+    <tr><td><code>overtake.d_off</code></td><td>3.0</td><td>空き側へ寄せる目標量（クリア十分＋深入りしすぎない）</td></tr>
+    <tr><td><code>overtake.funnel_steps</code></td><td>12</td><td>コリドーをラインへ遷移させるwp数（feasible維持）</td></tr>
+    <tr><td><code>overtake.psi_bias_max_deg</code></td><td>20</td><td>ヘディング参照を開き側へ傾ける上限</td></tr>
+    <tr><td><code>overtake.safety_margin_overtake</code></td><td>0.8</td><td>追い越し中の安全マージン（自車実footprint）</td></tr>
+    <tr><td><code>overtake.q_ey_overtake</code></td><td>5.0e6</td><td>追い越し中のQ[e_y]（右経路の前倒し実行）</td></tr>
+    <tr><td><code>overtake.v_cap / v_min</code></td><td>6.0 / 2.0</td><td>追い越し中の速度上限 / 前進維持の下限</td></tr>
+    <tr><td><code>overtake.safe_clear_dist / safe_brake_dist</code></td><td>1.5 / 3.0</td><td>安全網：未クリア判定の横距離 / 減速を始める前方距離</td></tr>
+    <tr><td><code>overtake.return_done_ey</code></td><td>0.7</td><td>追い越し後、ライン復帰完了とみなす|e_y|（戻りfunnel解除）</td></tr>
+  </table>
+</section>
+
+<!-- 変更ファイル -->
+<section>
+  <h2>6. 変更したファイル</h2>
+  <table>
+    <tr><th>ファイル</th><th>主な変更</th></tr>
+    <tr><td><code>multi_purpose_mpc_ros/.../mpc_controller.py</code></td><td>追い越しFSM、前方車の符号付き解析、offset/psi_bias/funnel/戻りfunnel、安全網、Q[e_y]・マージン切替、診断トピック</td></tr>
+    <tr><td><code>multi_purpose_mpc_ros/.../core/MPC.py</code></td><td>横オフセット(lateral_blend/target)、ヘディングバイアス、funnel、安全マージン上書き、コリドー診断</td></tr>
+    <tr><td><code>multi_purpose_mpc_ros/.../core/reference_path.py</code></td><td>コリドー診断カウンタ（free-segment検出数）の追加</td></tr>
+    <tr><td><code>multi_purpose_mpc_ros/config/config.yaml</code></td><td>overtake パラメータ群、v2x vehicle_radius</td></tr>
+    <tr><td><code>imu_gnss_poser/src/imu_gnss_poser_node.cpp</code></td><td>修正B：自動初期姿勢にレースライン向きを適用（発進時ヨー補正）</td></tr>
+    <tr><td><code>aichallenge_tools/record_run.sh</code></td><td>分析用トピック追加（v2x位置・overtake診断・localization・ground_truth等）</td></tr>
+  </table>
+  <p class="small">既存挙動の保全のため、各変更前にバックアップ（<code>*.gate2.bak</code>）を作成。gate1（両側塞がり→停止）の挙動は維持。</p>
+</section>
+
+<!-- 教訓 -->
+<section>
+  <h2>7. 重要な技術的教訓</h2>
+  <ul>
+    <li><b>MPCは「参照ラインの向き」を非常に強く追従する</b>（Q[e_psi]がQ[e_y]の約167倍）。進路を変えるには<b>ソフトな目標でなく、参照経路/コリドーそのものを動かす</b>必要がある。平行移動だけでは向きが変わらず無効。</li>
+    <li><b>コリドーは「即・最終形」でなく「徐々に」遷移させる</b>とfeasibleを保て、ブレーキ・詰まり・infeasibleを防げる（funnel）。これは追い越しの「往き」と「戻り」の両方に有効。</li>
+    <li><b>マージンは相手・自車の実寸から設計する</b>。障害物半径の過小表現や過剰な安全バッファは、接触または「寄せ切れない」の原因になる。安全最小＝自車半幅＋相手半幅＋小クリアランス。</li>
+    <li><b>低速・発進時のlocalization（特にヨー）は不確実</b>。制御の前提が崩れるため、起動時の姿勢初期化が極めて重要。</li>
+    <li><b>分析の前提を疑う</b>。参照CSVのpsi列が実進行方向と90°ずれていたことに途中で気づき、解析を是正した（コントローラ自体は座標から再計算しており正常だった）。</li>
+    <li><b>「決定層」と「実行層」を分ける</b>：判定（どちらへ・可否）は実測ベースの軽い解析、実行（経路追従）はMPC、安全網は最後の砦、という役割分担が堅実。</li>
+  </ul>
+</section>
+
+<!-- 今後 -->
+<section>
+  <h2>8. 今後（レース本番＝動く相手）に向けて</h2>
+  <p>本対応は<b>停車した相手</b>に対する追い越しを確立した。動く相手＋予測が必要な本番に向けては、次の発展が望ましい：</p>
+  <ul>
+    <li><b>相手を「点群」でなく「車両ごとの位置＋速度」で扱う</b>（現状はV2X予測サンプルを点として扱っており、動く相手で占有帯が膨張するため）。</li>
+    <li><b>時空間での追い越し可否判定</b>：自車と相手の数秒先を予測し、抜け切れるかを判定してからアグレッシブに踏み込む／不可なら追従・断念。</li>
+    <li>本番では「速度優位の確保」と「横移動の完了可否」を協調制御し、安全網（接触回避）を常時併用する。</li>
+  </ul>
+</section>
+
+</div>
+<footer>gate2 追い越し課題 対応まとめ ・ 本ドキュメントは走行ログ解析に基づく</footer>
+</body>
+</html>

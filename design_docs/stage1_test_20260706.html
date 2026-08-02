@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Stage1 テスト結果 2026-07-06 — OSQP update化の予選環境検証</title>
+<style>
+ body{font-family:"Noto Sans JP",sans-serif;margin:24px;background:#f7f8fa;color:#1a1a2e;line-height:1.55;max-width:1250px}
+ h1{font-size:1.4em;border-bottom:3px solid #1a5f7a;padding-bottom:6px}
+ h2{font-size:1.15em;background:#1a5f7a;color:#fff;padding:6px 13px;border-radius:4px;margin-top:30px}
+ table{border-collapse:collapse;width:100%;margin:10px 0;background:#fff;font-size:0.92em}
+ th{background:#e3eef3;border:1px solid #bfd4de;padding:6px 9px;text-align:left}
+ td{border:1px solid #bfd4de;padding:6px 9px;vertical-align:top}
+ .ok{color:#1a7a3a;font-weight:bold}.ng{color:#c0392b;font-weight:bold}.wip{color:#b07d0f;font-weight:bold}
+ .num{font-family:monospace;white-space:nowrap}
+ .hero{background:#fff;border:2px solid #1a5f7a;border-radius:8px;padding:12px 16px;margin:12px 0}
+ .note{background:#fdf6e3;border-left:5px solid #b07d0f;padding:8px 12px;margin:8px 0;font-size:0.9em}
+ code{background:#eef1f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
+ .small{font-size:0.85em;color:#556}
+</style>
+</head>
+<body>
+<h1>Stage1 テスト結果 — OSQP update化(2026-07-06 予選環境)</h1>
+<p class="small">データ: ローカル単独 run 20260705-224731 / 予選環境 autoware(0706).log + rosbag2_autoware(0706).mcap(3周+, 484秒, 相手2台: d2 cap19.5km/h・d3 cap15.1km/h)</p>
+
+<div class="hero">
+<b>結論</b>: Stage1(OSQP update化)は<b>設計どおり完全に機能</b>(等価性0.00・setup撤廃・init半減・単独欠落ゼロ)。
+一方で予選環境の制御欠落は<b>105回/分のまま不変</b> — 切り分けの結果、<b>欠落の主因はinit(QP構築)ではなく、未計測領域のスパイク</b>であることが確定した。
+「initを削れば欠落が消える」という当初仮説は<b>反証</b>され、次の一手は「コールバック全体の計装によるスパイク源の特定」に更新される。
+</div>
+
+<h2>1. 何がどう変わったか(Stage1の実装内容)</h2>
+<table>
+<tr><th>変更</th><th>内容</th></tr>
+<tr><td>MPC.py 全面リファクタ</td><td>470行の癒着した<code>_init_problem</code>を3層に責務分離: ①<code>_stage_data</code>(QPの中身=数値計算) ②組立(<code>_vectors</code>/<code>_assemble_legacy</code>=共通式) ③実行経路(fast/legacy)。コメント整理・matplotlib遅延import化</td></tr>
+<tr><td>fast経路(新設)</td><td>タグ法で構造凍結テンプレート+dataインデックスマップを一度だけ構築 → 毎周期はNumPy値書込+<code>update()</code>のみ。毎周期の疎行列生成・<code>setup()</code>を完全撤廃。P更新はコスト変更イベント時のみ(triuパターン対応)。適用=N固定・循環経路のみ、ピット等は自動でlegacy</td></tr>
+<tr><td>安全網</td><td>起動後50周期は新旧QPを実車上で突き合わせ([OSQP-SHADOW])、不一致なら自動legacyフォールバック。<code>use_osqp_update: false</code>で完全復旧可能</td></tr>
+<tr><td>既存バグ修正(2件)</td><td>①マージン緩和リトライ毎に<code>wp_id_offset</code>が再加算され参照が最大+5wpズレる ②<code>except TypeError or ValueError</code>がValueErrorを捕捉できていない</td></tr>
+<tr><td>Stage R準備</td><td><code>reset_solver_state()</code>(warm_start(x=0,y=0)によるμs級内部リセット)実装済み</td></tr>
+</table>
+
+<h2>2. 想定 vs 実測</h2>
+<table>
+<tr><th>#</th><th>項目</th><th>想定(ゲート)</th><th>実測</th><th>判定</th></tr>
+<tr><td>1</td><td>QP等価性(実車シャドー50周期)</td><td class="num">累計max差 &lt;1e-9</td><td class="num"><b>0.00e+00</b>(単独・予選とも完全一致)</td><td class="ok">PASS</td></tr>
+<tr><td>2</td><td>毎周期setupの撤廃</td><td>ゼロ化</td><td class="num">setup=0.0ms・fast=ON維持(予選21,100周期)</td><td class="ok">PASS</td></tr>
+<tr><td>3</td><td>init時間(単独)</td><td class="num">≤2ms</td><td class="num">7.9→<b>4.0ms</b></td><td class="wip">半減(未達だが下記4が良好)</td></tr>
+<tr><td>4</td><td>制御欠落(ローカル単独)</td><td>低減</td><td class="num">12回/分→<b>0回/分</b>・max 136→48ms</td><td class="ok">PASS(過去最良)</td></tr>
+<tr><td>5</td><td>init時間(予選40FPS)</td><td class="num">1〜2ms</td><td class="num">11.4→<b>5.2ms</b>(-54%)</td><td class="wip">半減(未達)</td></tr>
+<tr><td>6</td><td><b>制御欠落(予選40FPS)=最終ゲート</b></td><td class="num">≤15回/分</td><td class="num"><b>105回/分(前回100と不変)</b> p50=60ms・1tick落ち706回/大スパイク44回</td><td class="ng">FAIL — ただし原因を特定(下記4章)</td></tr>
+<tr><td>7</td><td>走り品質の不変(単独)</td><td>std/反転維持</td><td class="num">std10.46°・反転6.9/s(基準10.5/7.1)・急減速0</td><td class="ok">PASS</td></tr>
+<tr><td>8</td><td>走り品質(予選クリーン周=ラップ3)</td><td>—</td><td class="num">83.6s・std13.3°・反転6.3/s</td><td class="wip">stdやや高(単独10.5)・要観察</td></tr>
+</table>
+
+<h2>3. できていること</h2>
+<table>
+<tr><td class="ok">数値等価性の完全証明</td><td>スタンドアロン試験(組立1e-15厳密一致)+実車シャドー(単独/予選とも0.00)。走行への副作用ゼロでQP構築の仕組みを置換完了</td></tr>
+<tr><td class="ok">ローカル単独の完全健全化</td><td>欠落ゼロ・最大周期48ms(予算25msの2周期以内)。従来の136msスパイクが消滅=疎行列の毎周期生成がスパイク源の一つだったことの傍証</td></tr>
+<tr><td class="ok">予選でのinit半減</td><td>11.4→5.2ms。40FPS予算25msに対しinit+solve≈5.8msと十分小さい</td></tr>
+<tr><td class="ok">交通資産の継続動作</td><td>OpponentSpeedMap全周学習(d2=19.5/d3=15.1km/h)・ICC追従・被追い越し対応は予選環境で正常動作。急減速4回はいずれも前方詰まり由来の減速で衝突なし</td></tr>
+</table>
+
+<h2>4. やろうと思ったがうまくいっていないこと(切り分け済み)</h2>
+<div class="hero">
+<b>「init削減 → 予選欠落の根治」は不成立だった。</b>ただし切り分けは完了:
+<table>
+<tr><th>検証</th><th>結果</th><th>含意</th></tr>
+<tr><td>/clockの健全性(シム側)</td><td class="num">200Hz・欠落0回・max40ms・実時間係数1.000</td><td>シミュレータのフレーム落ちでは<b>ない</b></td></tr>
+<tr><td>欠落とフェーズの相関</td><td class="num">交通中114回/分 vs クリーン86回/分</td><td>交通処理は増悪要因だが主因ではない(クリーンでも高頻度)</td></tr>
+<tr><td>tick充足率</td><td class="num">18,545/19,371 = 95.7%(4.3%のtickを取りこぼし)</td><td><b>コントローラ側</b>で毎秒約1.7回、25ms予算を超過する処理が発生</td></tr>
+<tr><td>initとの関係</td><td class="num">init 11.4→5.2msでも欠落100→105回/分</td><td>スパイク源は<b>get_control(init+solve)の外</b>=未計測領域にある</td></tr>
+</table>
+容疑者(毎秒〜1.7回・25ms超のスパイク源候補): ①PythonのGC(疎行列は撤廃済みだが他のnumpy一時配列・v2x/コリドー処理) ②OPP_MAPフラット配列publish(1Hz・350wp×2台) ③RViz予測マーカ等のpublish群 ④1Hzの[OT]ログprint/flush。<b>次の一手はコールバック全体の区間計装で犯人を実測特定すること</b>(推測で対策しない)。
+</div>
+
+<h2>5. 新たに見つかった課題</h2>
+<table>
+<tr><th>#</th><th>課題</th><th>実測</th><th>対処方針</th></tr>
+<tr><td>N1</td><td><b>未計測領域のスパイク(最終ゲートの残り)</b></td><td>4.3%のtick落ち・p50=60ms・クリーン走行でも86回/分</td><td><b>Stage1.5</b>: タイマコールバック全体の区間計装(scan/plan/v2x/publish/GC)→上位犯人を除去。GCは<code>gc.freeze()</code>+アイドル時collectを計測後に判断</td></tr>
+<tr><td>N2</td><td>OT係合↔離脱の空転(churn)</td><td>OVERTAKING合計145秒・完了0回。オフセット2.5-2.8mまで開いて戻るを繰り返しラップ1-2が191/155秒</td><td>既知のΔv不足(v15 vs d3=15.1)が根本 — <b>Stage3(v_max引き上げ)まで係合条件を現状より保守化する価値あり</b>(閉じる窓に挑まない: 完遂予測のΔv下限を厳格化)。Stage4のOWMで区間ベース化</td></tr>
+<tr><td>N3</td><td>予選クリーン周の操舵stdやや高</td><td>ラップ3: std13.3°(単独10.5)・反転6.3/s</td><td>観察継続。予選機のtick落ち(60ms間隔)が操舵の粗さに寄与している可能性 — N1解決後に再測定</td></tr>
+<tr><td>N4</td><td>相手構成がセッションで変わる</td><td>d2 cap: 前回29.9→今回19.5km/h</td><td>想定内(OpponentSpeedMapは毎セッション学習し直す設計が正)。1周目保守の方針を維持</td></tr>
+</table>
+
+<h2>6. 次アクション</h2>
+<table>
+<tr><th>順</th><th>アクション</th><th>ゲート</th></tr>
+<tr><td>1</td><td><b>Stage1.5: コールバック全体の区間計装</b>(数行のperf_counterフック+周期毎の最大区間ログ)→ローカルで犯人特定→除去(publish間引き/GC対策/ベクトル化)</td><td>予選相当で欠落≤15回/分(本来のStage1ゲートを引き継ぐ)</td></tr>
+<tr><td>2</td><td>Stage2: Qの曲率スケジュール+予測型速度ガード(fast経路のPx更新基盤は実装済み)</td><td>直線std低下と内巻き縮小の両立</td></tr>
+<tr><td>3</td><td>Stage3: v_max段階引き上げ(N2の根本解)</td><td>各段の品質ゲート</td></tr>
+</table>
+
+
+<h2>7. 外部レビュー(課題A/B)のファクトチェックと裁定(2026-07-06)</h2>
+<div class="hero">
+<b>結論: 課題A・Bで提示された「起こった事実」は、当方の0706ログ/bagのどこにも存在しない。</b>
+修正コード(Diff)は「実在しない現象」に対しては適用しない(推測ベースの防衛コードは挙動を変えるリスクだけを持ち込む)。
+ただし提案された防衛ロジック自体は<b>2件が実装済み・2件がロードマップ採用済み</b>であり、下表の通り裁定する。
+</div>
+
+<h3>Step 1: 事実の検証(データフローの追跡)</h3>
+<table>
+<tr><th>主張された事実</th><th>検証方法</th><th>結果</th></tr>
+<tr><td>longitudinal_velocity=10.2m/s(36.7km/h)を記録</td><td>ログ内 "10.2" 全3件の文脈確認 + bag実速度</td><td class="ng">不検出。3件の正体は psi_bias=-10.2°(操舵バイアス) と vopp=10.2km/h(相手速度)。bag実測の自車最高速は<b>15.8km/h(4.4m/s)</b></td></tr>
+<tr><td>-15m/s²の異常減速</td><td>bag(kinematic_state差分)の加速度走査</td><td class="ng">不検出(急減速は最大でも通常制動域の4イベント・全て前方詰まり由来)</td></tr>
+<tr><td>35km/h制限ペナルティを喰らった</td><td>ログ内 penalty/speed limit 系全走査</td><td class="ng">不検出。ヒット3件はconfigコメント(OVER=指令加速度±3m/s²ルール)とOPP_MAP出力のみ。なお公式回答の記録では独立の最高速ペナルティ自体が存在しない(OVERは<b>指令加速度</b>に対する判定)</td></tr>
+<tr><td>REVERSE→DRIVE復帰直後に発生</td><td>ログ内 reverse/gear 全走査(0件)</td><td class="ng"><b>因果として不成立</b>: 当方スタックにREVERSEリカバリは未実装(Stage R=reverse_smokeベンチ待ち)。gear_cmdは一度も配信していない</td></tr>
+<tr><td>課題B: v24テストで内巻き1.15m・反転14回/s</td><td>当該runの実在確認</td><td class="ng">当方はv24走行を未実施(本runはv_max=15固定・bag最高速15.8km/h)。数値の出所となるログが当方に存在しない</td></tr>
+</table>
+<p class="small">データフロー(参考): 自車状態は /localization/kinematic_state(EKF)→ MPCのx0(e_y,e_psi)。速度指令はQP解u[0](上限=umax=v_max/κエンベロープ/ICC v_safeのmin)。ペナルティ判定はAWSIM内部の実車状態に対して行われ、当方制御は指令加速度を±1.37に制限済み(OVER閾値±3に対し2.2倍のマージン)。</p>
+
+<h3>Step 2-4: 提案された防衛ロジックの裁定(実在の設計・コードに対して)</h3>
+<table>
+<tr><th>提案</th><th>裁定</th><th>状態・根拠</th></tr>
+<tr><td>κ_eff = κ/(1-κ·e_y) のゼロ除算防衛</td><td class="ok">実装済み</td><td>mpc_controller.py の _offset_line_speed_cap に <code>den&lt;0.2→0.2</code> クランプ実装済み(発散・ZeroDivision・符号反転が構造的に不可能。縮退時は最大減速側=安全方向)</td></tr>
+<tr><td>DRIVE復帰1歩目のウォームスタート爆発対策</td><td class="ok">実装済み(上位解)</td><td>MPC.reset_solver_state()=warm_start(x=0,y=0)によるμs級内部リセット(setup不要)。max_iter引き上げ案はinfeasibility(実際の故障モード)に無効のため不採用(§10-6裁定)。<b>ただし呼び出し元のREVERSEモード自体が未実装なので現状は待機コード</b></td></tr>
+<tr><td>速度スパイク遮断クランパ/LPF</td><td class="wip">見送り(現時点)</td><td>対象現象が不検出のため適用しない。実在が確認されたら(該当runのログ+velocity_statusの記録を提供いただければ)O(1)のメディアン/レートゲートを即日実装可能。なお「観測速度の飛び」はOVER判定(指令加速度基準)を発動させる経路を持たない</td></tr>
+<tr><td>動的ルックアヘッド(車速比例の注視距離)</td><td class="ok">採用済み(条件付き)</td><td>ロードマップStage3に「時間一定(τ≈0.2s)+κバイアス補正」型として登録済み。発動条件=v18/20/22の各段ゲートでターンイン遅れの兆候が出た場合のみ(κバイアス倍返しの実測知見による)</td></tr>
+<tr><td>QスケジュールのS字平滑化</td><td class="ok">採用済み</td><td>§10-6裁定の通り: per-wp Qは時間不変・位置固定でBellman崩壊は構造上生じない(既存のper-wp κ_ref/v_refと同一枠組み)。smoothstep+8段階量子化はゼロコスト保険としてStage2仕様に組込済み</td></tr>
+<tr><td>計算量O(1)要件</td><td class="ok">仕様準拠</td><td>採用済みの予測型速度ガード=v+a×0.25s(1乗算1加算)。動的ルックアヘッド=インデックス計算のみ。現在の実測: init5.2ms+solve0.6ms(予算25ms)</td></tr>
+</table>
+<div class="note"><b>再現情報のお願い</b>: 課題A/Bの数値(10.2m/s・-15m/s²・内巻き1.15m・反転14回/s)が観測された<b>元のログファイル/走行環境</b>をご提供ください。当方の0706環境(v_max=15・リカバリ未実装)では原理的に再現しない構成のため、別環境(独自にリカバリを試験した環境等)の産物である可能性が高いです。実物が届き次第、同じ手法で因果を特定し防衛コードを裁定します。</div>
+<p class="small">生成: 2026-07-06 / Stage1コード: core/MPC.py(3層構造)・config <code>use_osqp_update/osqp_shadow_cycles</code> / 検証: スタンドアロン等価性試験(scratchpad/test_mpc_fast.py)・実車シャドー・予選bag解析 / ロードマップ: roadmap_20260705_targets.html</p>
+</body>
+</html>

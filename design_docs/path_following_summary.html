@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>経路追従性の課題と対策まとめ</title>
+<style>
+  :root{
+    --bg:#ffffff; --card:#f7f9fc; --card2:#eef2f8; --ink:#1c2333; --muted:#5b6678;
+    --accent:#1769d6; --good:#1a8f63; --bad:#d63b3b; --warn:#b9821a; --line:#d7deea;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,system-ui,sans-serif;
+    line-height:1.75;font-size:15px}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 20px 80px}
+  header h1{font-size:26px;margin:0 0 6px}
+  header .sub{color:var(--muted);font-size:14px}
+  .tag{display:inline-block;background:var(--card2);color:var(--accent);
+    border:1px solid var(--line);border-radius:999px;padding:2px 12px;font-size:12px;margin-right:6px}
+  h2{font-size:20px;margin:38px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:16px;margin:22px 0 8px;color:var(--accent)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}}
+  .box{border-radius:10px;padding:14px 16px;margin:10px 0;border-left:4px solid var(--line);background:var(--card2)}
+  .box.problem{border-left-color:var(--bad)}
+  .box.cause{border-left-color:var(--warn)}
+  .box.fix{border-left-color:var(--accent)}
+  .box.result{border-left-color:var(--good)}
+  .box .h{font-weight:700;margin-bottom:4px;font-size:14px;letter-spacing:.02em}
+  .box.problem .h{color:var(--bad)} .box.cause .h{color:var(--warn)}
+  .box.fix .h{color:var(--accent)} .box.result .h{color:var(--good)}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--card2);color:var(--muted);font-weight:600}
+  code{background:#eef2f8;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px;color:#0b4ea2}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre{background:#0f1b2d;color:#e7eefc;border-radius:10px;padding:14px 16px;overflow:auto;font-size:13px;line-height:1.55}
+  pre .c{color:#7fa7d6} pre .k{color:#e0b15a} pre .g{color:#7fd6a8}
+  .kpi{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0}
+  .kpi .k{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:150px}
+  .kpi .k .n{font-size:22px;font-weight:800}
+  .kpi .k .l{font-size:12px;color:var(--muted)}
+  .arrow{color:var(--good);font-weight:700}
+  .small{font-size:13px;color:var(--muted)}
+  ul{margin:6px 0 6px 0;padding-left:20px} li{margin:3px 0}
+  .pill{font-size:12px;padding:1px 8px;border-radius:6px;border:1px solid var(--line)}
+  .pill.g{color:var(--good);border-color:#bfe3d3;background:#e6f7ef}
+  .pill.b{color:var(--bad);border-color:#f3c6c6;background:#fdecec}
+  .pill.w{color:var(--warn);border-color:#f0dcb4;background:#fdf4e3}
+  .st-done{color:var(--good);font-weight:700}
+  .st-revert{color:var(--bad);font-weight:700}
+  .st-open{color:var(--warn);font-weight:700}
+  .foot{margin-top:40px;color:var(--muted);font-size:12.5px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div><span class="tag">AI Challenge 2026</span><span class="tag">Sim-to-Real / SW</span><span class="tag">solo cornering / 経路追従</span></div>
+  <h1>経路追従性の課題と対策まとめ</h1>
+  <div class="sub">「レースラインを正確になぞる」ための課題・対処・結果と、残課題の整理。最終目標：最速ライン追従＋オーバーテイク経路の正確なトレース。</div>
+</header>
+
+<!-- ============ 0. 背景 ============ -->
+<h2>0. 背景：なぜ経路追従性か</h2>
+<div class="card">
+  <p>レース戦略は<strong>先行時＝最速ラインを攻める</strong>／<strong>後追い時＝オーバーテイク経路を生成し実行</strong>の2局面。
+  どちらも「<strong>狙った線を正確に走れる</strong>」ことが前提。「経路追従性が高い＝速い」は正しく、二段構えで考える：</p>
+  <div class="grid">
+    <div class="box fix"><div class="h">① ラインが最速（traj_mincurv）</div>最小曲率最適化ライン。今後さらに煮詰める対象。</div>
+    <div class="box fix"><div class="h">② その線を正確になぞれる（追従）</div>生成ライン／オーバーテイク経路を誤差小さく追従。<strong>本書の主題</strong>。</div>
+  </div>
+</div>
+
+<!-- ============ 1. 現在の状態 ============ -->
+<h2>1. 現在の状態（最新スナップショット）</h2>
+<div class="card">
+  <div class="kpi">
+    <div class="k"><div class="n pill g">安定周回</div><div class="l">無衝突で複数周(5〜9周)</div></div>
+    <div class="k"><div class="n">RMS e_y ≈ 0.4–0.57 m</div><div class="l">真値(GNSS基準)の追従誤差</div></div>
+    <div class="k"><div class="n">直線 std ≈ 1.1°</div><div class="l">操舵の滑らかさ(発振なし)</div></div>
+  </div>
+  <p>採用中の設定：<strong>横目標＝レースライン</strong>（<code>line_follow_w=1.0</code>）、<strong>Q[e_y]=2e6</strong>、
+  <strong>GNSS軌跡方位の注入</strong>（方位バイアス補正）。
+  MPCの横目標 <code>xr0</code> は直線で <strong>0（＝レースライン, 壁中心ではない）</strong>＝<strong>目標は正しい</strong>ことを確認済み。
+  残るズレは「目標の誤り」ではなく「<strong>執行（追従）の取りこぼし</strong>」。</p>
+</div>
+
+<!-- ============ 2. 課題→対処→結果 ============ -->
+<h2>2. 実施した対処と結果（課題→対処→結果）</h2>
+<table>
+  <tr><th style="width:24%">課題</th><th style="width:30%">対処</th><th style="width:30%">結果</th><th style="width:16%">状態</th></tr>
+  <tr>
+    <td><strong>A. MPCがレースラインでなく壁コリドー中心を追従</strong>（常時0.5m級の横オフセット）</td>
+    <td>既存の <code>lateral_blend</code>/<code>lateral_target</code> 機構を再利用し、通常走行で横目標をレースライン(e_y=0)へ。<code>line_follow_w</code> 追加(可逆)</td>
+    <td>直線オフセット <strong>+0.55→+0.11m</strong>、ヘアピンの<strong>±2m振動を抑制</strong>、安定周回。目標が正しくなった</td>
+    <td><span class="st-done">採用 (w=1.0)</span></td>
+  </tr>
+  <tr>
+    <td><strong>B. 横追従の重み調整</strong>（ジッタ↔追従のトレードオフ）</td>
+    <td><code>Q[e_y]</code> を 6e5→5e6→2e6 で比較</td>
+    <td>5e6はジッタ増(std1.9°)。<strong>2e6が最良</strong>(std1.2°・追従良好)</td>
+    <td><span class="st-done">採用 (2e6)</span></td>
+  </tr>
+  <tr>
+    <td><strong>C. 方位バイアス</strong>（EKFヨーが実方位より約−1.5°。gyro積分のみで絶対補正なし）</td>
+    <td>GNSS位置履歴から進行方位を求め、EKFのyaw観測として注入(yaw cov有限化＋速度ゲート)。<code>imu_gnss_poser</code></td>
+    <td>バイアス <strong>−1.5°→−0.17°(解消)</strong>。ただしRMS e_yは不変＝<strong>方位は見えていたズレの主因ではなかった</strong></td>
+    <td><span class="st-done">採用(保持)</span></td>
+  </tr>
+  <tr>
+    <td><strong>D. ステアレート制約が固定Tsで過保守</strong>（空間MPCなのにΔs/vでない＝計画ターンインが鈍い、と仮説）</td>
+    <td>制約を物理的に正しい <code>Δs/v</code> ベースへ変更（試行）</td>
+    <td><strong>発振・蛇行</strong>(直線std 1.17→3.45°)、2周で停止。<br>学び：<strong>固定Ts制約は“事実上のダンピング”だった</strong></td>
+    <td><span class="st-revert">巻き戻し</span></td>
+  </tr>
+  <tr>
+    <td><strong>E. 追従精度を上げると発振する（安定性の天井）</strong></td>
+    <td>方針A：操舵レートのソフトペナルティ <code>r_drate</code>(Δkappa²罰)で減衰を付与し天井を上げる</td>
+    <td><strong>アンダーステアで衝突</strong>(r_drate=50kで曲がり切れず外へ2.5m膨らみ)。<br>学び：減衰は<strong>必要なターンインまで鈍らせる</strong></td>
+    <td><span class="st-revert">撤去</span></td>
+  </tr>
+</table>
+
+<h3>補足：制御の操舵レートは「両側とも壁」だった</h3>
+<div class="box cause"><div class="h">D と E の2失敗が動作点を挟み込んだ＝現安定点はこの制御構造のほぼ最良</div>
+  <ul>
+    <li>ステアレートを<strong>緩める</strong> → <strong>発振</strong>（課題D, run 211232）</li>
+    <li>ステアレートを<strong>締める/減衰</strong> → <strong>アンダーステア</strong>（課題E, run 090143）</li>
+  </ul>
+  → <strong>現在の安定点（Ts基準ハード制限・R=[1e5,0]・ソフト罰なし）は、ノイズの多いEKF下でこの制御構造が出せる実用的な最良点に近い。</strong>
+  操舵レート系パラメータを片側に倒すと別の失敗が出るだけ。<strong>制御パラメータでこれ以上の追従改善は頭打ち</strong>＝残るレバーは制御の外（センシング/トラジェクトリ）。
+  <span class="small">※（出力クリップ＝実アクチュエータ限界 rate·Ts は一貫して不変。Sim-to-Real整合を維持）</span>
+</div>
+
+<!-- ============ 3. センシング診断 ============ -->
+<h2>3. センシング（localization / EKF）の診断</h2>
+<div class="card">
+<pre>GNSS pose ─► imu_gnss_poser ─► (位置cov 0.1 / 方位=<span class="g">GNSS軌跡方位を注入(対処C)</span>)
+                                      │
+wheel vx + gyro(wz) ─► gyro_odometer ─► (twist)
+                                      ▼
+                              ekf_localizer ─► /localization/kinematic_state（制御が使用）</pre>
+  <p class="small">EKF主要param：<code>enable_yaw_bias_estimation:false</code> / <code>pose_additional_delay:0.14s</code> / GNSS位置 ~20Hz。</p>
+  <table>
+    <tr><th>診断項目</th><th>内容</th><th>状態</th></tr>
+    <tr><td>S1 方位バイアス</td><td>gyro積分のみで絶対補正なし→約−1.5°。Q[e_psi]=1e8支配で操舵に直結</td><td><span class="st-done">対処C で解消</span></td></tr>
+    <tr><td>S2 位置のコーナー過小報告</td><td>EKFがコーナーの横振れを<strong>約40-50%平滑化（過小報告）</strong>。真値RMS 0.55-0.58 に対しEKFは0.39しか見ない。
+      相互相関で<strong>時間遅れではなく振幅減衰</strong>と判明（EKFはむしろ60ms先行）→ <code>pose_additional_delay</code>調整では直らない</td><td><span class="st-open">未対処</span></td></tr>
+  </table>
+  <p class="small">GNSSは直線でEKFと一致(±0.07m)＝信頼可。コーナー差0.3mは本物のEKF過小報告。AWSIM真値poseは未記録(GTは衝突のみ)。</p>
+</div>
+
+<!-- ============ 4. 残った課題 ============ -->
+<h2>4. 残った課題の整理</h2>
+
+<h3>最優先：追従精度の根治（最終目標に直結）</h3>
+<div class="box problem"><div class="h">R1. コーナーで内側に切れ込み／膨らみ（真値 RMS 0.4–0.57m）</div>
+  原因＝<strong>EKFのコーナー過小報告(S2)＋制御のターンインラグ</strong>の二重。制御は誤差の約2/3しか見えず補正しきれない。
+  <strong>制御パラメータでは天井で詰められない</strong>（課題D/Eで実証）。レバーは下記2つ：
+  <ul>
+    <li><strong>トラジェクトリ（ベストライン化）</strong>：第3コーナーの「左→右」キンク除去・レイトエイプックス化等。
+    <span class="pill g">低リスク</span> 制御の天井に触れない・CSV編集で可逆・<strong>最終目標そのもの</strong>。<strong>推奨の次の一手</strong>。</li>
+    <li><strong>センシング（EKF, S2）</strong>：コーナー過小報告・ノイズの低減。<span class="pill w">難</span> EKF本体はAutoware側で深掘りが必要。応答性を上げる前提条件。</li>
+  </ul>
+</div>
+<div class="box problem"><div class="h">R2. 第3コーナーの「左→右」（トラジェクトリのS字形状）</div>
+  レースライン自体が手前で左へキンク(kappa+0.11)→右ヘアピン(−0.21)。車は忠実に左→右と操舵している＝<strong>追従は正しく、ライン形状の問題</strong>。
+  レイトエイプックス化（左キンク除去＋直線で左壁寄せ）で改善可。＝R1のトラジェクトリ対処と同じ作業。
+</div>
+<div class="box problem"><div class="h">R3. 第2コーナー脱出後の直線で中央へ垂れる（サグ +0.6m）</div>
+  MPC目標はレースライン(0)で正しいが、脱出オーバーシュートが短い直線で戻り切らず中央寄りに。第3コーナー手前では回復。
+  ＝<strong>執行ラグ(S2＋制御)</strong>。R1と同根。
+</div>
+
+<h3>別系統：安定性・安全性（MPC監査の“静かなバグ”）</h3>
+<div class="box cause"><div class="h">R4. 監査で見つけた未対処項目（挙動は出ていないが将来リスク）</div>
+  <ul>
+    <li>④ 例外捕捉バグ（<code>except TypeError or ValueError</code>＝TypeErrorしか捕捉せず）＋OSQP解ステータス未チェック</li>
+    <li>⑤ infeasible判定が脆い（「全操舵が非ゼロか」）／⑥ 緩和で安全マージンを0まで削る</li>
+    <li>⑧ 毎周期OSQPフルsetup（warm-start不使用）＝RT余裕／⑨ 経路マッチングが全点argmin＝ヘアピン誤マッチの恐れ</li>
+  </ul>
+  <span class="small">いずれも「静かに壊れる」型。レース投入前に押さえたいが、追従精度とは独立。</span>
+</div>
+<div class="box cause"><div class="h">R5. Sim-to-Real / モデル忠実度</div>
+  ⑩すべり無視でay_max=12(&gt;1G) ⑪ステアゲイン1.639の開ループ補正 ⑬粗いkappa/平滑化 ⑮出力ローパス無効 など。
+  実機レース・タイム詰めの段階で効く。
+</div>
+
+<!-- ============ 5. 今後の方針 ============ -->
+<h2>5. 今後の方針</h2>
+<div class="timeline" style="position:relative;margin:10px 0 0 6px;padding-left:22px;border-left:2px solid var(--line)">
+  <div style="margin-bottom:14px"><strong>STEP 1（推奨・次の一手）</strong> <strong>トラジェクトリのベストライン化</strong>（R1/R2/R3）。
+    第3コーナーのレイトエイプックス化から着手。低リスク・可逆・最終目標に直結。現行ラインと壁を可視化→修正案提示→確認の上で編集。</div>
+  <div style="margin-bottom:14px"><strong>STEP 2</strong> 必要に応じ<strong>センシング(S2)</strong>の改善（EKFコーナー過小報告の低減）。追従の天井を上げ、より攻めたライン追従を可能に。</div>
+  <div style="margin-bottom:14px"><strong>STEP 3</strong> ライン追従が安定したら<strong>オーバーテイク経路の生成＋トレース</strong>（後追い戦略）。</div>
+  <div><strong>STEP 4（並行）</strong> レース投入前に<strong>R4の安全系バグ</strong>を整理。</div>
+</div>
+
+<div class="card" style="margin-top:18px">
+  <strong>総括：</strong> 横目標をレースラインへ正す（対処A, w=1.0）ことで<strong>「壁中心を走る」構造問題は解消</strong>し、目標は正しくなった。
+  方位も補正済(対処C)。残る追従誤差は<strong>EKFのコーナー過小報告(S2)＋制御ターンインラグ</strong>で、
+  <strong>制御パラメータでは頭打ち</strong>（緩めると発振・締めるとアンダーステア）。
+  よって次は<strong>制御の外＝トラジェクトリのベストライン化</strong>（低リスク・最終目標直結）へ進むのが最善。
+</div>
+
+<div class="foot">経路追従性 課題・対処・残課題まとめ（整理版） / 解析ログ: 204648 / 162541 / 212741 / 221109 / 090143 / 更新: 2026-06-30 / MPC: spatial bicycle (OSQP)</div>
+
+</div>
+</body>
+</html>

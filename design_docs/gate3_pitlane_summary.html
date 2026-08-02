@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gate3 ピットレーン走行 課題まとめ</title>
+<style>
+  :root{
+    --bg:#ffffff; --card:#f7f9fc; --card2:#eef2f8; --ink:#1c2333; --muted:#5b6678;
+    --accent:#1769d6; --good:#1a8f63; --bad:#d63b3b; --warn:#b9821a; --line:#d7deea;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,system-ui,sans-serif;
+    line-height:1.75;font-size:15px}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 20px 80px}
+  header h1{font-size:26px;margin:0 0 6px}
+  header .sub{color:var(--muted);font-size:14px}
+  .tag{display:inline-block;background:var(--card2);color:var(--accent);
+    border:1px solid var(--line);border-radius:999px;padding:2px 12px;font-size:12px;margin-right:6px}
+  h2{font-size:20px;margin:38px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--line)}
+  h3{font-size:16px;margin:22px 0 8px;color:var(--accent)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}}
+  .box{border-radius:10px;padding:14px 16px;margin:10px 0;border-left:4px solid var(--line);background:var(--card2)}
+  .box.problem{border-left-color:var(--bad)}
+  .box.cause{border-left-color:var(--warn)}
+  .box.fix{border-left-color:var(--accent)}
+  .box.result{border-left-color:var(--good)}
+  .box .h{font-weight:700;margin-bottom:4px;font-size:14px;letter-spacing:.02em}
+  .box.problem .h{color:var(--bad)} .box.cause .h{color:var(--warn)}
+  .box.fix .h{color:var(--accent)} .box.result .h{color:var(--good)}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--card2);color:var(--muted);font-weight:600}
+  code{background:#eef2f8;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px;color:#0b4ea2}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  .timeline{position:relative;margin:10px 0 0 6px;padding-left:22px;border-left:2px solid var(--line)}
+  .tl{position:relative;margin:0 0 16px}
+  .tl::before{content:"";position:absolute;left:-29px;top:4px;width:12px;height:12px;border-radius:50%;
+    background:var(--bg);border:3px solid var(--accent)}
+  .tl.bad::before{border-color:var(--bad)} .tl.good::before{border-color:var(--good)}
+  .tl .t{font-weight:700;font-size:14px}
+  .tl .d{color:var(--muted);font-size:13.5px}
+  .kpi{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0}
+  .kpi .k{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:150px}
+  .kpi .k .n{font-size:22px;font-weight:800}
+  .kpi .k .l{font-size:12px;color:var(--muted)}
+  .arrow{color:var(--good);font-weight:700}
+  .small{font-size:13px;color:var(--muted)}
+  ul{margin:6px 0 6px 0;padding-left:20px} li{margin:3px 0}
+  .pill{font-size:12px;padding:1px 8px;border-radius:6px;border:1px solid var(--line)}
+  .pill.g{color:var(--good);border-color:#bfe3d3;background:#e6f7ef}
+  .pill.b{color:var(--bad);border-color:#f3c6c6;background:#fdecec}
+  .foot{margin-top:40px;color:var(--muted);font-size:12.5px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div><span class="tag">AI Challenge 2026</span><span class="tag">Sim-to-Real / SW</span><span class="tag">gate3</span></div>
+  <h1>gate3「車線維持（ピットレーン走行）」課題まとめ</h1>
+  <div class="sub">車庫発進 → 極狭ピットレーンの低速走行 → コースイン。課題・原因・対処・改善の記録。</div>
+</header>
+
+<!-- ============ 概要 ============ -->
+<h2>1. 概要</h2>
+<div class="card">
+  <p>gate3 は、車両が<strong>レースライン上ではなく車庫（ピット）でスポーン</strong>し、
+  <strong>極端に狭いピットレーン（最狭 約2.5m、車幅1.45m）を低速で走り抜けてコースイン</strong>する課題。
+  当初は<strong>発進すらできず</strong>、その後も<strong>ピット出口の右壁に繰り返し衝突</strong>していた。</p>
+  <p>設計上の制約として、<strong>gate3 専用にせず gate1 / gate2 / gate3 / make eval すべてで動く統一実装</strong>とすること、
+  <strong>スポーン座標で参照経路を判別し、コースインしたらレースラインへ切り替える（切替は GNSS 座標で）</strong>こと、を満たす必要があった。</p>
+  <div class="kpi">
+    <div class="k"><div class="n pill b">発進不可</div><div class="l">初期状態（v=0）</div></div>
+    <div class="k"><div class="n">→</div><div class="l">複数の原因を順に特定</div></div>
+    <div class="k"><div class="n pill g">CLEAR</div><div class="l">最終結果（all_passed: true）</div></div>
+  </div>
+</div>
+
+<!-- ============ 課題 ============ -->
+<h2>2. どのような課題だったか</h2>
+<div class="grid">
+  <div class="box problem"><div class="h">① 発進しない</div>
+    既定の MPC はレースライン（<code>traj_mincurv.csv</code>）を追従する設定。だが gate3 の発進地点はレースラインから
+    <strong>約10m離れた車庫</strong>。経路に乗れず目標速度が出ず、<strong>v=0 のまま動かない</strong>。</div>
+  <div class="box problem"><div class="h">② 右壁に衝突</div>
+    発進できるようにした後も、<strong>発進直後に右へ操舵し、ピット出口の右壁へまっすぐ流れて衝突</strong>。
+    対策を変えても同じ場所で当たり続けた（最難関）。</div>
+  <div class="box problem"><div class="h">③ コリドー崩壊（infeasible）</div>
+    回避コリドーが<strong>「No feasible free segment」で崩壊</strong>し、MPC が解けず無操舵で壁へ。</div>
+  <div class="box problem"><div class="h">④ 統一実装の要求</div>
+    gate3 専用ロジックは不可。<strong>発進座標で経路を自動判別</strong>し、コースインで自動復帰する汎用設計が必要。</div>
+</div>
+
+<!-- ============ 診断タイムライン ============ -->
+<h2>3. 原因究明のタイムライン（試行錯誤の記録）</h2>
+<div class="card">
+<div class="timeline">
+  <div class="tl bad"><div class="t">発進不可</div>
+    <div class="d">原因：参照がレースラインのみ。車庫はそこから約10m。
+    → <span class="arrow">対処</span>：発進座標でピット経路(from_garage)を読む機能を追加。</div></div>
+  <div class="tl bad"><div class="t">コリドー崩壊（infeasible）</div>
+    <div class="d">原因：<strong>占有格子地図がピット/車庫を全面「占有」</strong>として持つため、回避コリドーが空きを見つけられず崩壊。
+    → <span class="arrow">対処</span>：ピット内は回避OFF（純経路追従）。</div></div>
+  <div class="tl bad"><div class="t">誤診A：低速ヨー＝自己位置失敗（撤回）</div>
+    <div class="d">「低速でヨーが乱れる」と誤診し最低速度を追加 → 改善せず壁へ。再解析で
+    <strong>衝突後のアーティファクト</strong>と判明し撤回・謝罪。</div></div>
+  <div class="tl bad"><div class="t">誤診B：spawnアンカー経路（撤回）</div>
+    <div class="d">経路先頭をスポーンに合わせ徐々に from_garage へ戻す案 → むしろ<strong>収束を遅らせ右へ流す逆効果</strong>。撤回。</div></div>
+  <div class="tl good"><div class="t">突破口1：占有格子は不正確、lanelet2 に真の壁がある</div>
+    <div class="d">占有格子はスポーン地点すら「占有」なのに車は走れる＝<strong>ピットでは信用できない</strong>。
+    一方 <strong>lanelet2 地図にピットレーン境界（relation 9747 / 左 way 9746・右 way 9743）が同一座標系で定義</strong>されており、
+    実際の AWSIM 壁と±0.3mで一致。<strong>これが壁の真値</strong>。</div></div>
+  <div class="tl good"><div class="t">突破口2：EKF方位が低速で約17°ずれる（真の主因）</div>
+    <div class="d">GNSS軌跡の実方位と EKF方位を比較すると、<strong>ピット全域で EKF が +15〜19°（左に）ずれていた</strong>。
+    MPC は「レーンに合わせるには右へ」と誤判断し<strong>右へ操舵し続け右壁へ</strong>。
+    EKF方位はレース速度では収束するが<strong>低速(&lt;0.9m/s)では収束せず</strong>。位置も約0.45mずれていた。</div></div>
+</div>
+</div>
+
+<!-- ============ 根本原因 ============ -->
+<h2>4. 根本原因（確定）</h2>
+<div class="box cause"><div class="h">主因：低速での自己位置（EKF）誤差</div>
+  <ul>
+    <li><strong>方位（heading）が約 +15〜19° ずれる</strong>：MPC の横方向予測 e_y′ は方位 e_psi に依存するため、
+    方位が誤っていると「この操舵で十分」と<strong>誤予測</strong>し、実際は右へ流れる。
+    ハード制約すら予測誤差で破られる。</li>
+    <li><strong>位置が約 0.45m 壁側にずれる</strong>：MPC は「ライン上にいる」と誤認し補正が効かない。</li>
+    <li>いずれも<strong>低速特有</strong>（レース速度では GNSS 速度で EKF が収束するため gate1/2/レースは無影響）。</li>
+  </ul>
+</div>
+<div class="box cause"><div class="h">副因：占有格子地図がピットを表現していない</div>
+  ピット領域は地図上「全面占有」。回避コリドーも壁制約も機能しない。
+  <strong>壁の真値は lanelet2 地図（ピットレーン境界）にあった。</strong></div>
+<div class="box cause"><div class="h">補足：from_garage 基準線はレーン中央でなく右寄り</div>
+  狭部で参照線が右境界寄り。<code>Q[e_psi]</code> 支配で参照に平行な右オフセットを保ち、右壁へ張り付きやすい。</div>
+
+<!-- ============ 対処 ============ -->
+<h2>5. どのような対処を行ったか（最終解＝多層構成）</h2>
+<p class="small">いずれも <code>mpc_controller.py</code> と <code>config.yaml</code> のみで実装（CSVは不変）。
+<code>on_pit</code>（ピット走行中）でのみ作用し、gate1/2/レースには影響しない。</p>
+
+<div class="box fix"><div class="h">A. 統一ピット機能（発進座標で自動判別）</div>
+  発進時、<strong>レースラインまでの距離</strong>で判別：遠ければ（車庫/ピット）<code>from_garage</code> 経路、近ければレースライン。
+  走行中、レースラインに十分近づいたら（<strong>コースイン</strong>）レースライン（周回）へ一度だけ切替。
+  <span class="small">→ gate1/2/3/eval 共通で動作。ピット内は回避OFF。</span></div>
+
+<div class="box fix"><div class="h">B. ピット内のみ GNSS 位置で自己位置補正</div>
+  <code>on_pit</code> 時、MPC の <code>pose.x/y</code> を GNSS 実測へ置換。
+  <span class="small">→ 低速で生じる EKF の約0.45m横ずれを解消。</span></div>
+
+<div class="box fix"><div class="h">C. ピット内のみ GNSS 軌跡から実方位を算出（主因への対処）</div>
+  GNSS pose は方位が無効（identity）のため、<strong>直近約0.4mの GNSS 位置履歴から進行方位を算出</strong>し
+  <code>pose.theta</code> に使用。<span class="small">→ EKF方位の約17°誤差を解消。位置・方位とも GNSS で自己整合。これが決定打。</span></div>
+
+<div class="box fix"><div class="h">D. lanelet2 ピット境界を MPC のハード壁コリドーに使用</div>
+  不正確な占有格子の代わりに、<strong>lanelet2 のピットレーン左右境界（way 9746/9743）</strong>から各 waypoint の
+  <code>ub</code>(左)/<code>lb</code>(右) を算出。MPC は<strong>コリドー中央を横目標にしつつ e_y を壁内にハード拘束</strong>。
+  ピット専用マージン <code>safety_margin_pit = 0.9m</code>（既定の 1.63m は最狭部でコリドー崩壊するため）。
+  <span class="small">→ 最狭レーン2.48mでもコリドー≥0.68m（feasible）。参照線の横位置に依存せず中央を走る。</span></div>
+
+<div class="box fix"><div class="h">E. ピット横追従の重みを強化</div>
+  <code>q_ey_pit</code> を <strong>5e6 → 5e7</strong>。狭部で <code>Q[e_psi]=1e8</code> に対抗してレーン中央へ確実に寄せる
+  （右張り付きの解消）。<span class="small">→ 左壁側はコリドーがハード制約で守るため安全。</span></div>
+
+<!-- ============ パラメータ ============ -->
+<h2>6. 主なパラメータ（config.yaml / pit_lane）</h2>
+<table>
+  <tr><th>パラメータ</th><th>値</th><th>意味</th></tr>
+  <tr><td class="mono">enter_dist</td><td>5.0 m</td><td>レースライン距離 &gt; これ で「ピット発進」と判定</td></tr>
+  <tr><td class="mono">course_in_dist</td><td>3.0 m</td><td>レースライン距離 &lt; これ で「コースイン」→レースラインへ切替</td></tr>
+  <tr><td class="mono">v_max_pit_kmh</td><td>3.0 km/h</td><td>ピット走行中の速度上限（狭路を丁寧に）</td></tr>
+  <tr><td class="mono">densify_resolution</td><td>0.3 m</td><td>from_garage を3次スプラインで平滑・高密度化</td></tr>
+  <tr><td class="mono">lanelet_pkg / lanelet_rel</td><td>aichallenge_submit_launch / map/lanelet2_map.osm</td><td>壁の真値（ピット境界）を持つ lanelet2 地図</td></tr>
+  <tr><td class="mono">safety_margin_pit</td><td>0.9 m</td><td>ピット静的コリドーのマージン（実半幅0.725+緩衝0.175）</td></tr>
+  <tr><td class="mono">heading_track_dist</td><td>0.4 m</td><td>GNSS履歴から進行方位を求める後方距離</td></tr>
+  <tr><td class="mono">q_ey_pit</td><td>5e7</td><td>ピット横追従の重み（中央追従強化）</td></tr>
+</table>
+
+<!-- ============ 結果 ============ -->
+<h2>7. どのように改善されたか</h2>
+<div class="box result"><div class="h">段階的な改善の経過（右壁までの最小距離 distR、車体半幅0.725m）</div>
+  <table>
+    <tr><th>対処段階</th><th>結果</th><th>最小 distR（車体端）</th></tr>
+    <tr><td>初期（レースライン追従のみ）</td><td class="pill b">発進不可</td><td>—</td></tr>
+    <tr><td>A+B（ピット機能＋GNSS位置）</td><td class="pill b">右壁衝突</td><td>方位誤差で右へ流れる</td></tr>
+    <tr><td>+C（GNSS軌跡方位）</td><td>ピット進入成功・中盤は中央。最狭部で軽接触</td><td>0.61m（端 −0.12m）</td></tr>
+    <tr><td>+D+E（lanelet壁制約＋q_ey強化）</td><td class="pill g">gate3 CLEAR</td><td><strong>0.86m（端 +0.13m）非接触</strong></td></tr>
+  </table>
+</div>
+<div class="kpi">
+  <div class="k"><div class="n pill g">all_passed: true</div><div class="l">safety-gate 結果</div></div>
+  <div class="k"><div class="n">+0.13m</div><div class="l">右壁クリアランス（前回 −0.12m 接触）</div></div>
+  <div class="k"><div class="n">中央走行</div><div class="l">コリドー中央追従＋壁ハード制約</div></div>
+</div>
+<div class="box result"><div class="h">挙動の改善</div>
+  <ul>
+    <li>発進直後の<strong>右への過剰操舵が解消</strong>（方位を正しく認識）。</li>
+    <li>ピットレーンの<strong>中央付近（壁から約0.5m）を維持</strong>して走行。</li>
+    <li>最狭部でも<strong>壁に非接触</strong>でコースインし、レースラインへ復帰。</li>
+    <li>gate1/2/レースは <code>on_pit=False</code> のため<strong>従来どおり・無影響</strong>。</li>
+  </ul>
+</div>
+
+<!-- ============ 変更ファイル ============ -->
+<h2>8. 変更ファイル</h2>
+<table>
+  <tr><th>ファイル</th><th>変更内容</th></tr>
+  <tr><td class="mono">multi_purpose_mpc_ros/<br>multi_purpose_mpc_ros/mpc_controller.py</td>
+    <td>ピット発進判別・<code>_build_pit_ref_path</code> / <code>_load_densified_pit_points</code>、
+    GNSS購読・<code>_apply_pit_localization</code>（位置＋軌跡方位）・<code>_gnss_track_heading</code>、
+    lanelet境界読込 <code>_load_pit_lane_bounds</code> / コリドー上書き <code>_apply_lanelet_corridor</code>、
+    ピット専用マージンで静的コリドー生成。</td></tr>
+  <tr><td class="mono">multi_purpose_mpc_ros/config/config.yaml</td>
+    <td><code>pit_lane</code> セクション一式（上表）。CSV は不変。</td></tr>
+</table>
+
+<!-- ============ 教訓 ============ -->
+<h2>9. 教訓</h2>
+<div class="card">
+  <ul>
+    <li><strong>症状（右壁衝突）だけで原因（EKF方位誤差）は分からない</strong>。位置・方位・予測の各層をログで切り分けることが決定的だった。</li>
+    <li><strong>地図ソースの妥当性を疑う</strong>：占有格子はピットで不正確。lanelet2 が真の壁を持っていた。「壁が分からない」のではなく<strong>見る地図を間違えていた</strong>。</li>
+    <li><strong>ハード制約も予測モデルが間違っていれば破れる</strong>：方位（e_psi）が誤ると e_y 予測が崩れ、コリドー制約が機能しない。</li>
+    <li><strong>低速は別物</strong>：EKF方位はレース速度で収束するが低速では収束しない。ピット専用に GNSS 由来の自己位置で整合させた。</li>
+    <li>誤診を 2 度行った（低速ヨー / spawnアンカー）。<strong>データで反証して撤回</strong>し、最小変更で積み上げた。</li>
+  </ul>
+</div>
+
+<!-- ============ 今後 ============ -->
+<h2>10. 補足・今後</h2>
+<div class="card">
+  <ul>
+    <li>ピット中盤に約5秒の停止が見られたが、前進指令が出ているのに静止＝<strong>gate3 仕様の必須ピットストップ</strong>と判断（許容）。</li>
+    <li><strong>ピット出口の加速をより滑らかに</strong>（広い出口区間で速度上限をランプアップ）する改善余地あり。</li>
+    <li>本課題で確立した<strong>「GNSS 由来の自己位置整合」</strong>と<strong>「lanelet2 を壁の真値として使う」</strong>手法は、
+    今後の追従精度向上・オーバーテイク経路の正確トレースにも応用できる。</li>
+  </ul>
+</div>
+
+<div class="foot">Autonomous Driving AI Challenge 2026 — gate3 ピットレーン走行 課題まとめ<br>
+multi_purpose_mpc_ros (Spatial Bicycle MPC) / ROS 2 Humble / AWSIM</div>
+
+</div>
+</body>
+</html>

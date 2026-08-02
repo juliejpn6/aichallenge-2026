@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>予選環境(衝突あり)対応まとめ — 課題・対処・結果</title>
+<style>
+body{font-family:'Segoe UI','Hiragino Sans',Meiryo,sans-serif;margin:0;background:#fafbfc;color:#24292f;line-height:1.65}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 24px 80px}
+h1{font-size:26px;border-bottom:3px solid #0969da;padding-bottom:10px}
+h2{font-size:20px;margin-top:44px;border-left:6px solid #0969da;padding-left:12px}
+h3{font-size:16px;margin-top:28px;color:#0a3069}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px;background:#fff}
+th,td{border:1px solid #d0d7de;padding:8px 10px;vertical-align:top;text-align:left}
+th{background:#f6f8fa;white-space:nowrap}
+td.ok{color:#116329;font-weight:600;white-space:nowrap}
+td.ng{color:#a40e26;font-weight:600}
+code{background:#eff2f5;padding:1px 5px;border-radius:4px;font-size:12.5px}
+.summary{background:#ddf4ff;border:1px solid #54aeff;border-radius:8px;padding:14px 20px;margin:18px 0}
+.warn{background:#fff8c5;border:1px solid #d4a72c;border-radius:8px;padding:12px 18px;margin:14px 0}
+.note{color:#57606a;font-size:12.5px}
+.kpi{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}
+.kpi div{background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:12px 18px;flex:1;min-width:150px;text-align:center}
+.kpi b{display:block;font-size:22px;color:#0969da}
+.kpi span{font-size:12px;color:#57606a}
+.arrow{color:#0969da;font-weight:700}
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>予選環境(衝突あり)対応まとめ — 課題・対処・結果</h1>
+<p class="note">期間: 2026-07-02 〜 07-04 / 対象: multi_purpose_mpc_ros(MPC制御) / 検証: ローカル単独・複数台(手動d2含む)・予選環境</p>
+
+<div class="summary">
+<b>要約:</b> 予選環境の変更(衝突あり・ペナルティ制)で当初は完走不能(走行時間の59%が5km/hクロール)だったが、
+<b>①ペナルティ適合 ②計算負荷 ③操舵チューニング ④対他車制御(ICC/追い越し/守り/並走)</b> を段階的に対処し、
+最終的に <b>エラー0・接触0・デッドロック0・並走ねばり50秒維持</b> の状態に到達。制御コードは一元化リファクタで134行削減。
+</div>
+
+<div class="kpi">
+<div><b>59% → 5%</b><span>5km/h以下クロール時間</span></div>
+<div><b>22 → 40Hz</b><span>制御レート</span></div>
+<div><b>8件 → 0件</b><span>接触イベント(直近ローカル)</span></div>
+<div><b>26 → 数回</b><span>追い越し側の左右迷い</span></div>
+<div><b>0.90° → 0.40°</b><span>ステア1step振幅</span></div>
+<div><b>−134行</b><span>一元化リファクタ</span></div>
+</div>
+
+<h2>0. 前提: ルール変更と上位チーム分析</h2>
+<table>
+<tr><th>項目</th><th>内容</th></tr>
+<tr><td>環境変更</td><td>予選から「衝突なし → <b>衝突あり(他車と同時走行)</b>」に変更。</td></tr>
+<tr><td>公式ペナルティ</td><td><b>CRASH</b>(車両接触=前車リア×後車フロント): 10秒間5km/h上限 / <b>WALL</b>(壁・コースアウト): 5秒間5km/h / <b>OVER</b>(加速度±3m/s²超 or 250Hz以上publish): 2秒間5km/h。AWSIMは加速度入力を±1.37でclamp。</td></tr>
+<tr><td>上位チーム</td><td>Automitsu 46.0s / iASL(2位) 46.3s / B-CORE(1位) 48.8s。<b>1位が最速でない=ペナルティ回避(安定完走)がスコアの本体</b>。iASLは当チームと同一MPCコード(パラメータ違い)。</td></tr>
+<tr><td>方針</td><td><b>ペナルティ回避 ≫ 純ペース</b>。まず v_max=15km/h で確実周回の土台を作り、対他車制御を仕上げてから速度を上げる。</td></tr>
+</table>
+
+<h2>1. 基盤: ペナルティ適合と計算負荷(07-02)</h2>
+<table>
+<tr><th style="width:26%">課題</th><th style="width:37%">対処</th><th style="width:37%">結果</th></tr>
+<tr>
+<td>指令加速度が a_max=3.2 で<b>OVER違反(±3超)を誘発</b>。a_min=−3.0は違反境界ちょうど。しかもAWSIMは±1.37でclampするため1.37超は無意味。</td>
+<td><code>a_min/a_max = ±1.37</code>(有効最大かつ違反マージン1.63確保)。</td>
+<td class="ok">OVER違反 0件(以後全ラン)。</td>
+</tr>
+<tr>
+<td>他車の予測円が<b>1台=20個</b>(MPC N点分)投入され、MPCコストが2倍(12.6→28ms)→制御22Hz→ステア暴れ→壁衝突→<b>59%クロールで完走不能</b>(0701予選ラン)。</td>
+<td><code>n_pred_samples: 6</code>(予測円を1台6個に間引き。0.5s掃引の被覆は維持)。後に<code>rebuild_deadband: 0.3m</code>(障害物が0.3m動いた時だけ占有マップ再描画)を追加。</td>
+<td class="ok">制御 22→40Hz回復。MPC init+solve 42.8→18.1ms。</td>
+</tr>
+<tr>
+<td>他車が占有格子の<b>端にいると add_obstacles が IndexError</b> → 制御ノード即死(0702予選ランで2回、以後クロール)。</td>
+<td>map.py の円描画をグリッド境界でクリップ(端以外は挙動完全同一)。</td>
+<td class="ok">IndexError 0(以後全ラン)。</td>
+</tr>
+<tr>
+<td>確実に周回できる速度域が未確立。</td>
+<td><code>v_max: 15km/h</code>全域制限(実効=min(区間ref_vel, v_max, 曲率上限))。ay_max=5.5。</td>
+<td class="ok">最急コーナー(半径2.6m)でも横G余裕44%。</td>
+</tr>
+</table>
+
+<h2>2. 操舵チューニング: 15km/hでも曲がれない→安定ベースライン(07-02)</h2>
+<table>
+<tr><th style="width:26%">課題</th><th style="width:37%">対処</th><th style="width:37%">結果</th></tr>
+<tr>
+<td>15km/hでも最急コーナー(s≈250-270)で<b>+3.7m膨らみ壁衝突</b>。指令舵31°に実舵21°しか追従せず(turn-in不足)。</td>
+<td>第1バッチ: <code>steer_rate_max 0.35→1.5</code> + <code>R[delta] 0→500</code>(振動抑制の相方) + <code>delta_max 32→45</code> + <code>use_max_kappa_pred false</code>(曲率スパイク対策) + Q[e_y]を検証済み2e6へ。</td>
+<td class="ok">2周完走(初)。crashコーナー通過。</td>
+</tr>
+<tr>
+<td>steer_rate 2.0 に上げたら<b>ステア震え(符号反転14.3回/s)</b>+同コーナーで再crash。</td>
+<td>PlanB: <code>steer_rate 1.5</code> + <code>steer_low_pass_gain 0.5</code>(出力平滑) + <code>Q=[3e6,6e7,2e6]</code>(ヘディング支配50→20倍)。</td>
+<td>コーナー震え半減(6.9回/s)。ただし3周目に技術コーナーでcrash。</td>
+</tr>
+<tr>
+<td>内側切り込み(コーナー93%イン)・直線逸脱の根治を狙い Q[e_psi] をさらに検証。</td>
+<td>PlanC: <code>Q[e_psi] 6e7→4e7</code>(単独変数で検証)。</td>
+<td class="ok"><b>3〜4周無衝突を2回再現(81.1s/周±0.2)=安定ベースライン確立</b>。※内側切込・直線逸脱はQが原因でないと判明(反証)。</td>
+</tr>
+<tr>
+<td>AWSIMステアアクチュエータの実測限界: <b>むだ時間200ms・レート109°/s・大舵角ゲイン0.67</b>。raw1.5(=タイヤ141°/s)は実現不能な計画→スナップ振動の一因。</td>
+<td><code>steer_rate_max 1.5→1.1</code>(109°/s÷gain1.639に整合。「実機ができることだけを計画」)。</td>
+<td class="ok">ステア1step振幅 0.90→0.37°。最大跳び19.8→6.7°。</td>
+</tr>
+</table>
+
+<h2>3. 対他車制御: 追従(ICC)・追い越し・守り(07-03〜04)</h2>
+<h3>3-1. 追従(ICC=インテリジェントクルーズコントロール)</h3>
+<table>
+<tr><th style="width:26%">課題</th><th style="width:37%">対処</th><th style="width:37%">結果</th></tr>
+<tr>
+<td>周回遅れ車に<b>追突</b>(最終ラップに集中)。旧ロジックは前方車を「静止物」扱いで距離だけ見ており、速度差(接近率)を考慮しない。</td>
+<td>ICC化: <code>v_safe=√(v_fwd²+2a(gap−margin))</code>。相手速度まで減速して追従。<code>margin=3.0m</code>・検知20m(〜21km/hまで停車車に停止可)。</td>
+<td class="ok">追従車間が中央値4.0m・90%が2-4m帯に収束、追従中速度std 1.4km/h(教科書的ACC)。</td>
+</tr>
+<tr>
+<td>相手速度の生値に<b>27.7km/hのスパイク</b>(2フレーム差分)。</td>
+<td>トラッカー平滑窓 <code>2→6フレーム</code>(端点差分)。</td>
+<td class="ok">スパイク17.7km/hに抑制、std4.5→1.9。</td>
+</tr>
+<tr>
+<td><b>ライン外の低速車に全速追突</b>(検知帯±1.5mが参照ライン基準のため、帯外の車を無視。d=1.0m前方で v_safe=None・全速4.17m/s)。接触4件、全て車体横間隔1.15-1.47m&lt;カート幅。</td>
+<td>F1: 近距離(6m内)は「参照帯」でなく<b>「自車との実横間隔&lt;1.8m」で減速対象</b>を判定(横位置に関係なく、ぶつかる横関係なら減速。1.8m以上離れていれば減速せず通過)。</td>
+<td class="ok">全速追突消滅。十分離れた停車車は減速せず通過(過剰ブレーキなし)。</td>
+</tr>
+<tr>
+<td>相手の急減速(brake-check)で<b>0.63mまで接近</b>。ICCが margin内(gap&lt;3m)で「相手と同速」までしか減速せず、車間を開け直さない。</td>
+<td>G2: 根号内を負まで許容 <code>√(max(0, v_fwd²+2a(gap−margin)))</code> → margin割れで相手より遅く=車間を開け直す。</td>
+<td class="ok">brake-check時の最接近 0.63→1.35-1.5m。</td>
+</tr>
+</table>
+
+<h3>3-2. 追い越し(いつ・どちらから・抜くか)</h3>
+<table>
+<tr><th style="width:26%">課題</th><th style="width:37%">対処</th><th style="width:37%">結果</th></tr>
+<tr>
+<td>追い越し側の<b>左右迷い26回/走行</b>。毎周期「今広い方」を選び直すためコミットできず、前方車の脇で足踏み→接近(dmin1.0m)→接触。成功5/15。</td>
+<td>A: ①側スイッチにデッドバンド0.6m ②<b>側コミットラッチ</b>(通過完了or恒久失敗まで維持) ③拮抗時は<b>次コーナーのアウト側</b>を選択(前方25mの最大曲率の逆側。インが明確に広ければイン)。</td>
+<td class="ok">左右反転26→8回、状態遷移30→5回。クリーン通過を確認。</td>
+</tr>
+<tr>
+<td><b>同等速度の相手に蛇行して仕掛け続け、引き離される</b>(e_y振れ6.98m、速度5.5km/hまで低下、車間15→54m)。コーナー先の「絶対抜けない位置」の相手にも仕掛ける。</td>
+<td>速度差ゲート: 相手<b>&lt;6km/h(ペナルティ車)=障害物として即抜く(コーナー可)</b> / closing&gt;0.5m/sで追いつける相手のみ / コーナー中は「必要長≦残りコーナー長」で抜き切れる時のみ / 同等・速い相手は仕掛けない(追従)。</td>
+<td class="ok">同等速度相手への蛇行消滅(全編クリーン追従)。相手10.8km/h→仕掛け、14.5km/h→追従、と適応動作を確認。</td>
+</tr>
+<tr>
+<td>ICCで減速して追従に入ると <b>closing=0になり「遅い相手を永久に抜けない」</b>(現在速度基準の欠陥)。</td>
+<td>C1: closingを<b>「自分が出せる速度(v_pot=v_max)」基準</b>に変更。</td>
+<td class="ok">追従からの再仕掛けを確認。</td>
+</tr>
+<tr>
+<td><b>停止車の3m後ろでデッドロック</b>(ICCがmargin=3mでv=0 → 速度ゼロでは横移動を作れない → 7.8s/5.2s固まる)。</td>
+<td>F3クリープ: 相手との実距離√(ds²+Δlat²)&gt;1.8mの間は<b>1.5m/sのクリープ前進</b>を許し斜めに脱出。1.8m未満は完全停止(最後の防壁)。</td>
+<td class="ok">デッドロック解消(以後のスタックは発進シーケンス7.8sのみ)。</td>
+</tr>
+<tr>
+<td><b>駐車車に道を譲って停止</b>(守りの横並び判定が相手速度を見ず、停止車を「並走車」と誤認→追い越し禁止→5.2s停止)。</td>
+<td>G1: 守り発動は<b>「走っている車(≥6km/h)」のみ</b>。停止・低速車は「抜く相手」。</td>
+<td class="ok">解消。</td>
+</tr>
+</table>
+
+<h3>3-3. 守り(抜かれる側)と並走</h3>
+<table>
+<tr><th style="width:26%">課題</th><th style="width:37%">対処</th><th style="width:37%">結果</th></tr>
+<tr>
+<td>相手は最速35km/h・自車15km/h=<b>抜かれる場面が多い</b>。横に並ばれた時の振る舞いが未定義。</td>
+<td>守りC: 横並び/後方から速い車を検知したら<b>攻めのオフセット押し込みを抑制</b>(相手の進路を邪魔しない)+相手は障害物として回避+<b>壁近接(カート端-壁&lt;0.5m)なら減速</b>。</td>
+<td class="ok">被追い越し時の押し込み動作なし。</td>
+</tr>
+<tr>
+<td><b>真横(ds≈0)の車は誰も監視していない死角</b>。コーナーで横間隔1.4-1.7mの並走が5秒継続(エッジ間5cm)。</td>
+<td>並走ねばり: <b>自分側レーン幅(相手エッジ〜壁、先読み8m)が確保できる限り減速しない(ねばる)</b>。lane&lt;1.85mで相手より遅くして後退イールド、lane&lt;1.45m(カート幅)で強減速。</td>
+<td class="ok">並走50秒を平均12.8km/hで維持(ねばり)。誤イールドなし(lane発動値は全て≥2.33)。</td>
+</tr>
+<tr>
+<td>ねばり実装のバグ: 横オフセット下限がなく<b>「真正面の追従相手」にも発動</b>→狭コーナーの縦列追従で誤って強減速する構造。</td>
+<td>並走候補に <code>dlat≥1.0m</code>(実際に横に並んでいる)条件を追加。縦列はICCの管轄に分離。</td>
+<td class="ok">狭コーナー縦列追従27サンプルで誤減速ゼロ(最低8.7km/h=相手なり)。</td>
+</tr>
+</table>
+
+<h3>3-4. コード品質(一元化リファクタ)</h3>
+<table>
+<tr><th style="width:26%">課題</th><th style="width:37%">対処</th><th style="width:37%">結果</th></tr>
+<tr>
+<td>検知が4系統併存し<b>帯も対象もバラバラ</b>(analyzer=予測円・帯6.9m/context=帯3.9m/ACC=帯1.5m×2回呼び)。同じ相手に系統ごとに違う答え(d_min 1.0m vs 4m)を出し、デバッグ困難。予測円を「12台」と数える水増しも。</td>
+<td>一元化: <code>_scan_traffic()</code>(唯一の他車スキャン=現在位置+平滑速度、帯はコリドー基準に統一) + <code>_follow_speed_limit()</code>(唯一のICC) + 判断ブロック1本。予測円は占有マップ(コリドー形状)専用に限定。死んだ変数・旧パラメータ(v_min/safe_clear/safe_brake等)を削除。</td>
+<td class="ok"><b>正味−134行</b>、他車スキャン4回→1回/周期。G1/G2/C1/帯統一が構造として組込み。全過去問題ケースのリプレイ6/6で期待動作。バックアップ: <code>mpc_controller.py.pre_unify.bak</code></td>
+</tr>
+</table>
+
+<h2>4. 最終状態(2026-07-04 ローカル検証)</h2>
+<table>
+<tr><th>指標</th><th>予選0701(対処前)</th><th>最新ローカル複数台(235541)</th></tr>
+<tr><td>エラー(IndexError等)</td><td class="ng">制御ノード死亡あり</td><td class="ok">0</td></tr>
+<tr><td>制御レート</td><td class="ng">22Hz(p95 115ms)</td><td class="ok">40Hz</td></tr>
+<tr><td>5km/h以下クロール</td><td class="ng">59%</td><td class="ok">5%</td></tr>
+<tr><td>接触イベント</td><td class="ng">8件(最終ラップ4件)</td><td class="ok">0件(最小距離1.43m・全て相手が寄せた並走時)</td></tr>
+<tr><td>デッドロック/スタック</td><td class="ng">複数(駐車車・停止車)</td><td class="ok">0(発進シーケンス7.9sのみ)</td></tr>
+<tr><td>ステア1step振幅</td><td>1.68°(複数台時)</td><td class="ok">0.40°</td></tr>
+<tr><td>追い越し</td><td class="ng">成功5/15・side迷い26回</td><td class="ok">速度差で適応(遅い相手のみ・側コミット・アウト選択・クリープ)</td></tr>
+</table>
+
+<div class="warn">
+<b>残課題(優先順):</b>
+<ol style="margin:6px 0 2px 18px">
+<li><b>予選環境での総合検証</b>(実トラフィック・周回遅れ車で全機能の最終確認) — 次のアクション</li>
+<li><b>速度向上</b>: v_max 15→18→…(コーナー横G使用率35%=大きな余裕あり。ラップ81s vs 上位46s)。21km/h超では ICC検知20m/遅れ補償の再調整が必要</li>
+<li>発進時7.9s停止の短縮(起動シーケンス。レースで1回だけなので優先度低)</li>
+<li>軽微: ステアLPF値のMPCへのフィードバック不整合 / v_potがref_vel区間値を未考慮(全域15の現状は実害なし) / 瞬間17km/h観測(オドメトリノイズ疑い)の再確認</li>
+</ol>
+</div>
+
+<p class="note">主要設定(現在): v_max=15 / a=±1.37 / steer_rate=1.1 / LPF=0.5 / delta_max=52 / R=[1e5,500] / Q=[3e6,4e7,2e6] / width=2.30 / n_pred=6 / rebuild_deadband=0.3 / ICC margin=3.0・検知20m・実横間隔1.8m / overtake: min_gap2.5・deadband0.6・corner_lookahead25・obstacle_speed6km/h・creep1.5・hard_stop1.8・lane_need1.85・先読み8m</p>
+
+</div></body></html>

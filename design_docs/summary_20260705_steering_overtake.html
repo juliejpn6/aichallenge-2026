@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>課題・対処・残課題の総括 (2026-07-04〜05: 操舵系/内巻き/追い越し/予選)</title>
+<style>
+ body{font-family:"Noto Sans JP",sans-serif;margin:24px;background:#f7f8fa;color:#1a1a2e;line-height:1.55}
+ h1{font-size:1.5em;border-bottom:3px solid #2c5f8a;padding-bottom:6px}
+ h2{font-size:1.2em;background:#2c5f8a;color:#fff;padding:6px 12px;border-radius:4px;margin-top:32px}
+ h3{font-size:1.05em;color:#2c5f8a;margin-bottom:4px}
+ table{border-collapse:collapse;width:100%;margin:10px 0;background:#fff;font-size:0.92em}
+ th{background:#e8eef4;border:1px solid #c5d2de;padding:6px 8px;text-align:left}
+ td{border:1px solid #c5d2de;padding:6px 8px;vertical-align:top}
+ .ok{color:#1a7a3a;font-weight:bold}.ng{color:#c0392b;font-weight:bold}.wip{color:#b07d0f;font-weight:bold}
+ .num{font-family:monospace}
+ .card{background:#fff;border:1px solid #d5dde5;border-left:5px solid #2c5f8a;border-radius:4px;padding:10px 14px;margin:10px 0}
+ .card.warn{border-left-color:#b07d0f}
+ .lesson{background:#fdf6e3;border-left:5px solid #b07d0f;padding:8px 12px;margin:8px 0;font-size:0.92em}
+ code{background:#eef1f5;padding:1px 5px;border-radius:3px;font-size:0.9em}
+ .small{font-size:0.85em;color:#556}
+</style>
+</head>
+<body>
+<h1>課題・対処・残課題の総括</h1>
+<p class="small">対象期間: 2026-07-04〜07-05 / 対象: multi_purpose_mpc_ros(MPC制御・追い越し)・imu_gnss_poser(自己位置) / 全対処は実ログ(bag/GNSS真値)で検証済み</p>
+
+<h2>0. ダッシュボード(主要指標 改修前→現在)</h2>
+<table>
+<tr><th>指標</th><th>改修前</th><th>現在</th><th>状態</th></tr>
+<tr><td>ステア品質(std / 方向反転)</td><td class="num">10.7° / 33回s</td><td class="num">10.5° / 7.1回/s</td><td class="ok">✅ 反転1/4(チャタ根治)</td></tr>
+<tr><td>ヘアピンs66-75 壁クリアランス</td><td class="num">0.0〜0.7m(毎周接触)</td><td class="num">1.6m</td><td class="ok">✅ 根治</td></tr>
+<tr><td>ヘアピン内巻き(GNSS真値95%点)</td><td class="num">+1.49m</td><td class="num">+0.83m</td><td class="ok">✅ 半減(κ比例成分を特定・除去)</td></tr>
+<tr><td>EKF-GNSS誤差(最大)</td><td class="num">1.94m</td><td class="num">0.56m</td><td class="ok">✅ 1/3</td></tr>
+<tr><td>単独走行</td><td class="num">—</td><td class="num">公式6周完走・ばらつき±0.15s</td><td class="ok">✅ 完成</td></tr>
+<tr><td>停止/低速車の追い越し</td><td class="num">デッドロック/接触</td><td class="num">4/4通過(手動敵対テスト含む)</td><td class="ok">✅ F1で狭所も通過可能に</td></tr>
+<tr><td>走行車の追い越し</td><td class="num">壁衝突を繰り返す</td><td class="num">無理な賭けは見送る(未成功)</td><td class="wip">⚠ Δv不足が律速(v_max上げ待ち)</td></tr>
+<tr><td>MPC負荷(init)</td><td class="num">14〜16ms(2台時33ms)</td><td class="num">7.9ms(予選11.4ms)</td><td class="wip">⚠ 予選40FPS環境は欠落100回/分</td></tr>
+</table>
+
+<h2>1. 解決済み課題(課題 → 原因 → 対処 → 検証)</h2>
+
+<h3>A. 操舵系</h3>
+<table>
+<tr><th>課題</th><th>特定した原因</th><th>対処</th><th>検証結果</th></tr>
+<tr><td>ステア36Hzチャタ(コーナーp2p±25°)</td><td>ステアレート減衰の欠如+旧固定Ts制約が偶発ダンパー化していた</td><td><code>r_drate=1.5e6</code>(ホライズン内Δκ²のみ)+<code>LPF 0.35</code></td><td class="ok">反転33→7.1回/s</td></tr>
+<tr><td>蛇行(std17°の低周波揺れ)</td><td>r_drateの「前回κアンカー項」が解間粘性=位相遅れ→アクチュエータ200msと合成しリミットサイクル</td><td>アンカー項撤去(計画内の滑らかさのみ罰する)</td><td class="ok">std 17.3→10.5</td></tr>
+<tr><td>ヘアピン転舵不足(アンダー→壁)</td><td>P3: 空間MPCのΔκ境界が固定Ts基底(実時間の約1/10)</td><td>Δκ境界=rate×Δs/v_ref(cap0.15s)。継ぎ目<code>segment_lengths[0]=0</code>のoff-by-one(毎周Δκ=0の硬い等式)・非循環経路のラップもレビューで検出し修正</td><td class="ok">ヘアピンclr 1.6m/QP等価性は密行列照合済み</td></tr>
+</table>
+
+<h3>B. 経路・自己位置(「計画の内側を走る」の解体)</h3>
+<table>
+<tr><th>成分</th><th>量(実測)</th><th>対処</th><th>結果</th></tr>
+<tr><td>参照経路の平滑化による内側化</td><td class="num">+0.13m</td><td><code>smoothing_distance 2→1</code>(点数定義の窓が1m間隔CSVで±2mになっていた)</td><td class="ok">→0.03m</td></tr>
+<tr><td>MPC計画の逸脱</td><td class="num">±0.00m</td><td>不要(白点は緑線に完璧に乗っていた=計画は健全)</td><td class="ok">—</td></tr>
+<tr><td>参照先読みのκ比例バイアス</td><td class="num">cut≈7.3κ(ヘアピン1.5m)</td><td><code>wp_id_offset 2→1</code>(決定実験でスロープ半減=因果確定。<b>0は逆効果</b>: 遅れ補償喪失→ターンイン遅れ→急舵→内外暴れ。<b>1が最適点</b>)</td><td class="ok">→0.83m</td></tr>
+<tr><td>EKF座標系の内向きズレ</td><td class="num">RMS0.39/バイアス+0.23</td><td><code>gnss_covariance 0.1→0.05</code>(0.03は効果なし=床)。遅延ではないことを確認(最適τ=0.05s)</td><td class="ok">RMS0.28/最大0.56</td></tr>
+<tr><td>実追従誤差(アクチュエータ物理)</td><td class="num">+0.1〜0.2m</td><td>許容(残り分)</td><td>—</td></tr>
+</table>
+<div class="lesson">教訓: e_y指標はヘアピンで射影が壊れ内巻きを隠す。内巻き測定はGNSS×ポリライン符号付き距離で行うこと。</div>
+
+<h3>C. 追い越し・交通</h3>
+<table>
+<tr><th>課題</th><th>原因</th><th>対処</th><th>検証</th></tr>
+<tr><td>遠方(12-20m)からの早仕掛け→コーナー跨ぎ壁</td><td>距離ゲート無し</td><td>近接ゲート(<code>engage_max_dist=6m</code>=ICCで詰めてから)</td><td class="ok">全エンゲージ4-5mに</td></tr>
+<tr><td>±3mスイング(側の高速反転)</td><td>維持中の側再選択+離脱後即再エンゲージ</td><td>側コミット(engageで1回だけ選択)+side_block(0.5s)+クールダウン4s</td><td class="ok">エピソード内反転ゼロ</td></tr>
+<tr><td>毎周wp14外壁(コーナー頂点)</td><td>ホライズン先端の前方車予測円がコリドーを削る</td><td>前方12m超の予測円をマップ除外(H1の前方版)</td><td class="ok">4回/4周→0</td></tr>
+<tr><td>追従中のブルブル(2台時)</td><td><code>being_overtaken</code>生値がコリドー生成元(動的↔静的)を毎周期トグル</td><td>デバウンス(ON5/OFF15周期)</td><td class="ok">追従なめらか(ユーザー確認)</td></tr>
+<tr><td>「勝てない賭け」を買う(外回りで抜けない等)</td><td>遠回り距離・所要時間・持続空きの未考慮</td><td><code>_plan_pass</code>に一元化: 相手学習ライン基準の持続空き+遠回り会計∫|κ|·d+時間予算8s+<b>内側可否=コーナー前に抜き切れるか</b>(ユーザー方針: 直線で並び切れるなら内側OK)</td><td class="ok">コーナーでの無理仕掛け消滅(ユーザー確認)</td></tr>
+<tr><td>エンゲージ時の急ハンドル+失速</td><td>計画(t_lateral=3s)と参照(ramp0.5s)の不整合+psi_biasが遠い最終目標を向く</td><td><code>ramp_time 2.5s</code>+psi_biasをランプ済み目標へ</td><td class="ok">自然な車線変更ライン</td></tr>
+<tr><td>停止車の後ろで永久停止/狭所で即離脱ループ(予選11回)</td><td>幅基準の不整合(進入2.5/維持2.0 vs 実際に通れる1.85)</td><td><b>F1: _thr源流で一元化</b>(停止/低速車は進入・維持とも1.85)</td><td class="ok">L=1.94狭所で進入・維持とも成立(ロジック検証済・実走待ち)</td></tr>
+<tr><td>infeasible自己ロック(20秒級停止)</td><td>壁際でQP不可解→u0=0のまま放置</td><td>H4-lite(inf2秒+停止→マージン0.2+強funnelで這い出す)</td><td class="ok">発動・復帰を実走確認</td></tr>
+<tr><td>内側パス時の速度過大</td><td>エンベロープはレースライン曲率基準(オフセットでR縮小を見ない)</td><td>実効曲率κ/(1−κ·e_y)の動的減速(min適用・追い越し中のみ)</td><td class="ok">実装済(R6内側3m→10km/h)</td></tr>
+</table>
+
+<h3>D. 基盤(速度連鎖・学習・負荷)</h3>
+<table>
+<tr><th>課題</th><th>対処</th><th>検証</th></tr>
+<tr><td>v_max単位バグ(km/h生値がm/s欄へ→上限35km/hに漏れ)/v_ref平坦化(コーナー減速消滅)/v_pot凍結</td><td>単位変換修正+曲率エンベロープ(<code>ay_profile 2.6</code>: R6→13.4km/h)+_v_pot更新</td><td class="ok">ヘアピン14.6km/h進入・手前制動</td></tr>
+<tr><td>相手モデルの欠如(加速度は直接計測不能: SNR&lt;1を実測)</td><td><code>OpponentSpeedMap</code>: 位置別速度包絡線(max)+<b>走行ライン学習</b>+a(s)=v·dv/ds。ICC予測制動(v_pred_ahead)実装済</td><td class="ok">予選でd2=29.9/d3=15.2km/hを全周学習</td></tr>
+<tr><td>2台テストでCPU飽和(+9ms/周期の自作退行)</td><td>レート行列/2λSᵀSのN別キャッシュ+_plan_passの安価ゲート先行評価</td><td class="ok">init 7.9ms(単独)</td></tr>
+<tr><td>コードレビュー(8角度)findings 10+1件</td><td>P3継ぎ目バグ・非循環ラップ・deadband ID非対応 等を検出→重大2件即修正+デバウンス</td><td class="ok">デグレなしも同時確認</td></tr>
+</table>
+
+<h2>2. 残っている課題(優先度順)</h2>
+<table>
+<tr><th>#</th><th>課題</th><th>状況・方針</th><th>規模</th></tr>
+<tr><td>1</td><td class="wip">OSQP update化(毎周期setup廃止)</td><td>予選環境は40FPS・制御欠落100回/分(破綻した2台ローカルと同帯域)。P行列キャッシュ+インスタンス保持+update()化+マージン緩和時のみ再setup。init 11.4→3-5ms見込み。<b>v_max引き上げの前提条件</b></td><td>中</td></tr>
+<tr><td>2</td><td class="wip">v_max段階引き上げ(18→22→24)</td><td>走行車オーバーテイクの唯一の本質レバー(Δv)。予選ではd3=15.2に対しv_max15では物理的に抜けない(実測で証明)。単独で安定確認→2台→予選。<b>予選走行時のv_max設定を運用手順化</b></td><td>運用+検証</td></tr>
+<tr><td>3</td><td class="wip">走行車オーバーテイクの実戦成功</td><td>条件体系は完成(健全に「見送る」まで確認)。Δv確保後にゾーン1/ヘアピン出口で初成功を狙う</td><td>検証</td></tr>
+<tr><td>4</td><td class="wip">Qの曲率スケジュール化(per-wp Q)</td><td>内巻き残0.7-0.8mと「直線は緩く/コーナーは締める」の両立の本命。連続的な車速連動Qは振動源のため不採用(v_max変更イベントでのプリセット切替は可)</td><td>中〜大</td></tr>
+<tr><td>5</td><td class="wip">レビューfindings残(効率系)</td><td>ref_vel毎周期351点代入の抑制 / opp_map再構築のupdate側移設 / deadbandの車両ID対応 / v2x例外のwarn化 / H4-lite定数のconfig化</td><td>小×5</td></tr>
+<tr><td>6</td><td class="wip">内側パスの誤差予算判定(2.4m)・コーナー内margin動的化(0.8→1.1)</td><td>提案済み未実装。内巻き半減により予算は2.1m程度へ緩和可能。B-cap入力の保守化(EKF/指令オフセットのmin)も未実装</td><td>小</td></tr>
+<tr><td>7</td><td class="wip">Stage2攻めタイミング(catch-up予測)</td><td>マップのv_pred_aheadで「相手が遅くなる場所で仕掛ける」。ICC予測制動は実装済、攻め側は未</td><td>中</td></tr>
+<tr><td>8</td><td class="wip">H4フル(スタックリカバリ)</td><td>AWSIMは自律モードで後退不可。H4-liteで20秒級→数秒には短縮済。前進系の高度化は保留(ユーザー判断待ち)</td><td>保留</td></tr>
+</table>
+
+<h2>3. 運用メモ(予選)</h2>
+<div class="card warn">
+<ul>
+<li><b>v_max設定を忘れない</b>: <code>ros2 param set /mpc_controller v_max 18.0</code>(必ず小数)。15のままではd3級(15.2km/h)を走行中に抜く窓が存在しない</li>
+<li>予選環境は40FPS=制御余裕薄。OSQP update化(#1)まではv_max 18-20を上限目安に</li>
+<li>ライン学習は「相手が自動制御で毎周反復する」前提。手動運転の相手ではlat学習は参考値(capは頑健)</li>
+<li>速い相手(d2=30km/h級)への守りは現状で機能(デバウンス済み・抜かれ後もクリーン)</li>
+</ul>
+</div>
+
+<h2>4. 技術Q&amp;A(改善提案のための前提整理)</h2>
+
+<h3>Q1. OSQPの問題規模と update() 化の書き換え範囲</h3>
+<div class="card">
+<b>問題規模(実測値・確定)</b>: N=20 / 状態 nx=3(e_y, e_psi, t) / 入力 nu=2(v, κ)。
+変数 = nx(N+1)+nu·N = <span class="num">103</span>。制約行 = 等式63 + box103 + ステアレート19 = <span class="num">185</span>。
+<br><br>
+<b>毎周期変化するもの(update()化の設計に直結)</b>:
+<table>
+<tr><th>要素</th><th>毎周期変化?</th><th>備考</th></tr>
+<tr><td>x₀・上下限 l,u</td><td class="ng">変化する</td><td>初期状態固定・<b>コリドー(ub/lb)は l,u 側に入る</b>(A側ではない)・ay由来のvmax_dyn・P3のレート境界</td></tr>
+<tr><td>線形制約行列 A の「値」</td><td class="ng">変化する</td><td>LTV線形化(A_lin/B_lin が wp毎の v_ref, κ_ref, Δs に依存)のため<b>動力学ブロックの値は毎周期書き換え必須</b>。ただし<b>疎パターン(構造)は完全固定</b>(3×3/3×2ブロックの位置は不変)→ OSQPの update(Ax=…) で対応可</td></tr>
+<tr><td>コスト P</td><td class="ok">イベント時のみ</td><td>blockdiag(Q,QN,R)+2λSᵀS。Q切替(追い越し/ピット/将来のプリセット)時のみ update(Px=…)</td></tr>
+<tr><td>コスト q</td><td class="ng">変化する</td><td>参照 xr(コリドー/ライン追従), ur(v_ref, κ_ref)</td></tr>
+</table>
+<b>重要な実測</b>: init 11.4ms の内訳は <b>OSQP setup()自体は1.0msのみ、残り10.4msはPython側の疎行列構築</b>(block_diag/kron/vstack/csc変換)。
+つまり最大の勝ち筋は「setup→update」以上に「<b>行列をパターン固定で事前確保し、毎周期は値配列(numpy)の書き込みだけにする</b>」こと。
+レート行列系は同手法でキャッシュ済み(実績あり)。マージン緩和リトライ(最大5回/solve)も現状は毎回フル再構築→同様に値更新化。
+</div>
+
+<h3>Q2. 車両の速度上限と高速域での操舵安定性</h3>
+<div class="card">
+<b>物理上限</b>: 十分な余裕あり(いずれも実測)。
+<ul>
+<li>他車実績: 予選のd2は<b>cap 29.9〜30.1km/hを毎周安定維持</b>(我々のマップ学習値)。最速チームtyuraは25km/hで全コーナーをノーブレーキ通過 → <b>グリップ実力は ay≈20m/s²</b>(我々のay_profile 2.6の約8倍)</li>
+<li>駆動系: AWSIMの加速度clamp ±1.37m/s²が実効制約。24km/hは到達に~5秒を要するだけで上限ではない</li>
+<li>結論: <b>24km/hは物理・グリップ両面で余裕内</b>。制約は純粋に「操舵系の追従品質」と「制御周期の余裕」</li>
+</ul>
+<b>高速域での操舵対策の見込み</b>(正直な現状):
+<ul>
+<li>P3のΔκ境界は Δs/v_ref 基底なので<b>速度に自動適応</b>(高速ほどステップ実時間が縮み境界も縮む=構造的に破綻しにくい)</li>
+<li>LPF(40Hz固定)の位相遅れは実時間一定 → 高速ほど距離換算の遅れが増える(24km/hで+13cm相当)。r_drateは速度非依存</li>
+<li><b>実績の空白</b>: 現行の完成形(アンカー撤去後+offset=1)で検証済みなのは15km/hのみ。18〜22km/hの過去走行は旧構成。→ 残課題#2の段階検証(18→22→24を単独で、ステアstd/反転/clrを各段で判定)が必須であり、シミュレーション代替はしない方針</li>
+</ul>
+</div>
+
+<h3>Q3. Qスケジュール化の紐付け方式(設計案)</h3>
+<div class="card">
+<b>採用予定の方式: 経路ロード時にwp毎の重みを曲率から事前計算(方式A)</b>
+<ul>
+<li>キー: <b>各wpの|κ|(CSV由来・静的)</b>。コーナーIDや区間テーブルは使わない(保守対象を増やさない)</li>
+<li>形: ブレンド w(κ)=clip(|κ|/κ_ref, 0, 1) で Q_straight ↔ Q_corner を連続補間し、<b>Q_wp[i] を経路ロード時に配列化</b>。P行列は kron(I,Q) をやめ per-step block_diag(これはQ1のupdate()化でP値の直接書込が可能になるため同時に安価に実現=<b>#1と#4はセットで実装するのが正)</b></li>
+<li>速度依存: 毎周期の連続変化は<b>不採用</b>(QP地形の連続変形=振動源。アンカー項の教訓)。速度は v_max変更イベント時のプリセット切替(update_Q基盤が既存)のみ</li>
+<li>ステア系重み: R[κ]=500(大きさ)とr_drate(Δκ)は当面グローバル維持。κスケジュールの主対象は Q[e_y]/Q[e_psi] の比(直線=ノイズを追わない緩さ / コーナー=チョード化を許さない締まり)</li>
+</ul>
+</div>
+
+<h3>Q4. 相手車両の挙動モデルと予測精度</h3>
+<div class="card">
+<b>相手の性質</b>: 予選・本戦とも<b>各チームの自動運転スタック</b>(固定アルゴリズム)。ブロックライン等の対抗AIは観測されていない(ルール上も防御的進路妨害は想定外)。実測でも周回再現性が高い:
+<ul>
+<li>d2: cap 29.9→30.1km/h(周回間ブレ±0.2km/h)/ d3: 15.2km/h固定。<b>走行ライン(lat)も全周学習済み</b></li>
+<li>注意: 手動運転の相手(ローカルテスト)では反復前提が崩れる → lat学習は参考値(capはmax更新なので頑健)</li>
+</ul>
+<b>減速ポイント予測の現状精度</b>:
+<ul>
+<li>位置分解能: wp=約1m + 包絡線平滑(k=5)で<b>±2〜3m</b>。速度精度: 周回間±0.2〜1km/h</li>
+<li>ICC予測制動(実装済)は「先25mのmin」を取るため位置誤差±3mに<b>頑健</b>(用途に対して十分)</li>
+<li>Stage2の攻めタイミング(仕掛け点の同定)には±2〜3mはやや粗い → 仕掛け窓の判定は「点」でなく「区間(相手が遅い区間に自分の完遂窓を重ねる)」で設計する方針。減速<b>地点</b>の同定精度を上げる場合は平滑kの縮小かa(s)=v·dv/dsのゼロ交差利用が候補</li>
+</ul>
+</div>
+
+<p class="small">生成: 2026-07-05(技術Q&amp;A追記) / 検証データ: run_perffix_20260704_1148〜20260705_1736, 公式 20260705-133323, 予選 rosbag2_autoware(0705)</p>
+</body>
+</html>
