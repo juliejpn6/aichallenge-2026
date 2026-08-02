@@ -23,9 +23,16 @@ J(ジッタ)・work/work_cpu分布・プラットフォーム構成・スパイ�
 
 集計方針(既存の分析プロンプト・design docでの用法に合わせた選択、複数の
 選び方がありうる場所での本ツールの立場):
-  - dtパーセンタイル(p50/p95/p99/p999/max)は複数の[PERF-DT]窓の**最大値**を
-    採用する(「J」は安全マージンの根拠として使うため、平常値ではなく
-    ワースト窓を代表値とするのが安全側)。
+  - dtパーセンタイル(p50/p95/p99/p999)は複数の[PERF-DT]窓の**n重み付け平均**を
+    採用する(263節続報Part A-2で変更。旧実装の「窓ごとの最悪値のmax集計」は
+    走行時間[=窓の数]が長いほど単調に悪化する統計であり、run長の異なる
+    走行のJを比較できない問題があった。加重平均は真の全区間パーセンタイル
+    [生サンプル非公開のため厳密には計算不能]の実用的な近似であり、窓数が
+    増えても定常過程なら真の期待値へ収束する)。
+  - max_msだけは「観測された真の最大値」という定義上、従来通りmax集計を
+    維持する(走行時間とともに悪化しうるのが正しい挙動のため)。
+  - p99の窓別分布(min/median/max)を参考情報として別途保持する
+    (「どの窓が悪かったか」の特定用、旧実装のmax集計が果たしていた役割)。
   - eff_rateは窓ごとのnで重み付けした加重平均を採用する(スループットの
     実態を表すため)。
   - work/work_cpu/cpu_ratio/run_delayは可能な限り生データ(sum/n)から
@@ -207,6 +214,25 @@ def parse_perf_platform(text):
 # ---------------------------------------------------------------------------
 
 def aggregate_dt(windows):
+    """263節続報Part A-2で集計方針を変更した: [PERF-DT]は窓(既定400/720周期)
+    ごとのパーセンタイルしかログに残らず、生のdtサンプル全件は取得できない
+    (ダンプするとログ量が爆発するため)。旧実装はp50/p95/p99/p999を「窓ごとの
+    最悪値のmax集計」としていたが、これは走行時間(=窓の数)が長いほど
+    「たまたま悪い窓」に当たる機会が増え、単調に悪化する統計だった
+    (C4'の40Hzミニベースラインが会話の合間で想定の倍以上走ってしまい、
+    Jが同じ設定のC4のベースラインと比較不能になった実例で発覚)。
+
+    そこで、パーセンタイル系(p50/p95/p99/p999)は「窓ごとの値をn(窓内サンプル数)で
+    重み付け平均する」方式へ変更した。これは真の全区間p99(生サンプルへの
+    アクセスが無いため厳密には計算不能)の実用的な近似であり、かつ窓数が
+    増えても値が単調悪化しない(定常的なプロセスなら窓を増やすほどむしろ
+    真の期待値へ収束する)という望ましい性質を持つ。max_msだけは「観測された
+    真の最大値」という定義上、従来通りmax集計を維持する(これは正しく走行
+    時間とともに悪化しうる統計であり、それ自体が正しい挙動)。
+
+    p99の窓別分布(min/median/max)は「どの窓が悪かったか」を特定するための
+    参考情報として別途保持する(旧実装のmax集計が果たしていた役割はここへ
+    移した)。"""
     windows = [w for w in windows if w.get('n')]
     if not windows:
         return None
@@ -222,18 +248,30 @@ def aggregate_dt(windows):
             return None
         return sum(v * n for v, n in pairs) / sum(n for _, n in pairs)
 
+    p99_vals = sorted(w['p99_ms'] for w in windows if w.get('p99_ms') is not None)
+    if p99_vals:
+        mid = len(p99_vals) // 2
+        p99_window_median = (p99_vals[mid] if len(p99_vals) % 2 == 1
+                              else (p99_vals[mid - 1] + p99_vals[mid]) / 2)
+        p99_window_min, p99_window_max = p99_vals[0], p99_vals[-1]
+    else:
+        p99_window_median = p99_window_min = p99_window_max = None
+
     return {
         'total_n': total_n,
         'num_windows': len(windows),
-        'p50_ms': _max_field('p50_ms'),
-        'p95_ms': _max_field('p95_ms'),
-        'p99_ms': _max_field('p99_ms'),
-        'p999_ms': _max_field('p999_ms'),
+        'p50_ms': _weighted_avg('p50_ms'),
+        'p95_ms': _weighted_avg('p95_ms'),
+        'p99_ms': _weighted_avg('p99_ms'),
+        'p999_ms': _weighted_avg('p999_ms'),
         'max_ms': _max_field('max_ms'),
         'eff_rate_hz': _weighted_avg('eff_rate_hz'),
         'over_budget_pct_worst': _max_field('over_budget_pct'),
         'max_consec_over': _max_field('max_consec_over'),
         'margin_ms': windows[0].get('margin_ms'),
+        'p99_window_min_ms': p99_window_min,
+        'p99_window_median_ms': p99_window_median,
+        'p99_window_max_ms': p99_window_max,
     }
 
 
@@ -369,6 +407,10 @@ def format_single_report(result):
                       f"over_budget(最悪窓)={_fmt(dt['over_budget_pct_worst'], '%')}  "
                       f"max_consec_over={_fmt(dt['max_consec_over'])}  "
                       f"(集計対象={dt['num_windows']}窓, n={dt['total_n']})")
+        lines.append(f"[参考]窓別p99分布: min={_fmt(dt['p99_window_min_ms'], 'ms')} "
+                      f"median={_fmt(dt['p99_window_median_ms'], 'ms')} "
+                      f"max={_fmt(dt['p99_window_max_ms'], 'ms')} "
+                      "(問題窓の特定用。Jの算出には使わない)")
     else:
         lines.append("[PERF-DT]行が見つからないか、budgetを特定できませんでした(N/A)。")
     lines.append('')
@@ -515,7 +557,9 @@ def format_comparison_report(local, qual, target_hz):
     row('budget(ms、現行rate)', local['budget_ms'], qual['budget_ms'], 'ms')
     row('J = p99-budget(ms)', local['j_ms'], qual['j_ms'], 'ms')
     if local['dt'] and qual['dt']:
-        row('dt p99(ms)', local['dt']['p99_ms'], qual['dt']['p99_ms'], 'ms')
+        row('dt p99(ms、窓n加重平均)', local['dt']['p99_ms'], qual['dt']['p99_ms'], 'ms')
+        row('  [参考]窓別p99 max(ms)', local['dt']['p99_window_max_ms'],
+            qual['dt']['p99_window_max_ms'], 'ms')
         row('eff_rate(Hz)', local['dt']['eff_rate_hz'], qual['dt']['eff_rate_hz'], 'Hz')
     if local['perf'] and qual['perf']:
         row('work_cpu avg(ms)', local['perf']['work_cpu_avg_ms'],

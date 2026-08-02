@@ -4283,6 +4283,19 @@ class MPCController(Node):
         self._pf_last_cycle = {}          # このサイクルの区間別実測値(name -> 秒)
         self._pf_cycle_gen2_flag = False  # このサイクル内にGC世代2回収が発生したか
         self._pf_cycle_gen2_duration = 0.0
+        # 2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): [PERF-DT-SPIKE]用に、
+        #   直前サイクルのwork/work_cpu(_pf_cycle_end終了時点の値)を保持する。
+        #   dtは_control()冒頭(このサイクル自身のwork計測より前)で確定するため、
+        #   dtスパイク発火時点で分かるのは「直前サイクルがどれだけ重かったか」
+        #   だけであり、それをここに保持しておく。
+        self._pf_last_work_ms = None
+        self._pf_last_work_cpu_ms = None
+        # 2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): ハイパーバイザに
+        #   横取りされた時間(/proc/statのsteal、クラウドVM特有の外部競合の直接証拠)の
+        #   読み取り可否を起動時に1回だけ判定する。764msの全ノード同時停止ストール
+        #   (通常のnivcsw・GC・計算量では説明がつかない)の原因候補として、
+        #   ハイパーバイザレベルのCPU steal timeを疑ったための追加計装。
+        self._pf_steal_available = self._pf_read_cpu_steal_jiffies() is not None
         self._pf_prev_cache_builds = 0
         self._pf_prev_nivcsw = _resource.getrusage(_resource.RUSAGE_SELF).ru_nivcsw
         self._pf_prev_nseg = None
@@ -4440,11 +4453,18 @@ class MPCController(Node):
         cgroup = self._pf_read_cgroup_limits()
         cpu_model = self._pf_read_cpu_model()
         cpu_count = os.cpu_count() or 'N/A'
+        # 2026-08-02追加(263節続報Part A-3): 各項目を「読んだ実際の階層パス」を
+        #   併記する。cpu.max/cpuset.cpus.effective/memory.maxは委譲階層が
+        #   項目ごとに異なりうるため、値だけでは「コンテナ固有の制限」なのか
+        #   「ホスト/VM全体に近い、より上位の値」なのかを区別できない。
+        cpu_quota_from = cgroup['cpu_quota_path'] or 'N/A'
+        cpuset_from = cgroup['cpuset_path'] or 'N/A'
+        memory_from = cgroup['memory_path'] or 'N/A'
         self.get_logger().info(
             f"[PERF-PLATFORM] cgroup={cgroup['version']} "
-            f"cpu_quota_cores={cgroup['cpu_quota_str']} "
-            f"cpuset_cpus={cgroup['cpuset_str']} "
-            f"memory_max={cgroup['memory_max_str']} "
+            f"cpu_quota_cores={cgroup['cpu_quota_str']} (from={cpu_quota_from}) "
+            f"cpuset_cpus={cgroup['cpuset_str']} (from={cpuset_from}) "
+            f"memory_max={cgroup['memory_max_str']} (from={memory_from}) "
             f"cpu_model=\"{cpu_model}\" cpu_count={cpu_count}")
         self.get_logger().info(
             "[PERF-PLATFORM] availability: "
@@ -4452,7 +4472,21 @@ class MPCController(Node):
             f"sched_schedstats={'OK' if self._pf_run_delay_available else 'N/A'} "
             f"cgroup_cpu_quota={'OK' if cgroup['cpu_quota_readable'] else 'N/A'} "
             f"cgroup_cpuset={'OK' if cgroup['cpuset_readable'] else 'N/A'} "
-            f"cgroup_memory_max={'OK' if cgroup['memory_readable'] else 'N/A'}")
+            f"cgroup_memory_max={'OK' if cgroup['memory_readable'] else 'N/A'} "
+            f"steal_time={'OK' if self._pf_steal_available else 'N/A'}")
+        # 2026-08-02追加(263節続報Part A-3): cgroup cpusetとsched_getaffinity
+        #   実測値が食い違う場合(予選環境で観測: cpuset_cpus=0-15だが実際の
+        #   affinityは[7,8,9]の3コアのみ)、実効的な制限はos.sched_getaffinity
+        #   側(taskset等、cgroup外の機構による制限を含む実測値)であることを
+        #   明記する。cpusetが読めない/affinityが読めない場合は判定しない。
+        if (cgroup['cpuset_readable'] and effective_affinity != 'N/A'):
+            cpuset_cores = self._pf_parse_cpu_range(cgroup['cpuset_str'])
+            if cpuset_cores is not None and cpuset_cores != set(effective_affinity):
+                self.get_logger().info(
+                    "[PERF-PLATFORM] note: cgroup cpuset "
+                    f"({cgroup['cpuset_str']}) != 実効affinity({effective_affinity})"
+                    " — 実効制限はaffinity側(taskset/sched_setaffinity等、"
+                    "cgroup外の機構による制限を含む実測値)")
         # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 4、C4実験
         #   「双方向アフィニティ」用): 同居する主要プロセス(rviz2・component_container
         #   [ekf_localizer/gnss_poser等が composition で同居]・autostart_orchestrator・
@@ -4463,15 +4497,24 @@ class MPCController(Node):
         #   走査に失敗しても起動を止めない。
         self._pf_log_colocated_affinity()
 
-    def _pf_find_cgroup_v2_root(self):
-        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2): このプロセス
-        自身のCPUクォータが読めるcgroup v2ディレクトリを返す(見つからなければ
-        None)。cgroup v2はcpu.maxのようなコントローラファイルを「親が
-        cgroup.subtree_controlで委譲した」階層にしか置かない仕様のため、
-        自分の葉cgroup(/proc/self/cgroupが示すパス)に無くても祖先のどこかに
-        あることがある(開発ホストでの実地検証で確認: 葉には無くsystemd
-        user.sliceレベルにあった)。葉から/sys/fs/cgroupまで祖先を1段ずつ
-        遡り、cpu.maxが最初に見つかった階層を使う。"""
+    def _pf_find_cgroup_v2_item_root(self, filename):
+        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2/263節続報Part A-3):
+        指定したcgroup v2コントローラファイル(filename)がこのプロセス自身の
+        cgroupから読める最初の階層を返す(見つからなければNone)。cgroup v2は
+        コントローラファイルを「親がcgroup.subtree_controlで委譲した」階層にしか
+        置かない仕様のため、自分の葉cgroup(/proc/self/cgroupが示すパス)に
+        無くても祖先のどこかにあることがある(開発ホストでの実地検証で確認:
+        葉には無くsystemd user.sliceレベルにあった)。
+
+        Part A-3で項目ごとに独立して探索する設計へ変更した: cpu.max・
+        cpuset.cpus.effective・memory.maxは委譲階層が項目ごとに異なりうる
+        (例: CPUコントローラだけ葉に委譲されていてもcpusetは祖先止まり、等)。
+        以前は「cpu.maxが見つかった階層」から3項目とも読んでいたため、
+        cpuset/memoryが無関係な祖先(ホスト/VM全体に近い階層)の値を拾う
+        恐れがあった(予選環境ログのcpuset_cpus=0-15・memory_max=54.69GiBが
+        実際のコンテナ制限[cpu_affinity=[7,8,9]で確認済み]と乖離していた
+        ことから疑われた)。葉から/sys/fs/cgroupまで祖先を1段ずつ遡り、
+        filenameが最初に見つかった階層を使う。"""
         candidates = []
         try:
             with open('/proc/self/cgroup', 'r') as f:
@@ -4489,60 +4532,77 @@ class MPCController(Node):
         if '/sys/fs/cgroup' not in candidates:
             candidates.append('/sys/fs/cgroup')
         for cand in candidates:
-            if os.path.exists(os.path.join(cand, 'cpu.max')):
+            if os.path.exists(os.path.join(cand, filename)):
                 return cand
         return None
 
     def _pf_read_cgroup_limits(self):
-        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2): cgroup v2を
-        優先し、無ければv1(レガシーなコントローラ別階層)へフォールバックして
-        CPUクォータ・cpuset・メモリ上限を読む。「約3vCPU/12GiB」という予選環境の
-        推定値(2026-07-24時点、精度に留保あり)を実測で確定させるための計装。
+        """2026-08-02追加(263節、予選環境ギャップ分析準備Phase 2)、263節続報
+        Part A-3で項目別独立探索へ改修: cgroup v2を優先し、無ければv1
+        (レガシーなコントローラ別階層)へフォールバックしてCPUクォータ・
+        cpuset・メモリ上限を読む。「約3vCPU/12GiB」という予選環境の推定値
+        (2026-07-24時点、精度に留保あり)を実測で確定させるための計装。
         「unlimited」(制限ファイル自体は読めたが上限が設定されていない)と
         「N/A」(ファイルが読めない/存在しない)を区別して返す。読み取れない
-        項目があっても他項目やノード起動全体を止めない。"""
+        項目があっても他項目やノード起動全体を止めない。各項目を読んだ
+        実際の階層パス(*_path)も返す——値がコンテナ固有かホスト/VM全体かを
+        後から判別できるようにするため。"""
         result = {
             'version': 'N/A',
-            'cpu_quota_str': 'N/A', 'cpu_quota_readable': False,
-            'cpuset_str': 'N/A', 'cpuset_readable': False,
-            'memory_max_str': 'N/A', 'memory_readable': False,
+            'cpu_quota_str': 'N/A', 'cpu_quota_readable': False, 'cpu_quota_path': None,
+            'cpuset_str': 'N/A', 'cpuset_readable': False, 'cpuset_path': None,
+            'memory_max_str': 'N/A', 'memory_readable': False, 'memory_path': None,
         }
-        v2_root = self._pf_find_cgroup_v2_root()
-        if v2_root is not None:
+        # 2026-08-02追加(263節続報Part A-3): cgroup v2かどうかは、委譲階層に
+        #   依存しない唯一の階層(真のcgroupルート)に置かれるcgroup.controllers
+        #   の存在で判定する(項目ごとの探索とは無関係に、バージョン自体は
+        #   1回だけ確定させる)。
+        if os.path.exists('/sys/fs/cgroup/cgroup.controllers'):
             result['version'] = 'v2'
-            try:
-                with open(os.path.join(v2_root, 'cpu.max'), 'r') as f:
-                    quota_str, period_str = f.read().split()
-                result['cpu_quota_readable'] = True
-                result['cpu_quota_str'] = (
-                    'unlimited' if quota_str == 'max'
-                    else '%.2f' % (int(quota_str) / int(period_str)))
-            except (OSError, ValueError):
-                pass
-            for cpuset_name in ('cpuset.cpus.effective', 'cpuset.cpus'):
+            cpu_root = self._pf_find_cgroup_v2_item_root('cpu.max')
+            if cpu_root is not None:
+                result['cpu_quota_path'] = cpu_root
                 try:
-                    with open(os.path.join(v2_root, cpuset_name), 'r') as f:
+                    with open(os.path.join(cpu_root, 'cpu.max'), 'r') as f:
+                        quota_str, period_str = f.read().split()
+                    result['cpu_quota_readable'] = True
+                    result['cpu_quota_str'] = (
+                        'unlimited' if quota_str == 'max'
+                        else '%.2f' % (int(quota_str) / int(period_str)))
+                except (OSError, ValueError):
+                    pass
+            for cpuset_name in ('cpuset.cpus.effective', 'cpuset.cpus'):
+                cpuset_root = self._pf_find_cgroup_v2_item_root(cpuset_name)
+                if cpuset_root is None:
+                    continue
+                try:
+                    with open(os.path.join(cpuset_root, cpuset_name), 'r') as f:
                         cpuset_val = f.read().strip()
                 except OSError:
                     continue
                 if cpuset_val:
                     result['cpuset_readable'] = True
                     result['cpuset_str'] = cpuset_val
+                    result['cpuset_path'] = cpuset_root
                     break
-            try:
-                with open(os.path.join(v2_root, 'memory.max'), 'r') as f:
-                    mem_str = f.read().strip()
-                result['memory_readable'] = True
-                result['memory_max_str'] = (
-                    'unlimited' if mem_str == 'max'
-                    else '%.2fGiB' % (int(mem_str) / (1024 ** 3)))
-            except (OSError, ValueError):
-                pass
+            mem_root = self._pf_find_cgroup_v2_item_root('memory.max')
+            if mem_root is not None:
+                result['memory_path'] = mem_root
+                try:
+                    with open(os.path.join(mem_root, 'memory.max'), 'r') as f:
+                        mem_str = f.read().strip()
+                    result['memory_readable'] = True
+                    result['memory_max_str'] = (
+                        'unlimited' if mem_str == 'max'
+                        else '%.2fGiB' % (int(mem_str) / (1024 ** 3)))
+                except (OSError, ValueError):
+                    pass
             return result
         v1_quota_path = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us'
         v1_period_path = '/sys/fs/cgroup/cpu/cpu.cfs_period_us'
         if os.path.exists(v1_quota_path):
             result['version'] = 'v1'
+            result['cpu_quota_path'] = '/sys/fs/cgroup/cpu'
             try:
                 with open(v1_quota_path, 'r') as f:
                     quota_us = int(f.read().strip())
@@ -4553,12 +4613,14 @@ class MPCController(Node):
                     'unlimited' if quota_us <= 0 else '%.2f' % (quota_us / period_us))
             except (OSError, ValueError):
                 pass
+            result['cpuset_path'] = '/sys/fs/cgroup/cpuset'
             try:
                 with open('/sys/fs/cgroup/cpuset/cpuset.cpus', 'r') as f:
                     result['cpuset_str'] = f.read().strip()
                 result['cpuset_readable'] = True
             except OSError:
                 pass
+            result['memory_path'] = '/sys/fs/cgroup/memory'
             try:
                 with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
                     mem_bytes = int(f.read().strip())
@@ -4582,6 +4644,40 @@ class MPCController(Node):
         except OSError:
             pass
         return 'N/A'
+
+    def _pf_parse_cpu_range(self, s):
+        """2026-08-02追加(263節続報Part A-3): cgroup cpuset形式のコア範囲文字列
+        (例: '0-1,6-15'、'7-9')をコア番号のsetへ変換する。os.sched_getaffinity
+        実測値との比較(cgroup cpusetと実効affinityの食い違い検出)に使う。
+        パース不能な文字列に対してはNoneを返す(判定をスキップさせるため)。"""
+        try:
+            cores = set()
+            for part in s.split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                if '-' in part:
+                    lo, hi = part.split('-', 1)
+                    cores.update(range(int(lo), int(hi) + 1))
+                else:
+                    cores.add(int(part))
+            return cores
+        except ValueError:
+            return None
+
+    def _pf_read_cpu_steal_jiffies(self):
+        """2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): /proc/statの
+        集計cpu行(先頭'cpu '行)の第8フィールド(steal、ハイパーバイザに横取り
+        された時間、USER_HZ単位)を返す。ゲストから読める唯一のハイパーバイザ
+        横取りの直接証拠。フィールド自体が無いカーネル・コンテナ環境では
+        読み取り失敗としてNoneを返す。"""
+        try:
+            with open('/proc/stat', 'r') as f:
+                first_line = f.readline()
+            fields = first_line.split()
+            return int(fields[8])
+        except (OSError, IndexError, ValueError):
+            return None
 
     def _pf_log_colocated_affinity(self):
         targets = ('rviz2', 'component_container', 'autostart_orchestrator',
@@ -4731,6 +4827,12 @@ class MPCController(Node):
         self._pf_work_sum += work
         self._pf_sample_cpu_freq()
         self._pf_sample_run_delay()
+        # 2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): [PERF-DT-SPIKE]が
+        #   「直前サイクルはどれだけ重かったか」を参照できるよう、このサイクルの
+        #   work/work_cpuをmsで保持しておく(次サイクルのdt計測はこのサイクルの
+        #   work計測より前に確定するため、次サイクル視点では常に「直前」の値になる)。
+        self._pf_last_work_ms = work * 1000.0
+        self._pf_last_work_cpu_ms = work_cpu * 1000.0
         if work > self._pf_work_max:
             self._pf_work_max = work
         if work > self._pf_over_budget_s:
@@ -4914,6 +5016,21 @@ class MPCController(Node):
         self.get_logger().info(
             f"[PERF-DT] over_margin: {self._dtperf_over_margin_s * 1000:.3f}ms "
             f"(config: mpc.perf_dt_over_margin_ms, レートスケーリング対象外)")
+        # 2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): [PERF-DT-SPIKE]
+        #   (dtそのものが予算×factorを超えた周期のダンプ)の発火倍率。既存の
+        #   [PERF-SPIKE](work基準)と同じ扱い(計測の判定閾値、レートスケーリング
+        #   対象外)。既定5.0は、40Hzなら125ms——通常のジッタでは発火せず、
+        #   764ms級のストールは確実に捕捉する水準として選んだ。
+        self._dtperf_spike_factor = float(
+            getattr(self._cfg.mpc, "perf_dt_spike_factor", 5.0))  # type: ignore
+        self._dtperf_dtspike_count = 0
+        self._dtperf_prev_nivcsw = _resource.getrusage(_resource.RUSAGE_SELF).ru_nivcsw
+        self._dtperf_prev_steal_jiffies = (
+            self._pf_read_cpu_steal_jiffies() if self._pf_steal_available else None)
+        try:
+            self._dtperf_clk_tck = os.sysconf('SC_CLK_TCK')
+        except (AttributeError, ValueError, OSError):
+            self._dtperf_clk_tck = 100  # Linuxの一般的な既定値(USER_HZ)
 
     def _dtperf_reset_window(self):
         """レポート出力後の窓リセット。_dtperf_cur_streakだけは意図的に
@@ -4924,6 +5041,56 @@ class MPCController(Node):
         self._dtperf_dts = []
         self._dtperf_over_count = 0
         self._dtperf_max_streak = 0
+        self._dtperf_dtspike_count = 0
+
+    def _dtperf_dump_spike_if_needed(self, dt):
+        """2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): dtそのものが
+        予算×factorを超えた周期を[PERF-DT-SPIKE]として1行ダンプする。既存の
+        [PERF-SPIKE]はwork(処理時間)しか見ておらず、「呼び出し間隔dt自体が
+        伸びる」ストール(764ms級、全ノードが同時に停止していたため計算量・GCでは
+        説明がつかない)を原理的に捕捉できない。この盲点を埋めるための計装。
+        nivcsw・steal(ハイパーバイザ横取り時間)の差分追跡は毎サイクル軽量に
+        行い(既存[PERF-SPIKE]のnivcsw_diff追跡と同じ規律)、文字列整形とprintは
+        発火時のみ行う。"""
+        nivcsw = _resource.getrusage(_resource.RUSAGE_SELF).ru_nivcsw
+        nivcsw_diff = nivcsw - self._dtperf_prev_nivcsw
+        self._dtperf_prev_nivcsw = nivcsw
+
+        steal_diff_jiffies = None
+        if self._pf_steal_available:
+            cur_steal = self._pf_read_cpu_steal_jiffies()
+            if cur_steal is not None and self._dtperf_prev_steal_jiffies is not None:
+                steal_diff_jiffies = max(0, cur_steal - self._dtperf_prev_steal_jiffies)
+            self._dtperf_prev_steal_jiffies = cur_steal
+
+        if dt <= self._pf_over_budget_s * self._dtperf_spike_factor:
+            return
+        self._dtperf_dtspike_count += 1
+        prev_work_str = ('%.2fms' % self._pf_last_work_ms
+                          if self._pf_last_work_ms is not None else 'N/A')
+        prev_work_cpu_str = ('%.2fms' % self._pf_last_work_cpu_ms
+                              if self._pf_last_work_cpu_ms is not None else 'N/A')
+        # run_delayはサイクル末(_pf_cycle_end)でしかサンプルされないため、dt確定
+        # 時点(このサイクルの処理が始まる前)で分かるのは直前サイクルの値のみ。
+        if self._pf_run_delay_available and self._pf_cur_run_delay_ns is not None:
+            run_delay_prev_str = '%.2fms' % (self._pf_cur_run_delay_ns / 1e6)
+        else:
+            run_delay_prev_str = 'N/A'
+        steal_str = ('%.2fms' % (steal_diff_jiffies * 1000.0 / self._dtperf_clk_tck)
+                     if steal_diff_jiffies is not None else 'N/A')
+        # 2026-08-02追加(263節続報Part A-1): _dtperf_recordは self._loop += 1
+        # (_control()内、この呼び出しの少し後)より前に呼ばれるため、self._loopは
+        # まだ1つ前のサイクル番号を指している。work基準の[PERF-SPIKE]は
+        # インクリメント後のself._loopを使うため、同一サイクルで両方が発火した
+        # 場合にloop番号で突き合わせられるよう、+1して報告する。
+        print(
+            '[PERF-DT-SPIKE] loop=%d dt=%.2fms budget=%.2fms factor=%.1f threshold=%.2fms '
+            'prev_work=%s prev_work_cpu=%s run_delay_prev=%s nivcsw_diff=%d steal_diff=%s'
+            % (self._loop + 1, dt * 1000, self._pf_over_budget_s * 1000,
+               self._dtperf_spike_factor,
+               self._pf_over_budget_s * 1000 * self._dtperf_spike_factor,
+               prev_work_str, prev_work_cpu_str, run_delay_prev_str, nivcsw_diff, steal_str),
+            flush=True)
 
     def _dtperf_record(self, dt):
         if not hasattr(self, '_dtperf_cycles'):
@@ -4938,6 +5105,10 @@ class MPCController(Node):
             self._dtperf_max_streak = max(self._dtperf_max_streak, self._dtperf_cur_streak)
         else:
             self._dtperf_cur_streak = 0
+        # 2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1): 窓境界と無関係に
+        #   毎サイクル判定する(既存[PERF-SPIKE]と同じ理由——窓境界だけで判定すると
+        #   ストール自体を取りこぼす)。
+        self._dtperf_dump_spike_if_needed(dt)
 
         if self._pf_report_every and self._dtperf_cycles >= self._pf_report_every:
             n = self._dtperf_cycles
@@ -4954,10 +5125,11 @@ class MPCController(Node):
             dt_max = dts[-1]
             over_ratio = self._dtperf_over_count / n
             print('[PERF-DT] n=%d p50=%.2fms p95=%.2fms p99=%.2fms p999=%.2fms max=%.2fms '
-                  'eff_rate=%.2fHz over_budget=%.2f%% max_consec_over=%d margin=%.3fms'
+                  'eff_rate=%.2fHz over_budget=%.2f%% max_consec_over=%d margin=%.3fms '
+                  'dtspike=%d'
                   % (n, p50 * 1000, p95 * 1000, p99 * 1000, p999 * 1000, dt_max * 1000,
                      effective_rate, over_ratio * 100, self._dtperf_max_streak,
-                     self._dtperf_over_margin_s * 1000),
+                     self._dtperf_over_margin_s * 1000, self._dtperf_dtspike_count),
                   flush=True)
             self._dtperf_reset_window()
 

@@ -168,14 +168,14 @@ def test_control_logic_dt_untouched_by_perf_counter_separation():
 
 def test_platform_checklist_logs_use_sim_time():
     idx = _SRC.index("def _pf_log_platform_checklist(self):")
-    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_root", idx)
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
     snippet = _SRC[idx:idx_end]
     assert "use_sim_time={self.use_sim_time}" in snippet
 
 
 def test_platform_checklist_logs_cgroup_and_cpu_model_fields():
     idx = _SRC.index("def _pf_log_platform_checklist(self):")
-    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_root", idx)
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
     snippet = _SRC[idx:idx_end]
     for field in ("cgroup=", "cpu_quota_cores=", "cpuset_cpus=", "memory_max=",
                   "cpu_model=", "cpu_count="):
@@ -184,7 +184,7 @@ def test_platform_checklist_logs_cgroup_and_cpu_model_fields():
 
 def test_platform_checklist_logs_availability_summary():
     idx = _SRC.index("def _pf_log_platform_checklist(self):")
-    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_root", idx)
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
     snippet = _SRC[idx:idx_end]
     assert "[PERF-PLATFORM] availability:" in snippet
     for field in ("scaling_cur_freq=", "sched_schedstats=", "cgroup_cpu_quota=",
@@ -194,22 +194,25 @@ def test_platform_checklist_logs_availability_summary():
 
 def test_platform_checklist_calls_cgroup_and_cpu_model_readers():
     idx = _SRC.index("def _pf_log_platform_checklist(self):")
-    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_root", idx)
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
     snippet = _SRC[idx:idx_end]
     assert "self._pf_read_cgroup_limits()" in snippet
     assert "self._pf_read_cpu_model()" in snippet
 
 
-def test_pf_find_cgroup_v2_root_walks_ancestors():
-    idx = _SRC.index("def _pf_find_cgroup_v2_root(self):")
+def test_pf_find_cgroup_v2_item_root_walks_ancestors():
+    """263節続報Part A-3: 単一の_pf_find_cgroup_v2_root()から、filenameを
+    引数に取る_pf_find_cgroup_v2_item_root()へ汎用化した(項目ごとに独立して
+    探索するため)。"""
+    idx = _SRC.index("def _pf_find_cgroup_v2_item_root(self, filename):")
     idx_end = _SRC.index("\n    def _pf_read_cgroup_limits", idx)
     snippet = _SRC[idx:idx_end]
     assert "os.path.dirname(p)" in snippet
-    assert "os.path.exists(os.path.join(cand, 'cpu.max'))" in snippet
+    assert "os.path.exists(os.path.join(cand, filename))" in snippet
 
 
-def test_pf_find_cgroup_v2_root_handles_missing_proc_self_cgroup():
-    idx = _SRC.index("def _pf_find_cgroup_v2_root(self):")
+def test_pf_find_cgroup_v2_item_root_handles_missing_proc_self_cgroup():
+    idx = _SRC.index("def _pf_find_cgroup_v2_item_root(self, filename):")
     idx_end = _SRC.index("\n    def _pf_read_cgroup_limits", idx)
     snippet = _SRC[idx:idx_end]
     assert "except OSError:" in snippet
@@ -225,12 +228,37 @@ def test_pf_read_cgroup_limits_v2_branch_reads_three_files():
     assert "result['version'] = 'v2'" in snippet
 
 
-def test_pf_read_cgroup_limits_v1_fallback_only_when_v2_root_none():
+def test_pf_read_cgroup_limits_v2_items_searched_independently():
+    """263節続報Part A-3: cpu.max/cpuset.cpus.effective/memory.maxはそれぞれ
+    独立に_pf_find_cgroup_v2_item_root()を呼ぶこと(委譲階層が項目ごとに
+    異なりうるため——実地検証でmemory.maxがcpu.max/cpusetより深い階層に
+    あるケースを確認した)。"""
     idx = _SRC.index("def _pf_read_cgroup_limits(self):")
     idx_end = _SRC.index("\n    def _pf_read_cpu_model", idx)
     snippet = _SRC[idx:idx_end]
-    assert "v2_root = self._pf_find_cgroup_v2_root()" in snippet
-    assert "if v2_root is not None:" in snippet
+    assert snippet.count("self._pf_find_cgroup_v2_item_root(") == 3
+    assert "self._pf_find_cgroup_v2_item_root('cpu.max')" in snippet
+    assert "self._pf_find_cgroup_v2_item_root(cpuset_name)" in snippet
+    assert "self._pf_find_cgroup_v2_item_root('memory.max')" in snippet
+
+
+def test_pf_read_cgroup_limits_records_path_read_from():
+    idx = _SRC.index("def _pf_read_cgroup_limits(self):")
+    idx_end = _SRC.index("\n    def _pf_read_cpu_model", idx)
+    snippet = _SRC[idx:idx_end]
+    for key in ("cpu_quota_path", "cpuset_path", "memory_path"):
+        assert f"'{key}': None" in snippet, f"missing {key!r} initial value"
+        assert f"result['{key}'] = " in snippet, f"missing {key!r} assignment"
+
+
+def test_pf_read_cgroup_limits_v1_fallback_via_cgroup_controllers_marker():
+    """263節続報Part A-3: v2/v1判定は項目探索とは独立に、真のcgroupルートに
+    しか置かれないcgroup.controllersの存在で1回だけ確定させる(項目ごとの
+    探索結果[v2_rootの有無]では判定しない設計へ変更)。"""
+    idx = _SRC.index("def _pf_read_cgroup_limits(self):")
+    idx_end = _SRC.index("\n    def _pf_read_cpu_model", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "os.path.exists('/sys/fs/cgroup/cgroup.controllers')" in snippet
     assert "cpu.cfs_quota_us" in snippet
     assert "result['version'] = 'v1'" in snippet
 
@@ -255,11 +283,67 @@ def test_pf_read_cgroup_limits_does_not_crash_on_missing_files():
 
 def test_pf_read_cpu_model_reads_proc_cpuinfo():
     idx = _SRC.index("def _pf_read_cpu_model(self):")
-    idx_end = _SRC.index("\n    def _pf_log_colocated_affinity", idx)
+    idx_end = _SRC.index("\n    def _pf_parse_cpu_range", idx)
     snippet = _SRC[idx:idx_end]
     assert "/proc/cpuinfo" in snippet
     assert "model name" in snippet
     assert "return 'N/A'" in snippet
+
+
+def test_pf_parse_cpu_range_known_values():
+    """263節続報Part A-3: cgroup cpuset形式('0-1,6-15'等)のミラー検証。
+    実装は正規表現ではなくsplit/rangeで構成されるため、ソース構造検証と
+    あわせてロジックの単純さ自体もここで直接検証する。"""
+    idx = _SRC.index("def _pf_parse_cpu_range(self, s):")
+    idx_end = _SRC.index("\n    def _pf_read_cpu_steal_jiffies", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "range(int(lo), int(hi) + 1)" in snippet
+    assert "except ValueError:" in snippet
+    assert "return None" in snippet
+
+
+def mirror_parse_cpu_range(s):
+    cores = set()
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            cores.update(range(int(lo), int(hi) + 1))
+        else:
+            cores.add(int(part))
+    return cores
+
+
+def test_mirror_parse_cpu_range_simple_dash():
+    assert mirror_parse_cpu_range('7-9') == {7, 8, 9}
+
+
+def test_mirror_parse_cpu_range_mixed_ranges_and_singletons():
+    assert mirror_parse_cpu_range('0-1,6-15') == set(range(0, 2)) | set(range(6, 16))
+
+
+def test_platform_checklist_logs_cgroup_path_annotations():
+    """263節続報Part A-3: 各項目の値に「読んだ実際の階層パス」を併記すること
+    (値だけではコンテナ固有かホスト/VM全体かを区別できないため)。"""
+    idx = _SRC.index("def _pf_log_platform_checklist(self):")
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "(from={cpu_quota_from})" in snippet
+    assert "(from={cpuset_from})" in snippet
+    assert "(from={memory_from})" in snippet
+
+
+def test_platform_checklist_notes_affinity_cpuset_mismatch():
+    """263節続報Part A-3: cgroup cpusetとsched_getaffinity実測値が食い違う
+    場合(予選環境で観測: cpuset_cpus=0-15だが実際のaffinityは[7,8,9])、
+    実効制限はaffinity側である旨を注記する行を追加すること。"""
+    idx = _SRC.index("def _pf_log_platform_checklist(self):")
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "cpuset_cores != set(effective_affinity)" in snippet
+    assert "実効制限はaffinity側" in snippet
 
 
 def test_platform_checklist_calls_itself_at_pf_init_unchanged():
@@ -276,7 +360,7 @@ def test_existing_perf_platform_governor_fields_unchanged():
     governor/scaling_max_freq/rapl_power_limit/cores_sampled/cpu_affinity
     フィールドを壊していないことの回帰確認。"""
     idx = _SRC.index("def _pf_log_platform_checklist(self):")
-    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_root", idx)
+    idx_end = _SRC.index("\n    def _pf_find_cgroup_v2_item_root", idx)
     snippet = _SRC[idx:idx_end]
     for field in ("governor=", "scaling_max_freq=", "rapl_power_limit=",
                   "cores_sampled=", "cpu_affinity="):

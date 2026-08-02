@@ -186,6 +186,10 @@ EXEMPT_PARAMS = [
                              # os.sched_setaffinityで使うCPUコア番号のリスト。実際の
                              # CPUバインドという制御外の運用パラメータであり、周期時間や
                              # 減衰係数ではないため自動換算しない
+    "perf_dt_spike_factor",  # 2026-08-02追加(263節続報、蛇行/性能ギャップ分析Part A-1):
+                             # [PERF-DT-SPIKE]の発火倍率(計測の判定閾値であり制御には
+                             # 影響しないため、perf_dt_over_margin_msと同じ理由で
+                             # 自動換算しない)
 ]
 
 
@@ -245,6 +249,12 @@ def test_exempt_params_not_wrapped():
     assert "_rate_scaled_gain(" not in line4
     assert "_rate_scaled_cycles(" not in line4
 
+    idx5 = _SRC.index('getattr(self._cfg.mpc, "perf_dt_spike_factor"')
+    line5_end = _SRC.index("\n", idx5)
+    line5 = _SRC[max(0, idx5 - 40):line5_end]
+    assert "_rate_scaled_gain(" not in line5
+    assert "_rate_scaled_cycles(" not in line5
+
 
 def test_no_new_parameter_added_without_wrapping_or_exemption():
     """将来の回帰防止: 本テストのCATEGORY_A_PARAMS/CATEGORY_B_PARAMS/EXEMPT_PARAMSの
@@ -252,7 +262,7 @@ def test_no_new_parameter_added_without_wrapping_or_exemption():
     (件数の見落とし・重複を機械的に検出する)。"""
     assert len(CATEGORY_A_PARAMS) == 17  # osqp_shadow_cyclesを含め17件
     assert len(CATEGORY_B_PARAMS) == 4  # beta(LAT-TTC)は別テストで確認するためここでは4件
-    assert len(EXEMPT_PARAMS) == 5  # 262節続報Phase 4でcpu_affinityを追加
+    assert len(EXEMPT_PARAMS) == 6  # 263節続報Part A-1でperf_dt_spike_factorを追加
 
 
 # ---------------------------------------------------------------------------

@@ -188,7 +188,10 @@ def test_parse_perf_platform_all_none_when_no_lines_present():
 # 集計
 # ---------------------------------------------------------------------------
 
-def test_aggregate_dt_uses_max_across_windows_for_percentiles():
+def test_aggregate_dt_uses_n_weighted_average_for_percentiles():
+    """263節続報Part A-2: パーセンタイル系はn重み付け平均(旧: 窓ごと最悪値の
+    max集計、走行時間に比例して悪化する問題があったため変更)。max_msだけは
+    「観測された真の最大値」という定義上、引き続きmax集計を維持する。"""
     windows = [
         {'n': 400, 'p99_ms': 20.0, 'eff_rate_hz': 40.0, 'over_budget_pct': 0.0,
          'max_consec_over': 0, 'margin_ms': 0.0, 'p50_ms': 10, 'p95_ms': 15,
@@ -198,9 +201,41 @@ def test_aggregate_dt_uses_max_across_windows_for_percentiles():
          'p999_ms': 32, 'max_ms': 40},
     ]
     agg = apg.aggregate_dt(windows)
-    assert agg['p99_ms'] == 30.0  # 2窓のうち大きい方
+    assert agg['p99_ms'] == 25.0  # 重み(n)が等しいので単純平均(20+30)/2
+    assert agg['max_ms'] == 40.0  # maxのみ引き続きmax集計
     assert agg['total_n'] == 800
     assert agg['eff_rate_hz'] == 35.0  # 重み(n)が等しいので単純平均と一致
+
+
+def test_aggregate_dt_percentile_average_is_duration_stable():
+    """パーセンタイル系の加重平均は、同じ分布から窓数(=走行時間)だけが
+    増えても値が単調悪化しないこと(旧max集計の問題の直接的な回帰確認)。
+    ここでは全窓が同一分布(p99=20.0)である単純化されたケースで、窓数を
+    2倍に増やしても加重平均が20.0のまま変わらないことを確認する。"""
+    base_window = {'n': 400, 'p99_ms': 20.0, 'eff_rate_hz': 40.0,
+                    'over_budget_pct': 0.0, 'max_consec_over': 0, 'margin_ms': 0.0,
+                    'p50_ms': 10, 'p95_ms': 15, 'p999_ms': 22, 'max_ms': 25}
+    short_run = apg.aggregate_dt([dict(base_window) for _ in range(3)])
+    long_run = apg.aggregate_dt([dict(base_window) for _ in range(30)])
+    assert short_run['p99_ms'] == long_run['p99_ms'] == 20.0
+
+
+def test_aggregate_dt_reports_p99_window_distribution_as_reference():
+    windows = [
+        {'n': 400, 'p99_ms': 20.0, 'eff_rate_hz': 40.0, 'over_budget_pct': 0.0,
+         'max_consec_over': 0, 'margin_ms': 0.0, 'p50_ms': 10, 'p95_ms': 15,
+         'p999_ms': 22, 'max_ms': 25},
+        {'n': 400, 'p99_ms': 30.0, 'eff_rate_hz': 30.0, 'over_budget_pct': 2.0,
+         'max_consec_over': 1, 'margin_ms': 0.0, 'p50_ms': 12, 'p95_ms': 18,
+         'p999_ms': 32, 'max_ms': 40},
+        {'n': 400, 'p99_ms': 25.0, 'eff_rate_hz': 35.0, 'over_budget_pct': 1.0,
+         'max_consec_over': 0, 'margin_ms': 0.0, 'p50_ms': 11, 'p95_ms': 16,
+         'p999_ms': 27, 'max_ms': 33},
+    ]
+    agg = apg.aggregate_dt(windows)
+    assert agg['p99_window_min_ms'] == 20.0
+    assert agg['p99_window_median_ms'] == 25.0
+    assert agg['p99_window_max_ms'] == 30.0
 
 
 def test_aggregate_dt_returns_none_when_no_windows():
