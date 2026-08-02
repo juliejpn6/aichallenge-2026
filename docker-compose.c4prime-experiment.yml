@@ -1,0 +1,24 @@
+# 2026-08-02(262節続報、判定基準改訂+work_cpu計装Part B): C4'実験用override
+# (C4の三者隔離漏れ[simulator未隔離]を修正)。docker-compose.c4-experiment.ymlと
+# 同じ使い方(COMPOSE_FILEへ明示追加が必要):
+#   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml:docker-compose.c4prime-experiment.yml"
+# としてから`make dev`する。config.yamlのmpc.cpu_affinityを[2, 3, 4, 5]へ
+# 一時設定するのはC4と同じ。
+#
+# 背景: C4の72Hz実測でwall(work)超過割合が4条件中最悪(1.134%)だった原因として、
+# 「simulatorコンテナのcpusetが未設定(=0-15無制限)のため、AWSIMのスレッドが
+# mpc_controller「専有」のはずの論理2-5コアへ自由に侵入できる」という仮説を
+# B-1で直接検証した(ps -eLo pid,psr,pcpu,commで、AWSIM主要スレッドが実際に
+# psr=2/4/5上で動いているサンプルを複数回観測)。
+#
+# C4'はsimulatorにも他ROS2ノードと同じ補集合(0,1,6-15)へのcpusetを追加し、
+# mpc専有コア(2-5)・他autowareノード(taskset、0,1,6-15)・simulator(cpuset、
+# 0,1,6-15)の三者を完全に分離する。simulator側のCPUクォータ制限は付けない
+# (レンダリング等の負荷特性が異なるため、コア範囲の隔離のみに留める)。
+services:
+  autoware:
+    cpus: "16"
+    environment:
+      - AUTOWARE_OTHER_NODES_CPU_AFFINITY=0,1,6-15
+  simulator:
+    cpuset: "0,1,6-15"

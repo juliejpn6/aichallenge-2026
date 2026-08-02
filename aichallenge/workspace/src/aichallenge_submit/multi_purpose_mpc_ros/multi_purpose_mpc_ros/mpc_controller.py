@@ -4294,6 +4294,34 @@ class MPCController(Node):
         #   壁時計時間(work avg)に対し実CPU時間が明らかに少なければ「計算コストではなく
         #   スケジューリング待ちで遅れている」ことを直接示せる。
         self._pf_rusage_prev = _resource.getrusage(_resource.RUSAGE_SELF)
+        # 2026-08-02追加(262節続報、判定基準改訂+work_cpu計装Part B): run_delay
+        #   (スケジューラのランキュー待ち時間、ns)を直接計測する。nivcswは「横取り
+        #   された回数」、work_cpuとwallの差は「間接的な」スケジューラ待ちの推測
+        #   だったが、/proc/<pid>/task/<tid>/schedstatの第2フィールド(run_delay
+        #   累積ns)を毎周期差分で追跡すれば、wall-cpuギャップの原因がランキュー
+        #   待ちそのものであることを数字で直接閉じられる。カーネルのsched_schedstats
+        #   設定が無効(既定)だと全フィールドが常に0になり見かけ上「読めてしまう」
+        #   ため、可用性はsysctl自体の値で判定する(読み取り成功=有効ではない)。
+        try:
+            self._pf_run_delay_tid = os.gettid()
+        except AttributeError:
+            self._pf_run_delay_tid = None
+        try:
+            with open('/proc/sys/kernel/sched_schedstats', 'r') as f:
+                self._pf_run_delay_available = f.read().strip() == '1'
+        except OSError:
+            self._pf_run_delay_available = False
+        if self._pf_run_delay_available:
+            self._pf_prev_run_delay_ns = self._pf_read_run_delay_ns() or 0
+            self.get_logger().info("[PERF-SPIKE] run_delay sampling enabled (schedstat)")
+        else:
+            self._pf_prev_run_delay_ns = 0
+            self.get_logger().warn(
+                "[PERF-SPIKE] kernel.sched_schedstats disabled (sudo sysctl "
+                "kernel.sched_schedstats=1 required) - run_delay fields will report N/A.")
+        self._pf_run_delay_win_sum = 0.0
+        self._pf_run_delay_win_max = 0.0
+        self._pf_cur_run_delay_ns = None
         # 2026-08-01追加(262節続報、プラットフォーム状態計装Phase 1): CPU周波数
         #   (DVFS/電源制限によるスロットリング)を[PERF-SPIKE]・窓集計へ加える。
         #   出力制限解除の前後比較(72Hz再実測)で改善が見られたことから、
@@ -4488,6 +4516,35 @@ class MPCController(Node):
         if self._pf_freq_win_max is None or avg_mhz > self._pf_freq_win_max:
             self._pf_freq_win_max = avg_mhz
 
+    def _pf_read_run_delay_ns(self):
+        """/proc/<pid>/task/<tid>/schedstat(取得できなければプロセス全体の
+        /proc/self/schedstat)の第2フィールド(run_delay、ランキュー待ち累積ns)を
+        返す。読み取り失敗時はNone。"""
+        path = (f'/proc/self/task/{self._pf_run_delay_tid}/schedstat'
+                if self._pf_run_delay_tid is not None else '/proc/self/schedstat')
+        try:
+            with open(path, 'r') as f:
+                fields = f.read().split()
+            return int(fields[1])
+        except (OSError, IndexError, ValueError):
+            return None
+
+    def _pf_sample_run_delay(self):
+        """毎サイクル1回、run_delayの前サイクルからの差分[ns]を
+        self._pf_cur_run_delay_ns へ格納し、窓集計(avg/max)も更新する。
+        sched_schedstatsが無効な環境では起動時に判定済みのため何もしない。"""
+        if not self._pf_run_delay_available:
+            return
+        cur = self._pf_read_run_delay_ns()
+        if cur is None:
+            return
+        diff_ns = max(0, cur - self._pf_prev_run_delay_ns)
+        self._pf_prev_run_delay_ns = cur
+        self._pf_cur_run_delay_ns = diff_ns
+        self._pf_run_delay_win_sum += diff_ns
+        if diff_ns > self._pf_run_delay_win_max:
+            self._pf_run_delay_win_max = diff_ns
+
     def _pf_gc_cb(self, phase, info):
         if phase == 'start':
             self._pf_gc_t0 = _time.perf_counter()
@@ -4527,6 +4584,7 @@ class MPCController(Node):
         self._pf_cycles += 1
         self._pf_work_sum += work
         self._pf_sample_cpu_freq()
+        self._pf_sample_run_delay()
         if work > self._pf_work_max:
             self._pf_work_max = work
         if work > self._pf_over_budget_s:
@@ -4587,9 +4645,19 @@ class MPCController(Node):
                     self._pf_freq_win_min, self._pf_freq_win_max)
             else:
                 _freq_str = 'freq_avg=N/A freq_min=N/A freq_max=N/A'
+            # 2026-08-02追加(262節続報、判定基準改訂+work_cpu計装Part B):
+            #   run_delay(スケジューラのランキュー待ち累積ns)の窓avg/maxを
+            #   同じ行に含める。読み取り不可(sched_schedstats無効)の環境ではN/A。
+            if self._pf_run_delay_available and k > 0:
+                _run_delay_str = 'run_delay_avg=%.2fms run_delay_max=%.2fms' % (
+                    self._pf_run_delay_win_sum / k / 1e6,
+                    self._pf_run_delay_win_max / 1e6)
+            else:
+                _run_delay_str = 'run_delay_avg=N/A run_delay_max=N/A'
             print('[PERF-RUSAGE] n=%d cpu_time=%.2fs wall_time=%.2fs cpu_ratio=%.2f '
-                  'nivcsw=%d nvcsw=%d %s'
-                  % (k, _cpu_time, _wall_time, _cpu_ratio, _nivcsw, _nvcsw, _freq_str),
+                  'nivcsw=%d nvcsw=%d %s %s'
+                  % (k, _cpu_time, _wall_time, _cpu_ratio, _nivcsw, _nvcsw, _freq_str,
+                     _run_delay_str),
                   flush=True)
             self._pf_rusage_prev = _ru
             self._pf_acc = {}
@@ -4605,6 +4673,8 @@ class MPCController(Node):
             self._pf_freq_win_min = None
             self._pf_freq_win_max = None
             self._pf_freq_win_samples = 0
+            self._pf_run_delay_win_sum = 0.0
+            self._pf_run_delay_win_max = 0.0
 
     def _pf_dump_spike_if_needed(self, work, work_cpu=0.0):
         """2026-08-01追加(261節続報、72Hzスパイク調査Phase 3): work>予算×factorの
@@ -4642,6 +4712,13 @@ class MPCController(Node):
                     self._pf_cur_freq_max_mhz)
             else:
                 freq_str = 'freq_avg=N/A freq_min=N/A freq_max=N/A'
+            # 2026-08-02追加(262節続報、判定基準改訂+work_cpu計装Part B): 発火時点の
+            #   run_delay(スケジューラのランキュー待ち、このサイクル分[ns→ms])。
+            #   wall-cpuギャップ≈run_delayならランキュー待ちで帰属が数字で閉じる。
+            if self._pf_run_delay_available and self._pf_cur_run_delay_ns is not None:
+                run_delay_str = 'run_delay=%.2fms' % (self._pf_cur_run_delay_ns / 1e6)
+            else:
+                run_delay_str = 'run_delay=N/A'
             # 2026-08-01追加(262節続報、判定基準改訂+work_cpu計装Phase 1): wall(work)と
             #   スレッドCPU時間(work_cpu)を並べて記録する。wall≫cpuならこのサイクルは
             #   スケジューラに横取りされて待たされていた証拠、wall≈cpuなら本当に計算量が
@@ -4652,11 +4729,11 @@ class MPCController(Node):
             print(
                 '[PERF-SPIKE] loop=%d loop_mod100=%d work=%.2fms work_cpu=%.2fms budget=%.2fms '
                 'cache_builds_diff=%d nivcsw_diff=%d gen2_gc=%s gen2_gc_dur=%.2fms '
-                'nseg=%s nseg_changed=%s %s | %s'
+                'nseg=%s nseg_changed=%s %s %s | %s'
                 % (self._loop, self._loop % 100, work * 1000, work_cpu * 1000,
                    self._pf_over_budget_s * 1000, cache_builds_diff, nivcsw_diff,
                    self._pf_cycle_gen2_flag, self._pf_cycle_gen2_duration * 1000,
-                   nseg, nseg_changed, freq_str, parts),
+                   nseg, nseg_changed, freq_str, run_delay_str, parts),
                 flush=True)
 
     # 2026-07-31追加(255節続報、レートスケーリングのクローズ作業Phase 2):
@@ -4724,11 +4801,15 @@ class MPCController(Node):
             p50 = dts[int(n * 0.50)]
             p95 = dts[min(n - 1, int(n * 0.95))]
             p99 = dts[min(n - 1, int(n * 0.99))]
+            # 2026-08-02追加(262節続報、判定基準改訂+work_cpu計装Part B): p99とmaxの
+            #   間の孤立スパイクを目視できるようp99.9を参考記録として追加する
+            #   (判定基準には使わない。合格宣言時の40Hzベースラインとの相対比較用)。
+            p999 = dts[min(n - 1, int(n * 0.999))]
             dt_max = dts[-1]
             over_ratio = self._dtperf_over_count / n
-            print('[PERF-DT] n=%d p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms '
+            print('[PERF-DT] n=%d p50=%.2fms p95=%.2fms p99=%.2fms p999=%.2fms max=%.2fms '
                   'eff_rate=%.2fHz over_budget=%.2f%% max_consec_over=%d margin=%.3fms'
-                  % (n, p50 * 1000, p95 * 1000, p99 * 1000, dt_max * 1000,
+                  % (n, p50 * 1000, p95 * 1000, p99 * 1000, p999 * 1000, dt_max * 1000,
                      effective_rate, over_ratio * 100, self._dtperf_max_streak,
                      self._dtperf_over_margin_s * 1000),
                   flush=True)
