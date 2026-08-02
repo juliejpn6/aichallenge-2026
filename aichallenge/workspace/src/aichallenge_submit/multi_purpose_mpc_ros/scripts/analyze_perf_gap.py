@@ -313,8 +313,11 @@ def aggregate_spikes(spikes):
 # 1本のログをまとめて読み、上記アグリゲータへ通す。
 # ---------------------------------------------------------------------------
 
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
 def analyze_log(path):
-    text = Path(path).read_text(errors='replace')
+    text = _ANSI_ESCAPE_RE.sub('', Path(path).read_text(errors='replace'))
     dt = aggregate_dt(parse_perf_dt_lines(text))
     perf = aggregate_perf(parse_perf_lines(text))
     rusage = aggregate_rusage(parse_perf_rusage_lines(text))

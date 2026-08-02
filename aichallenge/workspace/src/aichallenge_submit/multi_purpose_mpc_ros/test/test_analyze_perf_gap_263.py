@@ -19,6 +19,24 @@ import analyze_perf_gap as apg  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# ANSIエスケープ除去(PartB-4実測で発覚: ROSログのカラー化により
+# 'cpu_count=16\x1b[0m'のように値の直後へエスケープシーケンスが混入する)
+# ---------------------------------------------------------------------------
+
+def test_analyze_log_strips_ansi_escape_codes(tmp_path):
+    p = tmp_path / "ansi.log"
+    p.write_text(
+        "\x1b[0m[PERF-PLATFORM] governor=performance scaling_max_freq=4000MHz "
+        "rapl_power_limit=N/A cores_sampled=4 cpu_affinity=[2, 3, 4, 5] "
+        "use_sim_time=True\x1b[0m\n"
+        "\x1b[0m[PERF-PLATFORM] cgroup=v2 cpu_quota_cores=16.00 cpuset_cpus=0-15 "
+        "memory_max=8.00GiB cpu_model=\"AMD Ryzen 9 6900HS\" cpu_count=16\x1b[0m\n")
+    result = apg.analyze_log(p)
+    assert result['platform']['cpu_count'] == '16'
+    assert result['platform']['use_sim_time'] == 'True'
+
+
+# ---------------------------------------------------------------------------
 # パーサ単体
 # ---------------------------------------------------------------------------
 
