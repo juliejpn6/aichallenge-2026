@@ -9,6 +9,13 @@ STOPPING/OVERTAKING)別に操舵角のパワースペクトル密度(PSD)を比�
 オフライン分析専用ツール。対策(offsetレート制限等)・フェイルセーフの
 実装はこのツールのスコープ外——判別結果を人間が確認してから別途設計する。
 
+2026-08-03追加(TOOL-1、汎用化): 比較軸をOT状態に固定していた実装を、
+任意のログ行パターンでラベル抽出できるよう汎用化した(--label-pattern/
+--states/--baseline)。既定値は元のOT状態比較と完全に同じ挙動を保つ
+(後方互換)。動機は複数台(対戦車2台以上)同時走行時の蛇行分析——
+[OT]ログのfwd=(前方に検知している対戦車の台数)をラベルに使えば、
+「単独走行 vs 対戦車1台 vs 対戦車2台」のPSD比較が同じ枠組みでできる。
+
 データソース:
   - 操舵角: rosbagの/control/command/control_cmd
     (autoware_auto_control_msgs/msg/AckermannControlCommand.lateral.
@@ -51,6 +58,8 @@ _ACKERMANN_FMT = '<4x iIiIff iIfff'
 
 MIN_SEGMENT_S = 8.0  # 限界サイクル周期(0.6-0.7Hz≈1.4-1.7s)の5倍相当の最低長
 LIMIT_CYCLE_BAND = (0.5, 0.9)  # Hz、既知の限界サイクル0.6-0.7Hzを包含
+DEFAULT_LABEL_PATTERN = r'\[(\d{10}\.\d+)\].*\[OT\] state=(\w+)'
+DEFAULT_STATES = ('NORMAL', 'STOPPING', 'OVERTAKING')
 # 過渡応答/目標変更由来の低周波帯パワーは、当初PSDの0.02-0.1Hz帯域として
 # 定義する予定だったが、実測でこのアプローチが機能しないことが判明した
 # (scipy.signal.welchの既定detrend='constant'がセグメント平均[DC成分]を
@@ -58,7 +67,6 @@ LIMIT_CYCLE_BAND = (0.5, 0.9)  # Hz、既知の限界サイクル0.6-0.7Hzを包
 # 帯域幅0.08Hzより粗いことが重なり、常に0.000000になる)。代わりに
 # analyze()内で生の操舵角の標準偏差(std_rad、周波数非依存の総変動幅)を
 # 参考指標として使う——詳細はanalyze()内のコメント参照。
-OT_STATES = ('NORMAL', 'STOPPING', 'OVERTAKING')
 
 
 def read_steering_series(bag_path):
@@ -93,15 +101,16 @@ def read_speed_series(bag_path):
     return series
 
 
-def read_ot_state_series(log_path):
-    """autoware.logから(epoch_timestamp, state)のリストを時刻昇順で返す
-    (OT状態遷移。同一状態への重複遷移は保持したままでよい——状態割り当て側は
-    直近の遷移だけを使うため)。"""
+def read_label_series(log_path, pattern=DEFAULT_LABEL_PATTERN):
+    """autoware.logから(epoch_timestamp, label)のリストを時刻昇順で返す
+    (ラベル遷移。patternはgroup(1)=タイムスタンプ、group(2)=ラベル文字列を
+    要求する。同一ラベルへの重複遷移は保持したままでよい——ラベル割り当て側は
+    直近の遷移だけを使うため)。既定は元のOT状態パターンと同じ。"""
     series = []
-    pattern = re.compile(r'\[(\d{10}\.\d+)\].*\[OT\] state=(\w+)')
+    regex = re.compile(pattern)
     with open(log_path, errors='replace') as f:
         for line in f:
-            m = pattern.search(line)
+            m = regex.search(line)
             if m:
                 series.append((float(m.group(1)), m.group(2)))
     series.sort(key=lambda p: p[0])
@@ -181,13 +190,21 @@ def band_power(freqs, pxx, band):
     return float(np.trapezoid(pxx[mask], freqs[mask]))
 
 
-def analyze(log_path, bag_path, sample_hz=40.0, min_segment_s=MIN_SEGMENT_S):
+def analyze(log_path, bag_path, sample_hz=40.0, min_segment_s=MIN_SEGMENT_S,
+            label_pattern=DEFAULT_LABEL_PATTERN, states=None):
+    """statesを省略すると、ログ中に実際に現れたラベルを初出順で自動採用する。"""
     steering = read_steering_series(bag_path)
     speed = read_speed_series(bag_path)
-    ot_series = read_ot_state_series(log_path)
+    label_series = read_label_series(log_path, label_pattern)
 
-    steering_states = assign_states([t for t, _ in steering], ot_series)
-    speed_states = assign_states([t for t, _ in speed], ot_series)
+    if states is None:
+        states = []
+        for _, s in label_series:
+            if s not in states:
+                states.append(s)
+
+    steering_states = assign_states([t for t, _ in steering], label_series)
+    speed_states = assign_states([t for t, _ in speed], label_series)
 
     raw_segments = segment_by_state(steering, steering_states)
     segments, excluded_count, excluded_duration = filter_min_length(
@@ -195,7 +212,7 @@ def analyze(log_path, bag_path, sample_hz=40.0, min_segment_s=MIN_SEGMENT_S):
 
     nperseg = int(min_segment_s * sample_hz)
     per_state = {}
-    for state in OT_STATES:
+    for state in states:
         state_segs = [pts for s, pts in segments if s == state]
         psds = []
         total_duration = 0.0
@@ -236,6 +253,7 @@ def analyze(log_path, bag_path, sample_hz=40.0, min_segment_s=MIN_SEGMENT_S):
 
     return {
         'per_state': per_state,
+        'states': states,
         'excluded_count': excluded_count,
         'excluded_duration_s': excluded_duration,
         'nperseg': nperseg,
@@ -243,15 +261,22 @@ def analyze(log_path, bag_path, sample_hz=40.0, min_segment_s=MIN_SEGMENT_S):
     }
 
 
-def discriminate(per_state):
-    """NORMALを基準に、非NORMAL状態の限界サイクル帯パワー比・低周波帯パワー比
-    から「励起仮説」「過渡応答」「判別不能」を報告する。対策の実装はしない、
-    判別結果の文字列を返すのみ。"""
-    normal = per_state.get('NORMAL')
+def discriminate(per_state, states=None, baseline=None):
+    """baseline(既定はstates[0])を基準に、他ラベルの限界サイクル帯パワー比・
+    低周波帯パワー比から「励起仮説」「過渡応答」「判別不能」を報告する。
+    対策の実装はしない、判別結果の文字列を返すのみ。statesを省略すると
+    既定のOT状態順(NORMAL/STOPPING/OVERTAKING)を使う(後方互換)。"""
+    if states is None:
+        states = list(DEFAULT_STATES)
+    if baseline is None:
+        baseline = states[0]
+    normal = per_state.get(baseline)
+    others = [s for s in states if s != baseline]
     if normal is None or normal['limit_cycle_power'] <= 0:
-        return {'verdict': '判別不能(NORMALのデータ不足)', 'ratios': {}}
+        return {'verdict': f'判別不能({baseline}のデータ不足)', 'ratios': {},
+                'baseline': baseline}
     ratios = {}
-    for state in ('STOPPING', 'OVERTAKING'):
+    for state in others:
         s = per_state.get(state)
         if s is None:
             ratios[state] = None
@@ -261,18 +286,19 @@ def discriminate(per_state):
                      if normal['std_rad'] and normal['std_rad'] > 0 else None)
         ratios[state] = {'limit_cycle_ratio': lc_ratio, 'std_ratio': std_ratio}
     valid_lc_ratios = [r['limit_cycle_ratio'] for r in ratios.values() if r]
+    others_label = '/'.join(others) if others else '(比較対象なし)'
     if not valid_lc_ratios:
-        verdict = '判別不能(STOPPING/OVERTAKINGのデータ不足)'
+        verdict = f'判別不能({others_label}のデータ不足)'
     elif all(r >= 2.0 for r in valid_lc_ratios):
         verdict = '励起仮説を支持(限界サイクル帯パワー比が2倍超)'
     elif all(r < 1.3 for r in valid_lc_ratios):
-        verdict = '過渡応答仮説を支持(限界サイクル帯パワー比はNORMALと同水準)'
+        verdict = f'過渡応答仮説を支持(限界サイクル帯パワー比は{baseline}と同水準)'
     else:
         verdict = '中間(明確な判別不能、両仮説とも部分的にしか支持されない)'
-    return {'verdict': verdict, 'ratios': ratios}
+    return {'verdict': verdict, 'ratios': ratios, 'baseline': baseline}
 
 
-def plot_psd(per_state, out_path):
+def plot_psd(per_state, states, out_path):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -287,18 +313,18 @@ def plot_psd(per_state, out_path):
         matplotlib.rcParams['font.family'] = ja_fonts[0]
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    colors = {'NORMAL': 'tab:blue', 'STOPPING': 'tab:orange', 'OVERTAKING': 'tab:red'}
-    for state in OT_STATES:
+    palette = plt.get_cmap('tab10').colors
+    for i, state in enumerate(states):
         s = per_state.get(state)
         if s is None:
             continue
         ax.semilogy(s['freqs'], s['pxx'], label=f"{state} (n={s['num_segments']}セグメント)",
-                    color=colors.get(state))
+                    color=palette[i % len(palette)])
     ax.axvspan(*LIMIT_CYCLE_BAND, color='gray', alpha=0.2, label='限界サイクル帯(0.5-0.9Hz)')
     ax.set_xlabel('Frequency [Hz]')
     ax.set_ylabel('PSD [rad^2/Hz]')
     ax.set_xlim(0, 2.0)
-    ax.set_title('操舵角PSD: OT状態別比較')
+    ax.set_title('操舵角PSD: ラベル別比較')
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -307,6 +333,7 @@ def plot_psd(per_state, out_path):
 
 
 def format_report(result, verdict_info, log_path, bag_path):
+    states = result['states']
     lines = []
     lines.append(f"# 蛇行PSD分析: {log_path} / {bag_path}")
     lines.append('')
@@ -316,8 +343,8 @@ def format_report(result, verdict_info, log_path, bag_path):
                  f"{result['excluded_count']}件 "
                  f"(合計{result['excluded_duration_s']:.1f}s)")
     lines.append('')
-    lines.append('## 状態別バンドパワー')
-    for state in OT_STATES:
+    lines.append('## ラベル別バンドパワー')
+    for state in states:
         s = result['per_state'].get(state)
         if s is None:
             lines.append(f"{state}: データ不足(セグメント無し)")
@@ -332,7 +359,7 @@ def format_report(result, verdict_info, log_path, bag_path):
             f"操舵角std(周波数非依存の参考指標)={std_str} "
             f"全帯域パワー={s['total_power']:.6f}")
     lines.append('')
-    lines.append('## 対NORMAL比')
+    lines.append(f"## 対{verdict_info['baseline']}比")
     for state, r in verdict_info['ratios'].items():
         if r is None:
             lines.append(f"{state}: N/A")
@@ -350,20 +377,36 @@ def _fmt_ratio(v):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='OT状態別の操舵角PSD比較(蛇行=限界サイクル励起 vs 過渡応答の判別)')
-    parser.add_argument('log', help='autoware.log(OT状態遷移の抽出元)')
+        description='任意ラベル別の操舵角PSD比較(蛇行=限界サイクル励起 vs 過渡応答の判別)。'
+                     '既定はOT状態(NORMAL/STOPPING/OVERTAKING)比較。')
+    parser.add_argument('log', help='autoware.log(ラベル遷移の抽出元)')
     parser.add_argument('bag', help='rosbag(.mcap、操舵角・速度の抽出元)')
     parser.add_argument('--sample-hz', type=float, default=40.0,
                          help='等間隔リサンプリング後のサンプリングレート(既定40Hz)')
     parser.add_argument('--out-dir', default='.', help='PSDプロット(PNG)の出力先')
+    parser.add_argument('--label-pattern', default=DEFAULT_LABEL_PATTERN,
+                         help='ラベル抽出用正規表現。group(1)=タイムスタンプ(epoch秒)、'
+                              'group(2)=ラベル文字列を要求する。既定はOT状態'
+                              r'(例: 対戦車台数別なら \[OT\].*?fwd=(\d+) 等)')
+    parser.add_argument('--states', default=None,
+                         help='比較対象ラベルをカンマ区切りで指定(省略時はログ出現順で自動検出)')
+    parser.add_argument('--baseline', default=None,
+                         help='比率算出の基準ラベル(省略時は--statesの先頭、または自動検出の初出ラベル)')
     args = parser.parse_args(argv)
 
-    result = analyze(args.log, args.bag, sample_hz=args.sample_hz)
-    verdict_info = discriminate(result['per_state'])
+    if args.states:
+        states = args.states.split(',')
+    elif args.label_pattern == DEFAULT_LABEL_PATTERN:
+        states = list(DEFAULT_STATES)  # 後方互換: 既定パターンではOT状態の固定順を維持
+    else:
+        states = None  # 独自パターン時はログ出現順で自動検出
+    result = analyze(args.log, args.bag, sample_hz=args.sample_hz,
+                      label_pattern=args.label_pattern, states=states)
+    verdict_info = discriminate(result['per_state'], result['states'], baseline=args.baseline)
     print(format_report(result, verdict_info, args.log, args.bag))
 
     out_path = Path(args.out_dir) / 'steering_psd.png'
-    plot_psd(result['per_state'], out_path)
+    plot_psd(result['per_state'], result['states'], out_path)
     print(f"\nプロット保存: {out_path}")
     return 0
 
