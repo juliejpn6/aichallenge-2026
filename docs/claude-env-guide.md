@@ -58,8 +58,27 @@ CLAUDE.mdの内容(特に§3禁止リスト)が実態とズレていないかを
    `permissions.allow`/`permissions.ask`へ追記する。
 4. 新しいセッションで動作確認する(フックはセッション開始時に読み込まれる)。
 
-承認後は、設定結果をClaude Codeへ報告するプロンプトのテンプレートを使うと
-記録が残しやすい(セッション内で提示済み・再利用可)。
+承認後は、以下のテンプレートでClaude Codeへ結果を報告すると記録が残しやすい
+(コピーして値を埋めるだけで使える):
+
+```
+[環境設定 結果報告] YYYY-MM-DD
+
+承認/適用した項目:
+- [ ] Stopフック(scripts/check_race_config.sh)を有効化
+- [ ] PreToolUseフック(claude_md_edit_guard.sh、CLAUDE.md・安全判定系ファイル編集時の確認)を有効化
+- [ ] permissions-proposal.jsonのproposed_allowから追記した項目: (列挙)
+- [ ] permissions-proposal.jsonのproposed_askから追記した項目: (列挙)
+- [ ] その他: (自由記述)
+
+見送った項目・条件を変えて適用した項目:
+(自由記述。理由も一言添えてください)
+
+Claudeへの依頼:
+- 上記をdocs/claude-env-guide.mdの状態と整合するよう確認してください
+- /status を実行して整合性を確認してください
+- 動作確認(CLAUDE.md編集時にask確認が出るか等)の結果も併せて報告してください
+```
 
 ## CLAUDE.md更新diffのレビュー観点
 
