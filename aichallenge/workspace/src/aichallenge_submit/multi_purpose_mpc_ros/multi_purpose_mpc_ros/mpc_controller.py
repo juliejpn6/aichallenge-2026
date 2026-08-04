@@ -1117,6 +1117,8 @@ class MPCController(Node):
                 "infeas_thr", int(_stkget("infeas_thr", 300)))  # [周期] H4-liteに猶予を与えた上でこれ以上連続infeasibleなら即発動(≈7.5s@40Hz)
             self._stuck_gear_settle_cycles = self._rate_scaled_cycles(
                 "gear_settle_cycles", int(_stkget("gear_settle_cycles", 20)))  # [周期] ギア確定待ち(≈0.5s)
+            self._stuck_gear_park_dwell_cycles = self._rate_scaled_cycles(
+                "gear_park_dwell_cycles", int(_stkget("gear_park_dwell_cycles", 40)))  # [周期] WAIT_PARK固定滞留(≈1.0s、confirmedを信用しない)
             self._stuck_backup_dist = float(_stkget("backup_dist", 2.0))  # [m] 後退距離
             self._stuck_backup_speed = float(_stkget("backup_speed", -3.0))  # [m/s] サンプル準拠
             self._stuck_backup_accel = float(_stkget("backup_accel", 1.5))   # [m/s^2] サンプル準拠
@@ -1214,7 +1216,7 @@ class MPCController(Node):
             #   が進むたびに反転し、PUSHの操舵方向候補を毎回変える
             self._stuck_episode_last_end_time = None  # 直近のPUSH/断念完了時刻(シャッフル判定用)
             self._stuck_episode_last_pose = None      # 同上、完了時の位置
-            self._stuck_state = "NORMAL"   # NORMAL/WAIT_REVERSE/BACKUP/WAIT_DRIVE_PUSH/PUSH
+            self._stuck_state = "NORMAL"   # NORMAL/WAIT_PARK/WAIT_REVERSE/BACKUP/WAIT_DRIVE_PUSH/PUSH
             # (2026-07-24, 171節続報: WAIT_DRIVEは経路1/2専用の直進復帰だったが、経路を
             #   問わずWAIT_DRIVE_PUSH→PUSHへ統一したため到達不能になり削除した)
             self._stuck_count = 0          # 指令/実速度乖離の連続周期数(経路1)
@@ -1854,9 +1856,16 @@ class MPCController(Node):
         _handle_stuck_recovery呼び出し)が手作業で複製されており、ログメッセージ
         (path=1/2 vs path=3で文言が異なる)のみが呼び出し元固有だった。呼び出し元は
         本ヘルパー呼び出し後に直ちにreturnするため、returnはこのヘルパーに含めない
-        (制御フローの分岐点は呼び出し元に残す)。"""
+        (制御フローの分岐点は呼び出し元に残す)。
+        2026-08-04修正(ユーザー確認: D→Rへ直接シフトできず、D→P→Rの順でのみ
+        Rレンジが入る実車/AWSIM双方の仕様): 従来はここで直接WAIT_REVERSEへ突入し
+        GearCommand.REVERSEを送り続けていたが、これは「Pを経由しないR要求」に
+        相当し、ローカル環境でgear_report=PARKのままREVERSEへ一切遷移しない事象
+        ([[local-awsim-reverse-gear-unreliable]])の一因だった可能性がある。
+        WAIT_PARK(新設、PARKを送りgear_settle_cycles確定待ち)をWAIT_REVERSEの
+        前段に挿入し、必ずP経由でRへ向かうようにする。"""
         self._stuck_update_shuffle_cycle(now, pose)  # 184節追加
-        self._stuck_state = "WAIT_REVERSE"
+        self._stuck_state = "WAIT_PARK"
         self._stuck_count = 0
         self._stuck_stall_count = 0
         self._stuck_gear_wait_count = 0
@@ -2071,7 +2080,7 @@ class MPCController(Node):
         return float(_mag if _plan_side > 0 else -_mag)
 
     def _handle_stuck_recovery(self, now, pose) -> None:
-        """スタック復帰の状態機械(WAIT_REVERSE/BACKUP/WAIT_DRIVE/WAIT_DRIVE_PUSH/PUSH)。
+        """スタック復帰の状態機械(WAIT_PARK/WAIT_REVERSE/BACKUP/WAIT_DRIVE/WAIT_DRIVE_PUSH/PUSH)。
         2026-07-09追加、2026-07-10改修(起動猶予/infeasibility経路/ギア確認/経路3+PUSH)。
         後退値はAutoware公式サンプル(autoware_practice_course/backward.cpp)準拠(ユーザー承認済み)。
         2026-07-10: 実測で/vehicle/status/gear_statusがこの環境では配信されず、GearReport確認への
@@ -2090,7 +2099,32 @@ class MPCController(Node):
         gear_cmd = GearCommand()
         gear_cmd.stamp = now.to_msg()
 
-        if self._stuck_state == "WAIT_REVERSE":
+        if self._stuck_state == "WAIT_PARK":
+            # 2026-08-04追加(ユーザー確認: D→Rへ直接シフトできず、D→P→Rの順でのみ
+            #   Rレンジが入る仕様): WAIT_REVERSEの前段として必ずPARKを経由する。
+            # 2026-08-04同日さらに修正: 実測(本日5件、全てwp282-289帯)で、この直後の
+            #   P→R遷移(WAIT_REVERSE)が毎回失敗していた。ログ調査の結果、WAIT_PARK
+            #   突入直後(1周期未満)にgear_report.report==PARKが既に真になっており
+            #   即座にconfirmed扱いで通過していた——直前エピソード(STUCK-BACKUP-BLOCKED
+            #   giveup等)の残存状態を拾っているだけで、「今回のPARK要求が実際に処理された」
+            #   ことの確認になっていない疑いが強い。confirmedを信用せず、
+            #   gear_park_dwell_cycles周期は無条件で滞留してからWAIT_REVERSEへ進む
+            #   (ローカルAWSIM限定の既知問題への対策、詳細は
+            #   [[stuck-normal-handoff-infinite-loop-wall-pin-0804]]。実地未検証)。
+            gear_cmd.command = GearCommand.PARK
+            self._gear_cmd_pub.publish(gear_cmd)
+            self._stuck_gear_wait_count += 1
+            _confirmed = (self._gear_report.report == GearReport.PARK)
+            if self._stuck_gear_wait_count >= self._stuck_gear_park_dwell_cycles:
+                self.get_logger().warn(
+                    f"[STUCK] gear=PARK {'confirmed' if _confirmed else '未確認だが規定周期経過'} "
+                    f"(実際のgear_report={self._gear_label(self._gear_report.report)}) -> WAIT_REVERSEへ")
+                self._stuck_state = "WAIT_REVERSE"
+                self._stuck_gear_wait_count = 0
+            u = [0.0, 0.0]
+            acc = self._stuck_hold_accel
+
+        elif self._stuck_state == "WAIT_REVERSE":
             gear_cmd.command = GearCommand.REVERSE
             self._gear_cmd_pub.publish(gear_cmd)
             self._stuck_gear_wait_count += 1

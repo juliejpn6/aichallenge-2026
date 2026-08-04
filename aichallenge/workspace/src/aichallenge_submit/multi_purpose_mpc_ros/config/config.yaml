@@ -225,6 +225,12 @@ stuck_recovery:
   hold_cycles: 60        # [周期] 継続でスタック判定(≈1.5s@40Hz。252節で120→60へ短縮)
   infeas_thr: 300        # [周期] u0を問わず連続infeasibleで即発動(≈7.5s@40Hz)
   gear_settle_cycles: 20 # [周期] ギア切替の確定待ち(≈0.5s@40Hz、GearReport未配信環境向けの保険)
+  # 2026-08-04追加: WAIT_PARKで「gear_report==PARK」が実質0周期で即confirmed=Trueに
+  #   なる(前エピソードの残存状態を拾っている可能性)実測が本日5件見つかり、
+  #   P→R遷移(WAIT_REVERSE)が全件失敗する主因の疑いが強い。confirmedを信用せず、
+  #   WAIT_PARKは常にこの周期数だけ滞留してからWAIT_REVERSEへ進む(ローカルAWSIM
+  #   限定の既知問題への対策、詳細は[[stuck-normal-handoff-infinite-loop-wall-pin-0804]])。
+  gear_park_dwell_cycles: 40 # [周期] WAIT_PARKの固定滞留(≈1.0s@40Hz、gear_settle_cyclesの2倍から開始)
   backup_dist: 2.0       # [m] 後退距離
   backup_speed: -3.0     # [m/s] サンプル準拠
   backup_accel: 1.5      # [m/s^2] サンプル準拠

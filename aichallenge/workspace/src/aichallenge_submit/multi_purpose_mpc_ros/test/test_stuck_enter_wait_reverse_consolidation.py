@@ -34,9 +34,12 @@ def _helper_body():
 # ---------------------------------------------------------------------------
 
 def test_helper_contains_full_reset_set():
+    """2026-08-04更新: D→Rへ直接シフトできずD→P→Rの順でのみRレンジが入る仕様
+    (ユーザー確認)への対処により、ヘルパーの突入先はWAIT_REVERSEから
+    WAIT_PARK(新設、Pを経由してからWAIT_REVERSEへ進む前段)へ変更された。"""
     snippet = _helper_body()
     assert "self._stuck_update_shuffle_cycle(now, pose)" in snippet
-    assert 'self._stuck_state = "WAIT_REVERSE"' in snippet
+    assert 'self._stuck_state = "WAIT_PARK"' in snippet
     assert "self._stuck_count = 0" in snippet
     assert "self._stuck_stall_count = 0" in snippet
     assert "self._stuck_gear_wait_count = 0" in snippet
