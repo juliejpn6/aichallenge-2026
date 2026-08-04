@@ -403,7 +403,8 @@ class SpatialBicycleModel(ABC):
 #################
 
 class BicycleModel(SpatialBicycleModel):
-    def __init__(self, reference_path, length, width, Ts, actuator_lag_tau_s=0.19,
+    def __init__(self, reference_path, length, width, Ts, actuator_lag_tau_s=0.16,
+                 actuator_gain=1.0,
                  use_curvature_bias_correction=False,
                  curvature_bias_slope=0.772, curvature_bias_intercept=0.016):
         """
@@ -434,7 +435,23 @@ class BicycleModel(SpatialBicycleModel):
             疑いが生じたため、修正後の実装でtau=190ms(予選環境相当のフル遅延)を
             探索的に再検証する(0.13から一時変更)。0.0を指定するとdelta_actual_next=
             delta_cmd(瞬時追従)となり旧3状態モデルと数学的に完全一致する
-            (下位互換の保証、テストで検証)。
+            (下位互換の保証、テストで検証)。213節でtau=240msを試したが悪化し190msへ
+            復元、208節でAXIS06クローズ(190ms確定)。2026-08-03、`analyze_actuator_delay.py`
+            のFOPDT実測(v_max=15/20km/h×Q=700k/1.0Mの4条件中3条件で一致)でtau=160msと
+            判明したため、190ms→160msへ変更(design_docs/axis06_gain_correction_design_
+            20260803.md参照、緩和策①[ゲイン]棄却後の次善策)。150ms・Q=1.0Mとの組み合わせも
+            ローカルA/Bで比較した結果、160ms・Q=700k(現行Q維持)が最良(wp269-282ホットスポット
+            PASS、対数減衰率0.88)と確定し、予選環境での検証へ進む。
+        :param actuator_gain: delta_actualが定常状態で収束する先を、指令deltaの
+            何倍にするかのゲイン | 無次元(既定1.0、下位互換)。2026-08-03、
+            `analyze_actuator_delay.py`のestimate_gain_continuousによる実測
+            (通常走行域|指令振幅|0-30°で4条件(v_max=15/20km/h×Q=700k/1.0M)すべて
+            0.63-0.78、既知値0.67と整合)に基づき導入。連続時間モデルを
+            d(delta_actual)/dt = (actuator_gain*delta - delta_actual)/tauへ変更し、
+            定常状態でdelta_actual→actuator_gain*deltaに収束するようにする。
+            1.0を指定すると全ての変更箇所で乗算が1倍になり、旧モデルと数学的に
+            完全一致する(下位互換の保証、テストで検証)。設計根拠:
+            design_docs/axis06_gain_correction_design_20260803.md参照。
         """
 
         # Initialize base class
@@ -442,6 +459,7 @@ class BicycleModel(SpatialBicycleModel):
                                            width=width, Ts=Ts)
 
         self.actuator_lag_tau_s = max(0.0, actuator_lag_tau_s)
+        self.actuator_gain = float(actuator_gain)
         self.use_curvature_bias_correction = bool(use_curvature_bias_correction)
         self.curvature_bias_slope = float(curvature_bias_slope)
         self.curvature_bias_intercept = float(curvature_bias_intercept)
@@ -521,10 +539,11 @@ class BicycleModel(SpatialBicycleModel):
         d_e_psi_d_s = psi_dot / s_dot - kappa
         d_t_d_s = 1 / s_dot
 
-        # delta_actualの一次遅れ(連続時間: d(delta_actual)/dt=(delta-delta_actual)/tau)
-        # を空間微分へ変換(2026-07-27再実装)。tau=0(無効)はゼロ除算を避けepsを使う。
+        # delta_actualの一次遅れ(連続時間: d(delta_actual)/dt=(actuator_gain*delta-delta_actual)/tau)
+        # を空間微分へ変換(2026-07-27再実装、2026-08-03にactuator_gain追加)。
+        # tau=0(無効)はゼロ除算を避けepsを使う。
         tau = max(self.actuator_lag_tau_s, self.eps)
-        d_delta_actual_d_s = (delta - delta_actual) / (tau * s_dot)
+        d_delta_actual_d_s = (self.actuator_gain * delta - delta_actual) / (tau * s_dot)
 
         return np.array([d_e_y_d_s, d_e_psi_d_s, d_t_d_s, d_delta_actual_d_s])
 
@@ -567,7 +586,11 @@ class BicycleModel(SpatialBicycleModel):
         a_2 = np.array([-kappa_ref ** 2 * delta_s, 1, 0, delta_s * (1 - alpha)])
 
         b_1 = np.array([0, 0])
-        b_2 = np.array([0, delta_s * alpha])
+        # delta_actual_{k+1} = (1-alpha)*delta_actual_k + alpha*actuator_gain*delta_k
+        # (2026-08-03、actuator_gain追加)。e_psi行(b_2)もdelta_actual_{k+1}経由で
+        # 同じゲインを受け取る。a_2[3](delta_actual_kの係数)は前ステップ状態の持続
+        # なのでactuator_gainの影響を受けない。
+        b_2 = np.array([0, delta_s * alpha * self.actuator_gain])
 
         if v_ref == 0:
             a_3 = np.array([0, 0, 1, 0])
@@ -579,7 +602,7 @@ class BicycleModel(SpatialBicycleModel):
             a_3 = np.array([-kappa_ref / v_ref * delta_s, 0, 1, 0])
             b_3 = np.array([-1 / (v_ref ** 2) * delta_s, 0])
             a_4 = np.array([0, 0, 0, 1 - alpha])
-            b_4 = np.array([0, alpha])
+            b_4 = np.array([0, alpha * self.actuator_gain])
             f = np.array([0.0, 0.0, 1 / v_ref * delta_s, 0.0])
 
         A = np.stack((a_1, a_2, a_3, a_4), axis=0)

@@ -195,6 +195,141 @@ def estimate_delay_by_edges(steering_cmd, steering_act,
     }
 
 
+GAIN_MAGNITUDE_BINS_DEG = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 90.0]  # |Δcmd|のビン境界
+GAIN_SETTLE_WINDOW_S = (0.3, 0.7)  # [s] エッジ後、この区間の平均を「整定値」とみなす
+
+
+def estimate_gain_by_magnitude(steering_cmd, steering_act, threshold_deg=EDGE_THRESHOLD_DEG,
+                                settle_window=GAIN_SETTLE_WINDOW_S,
+                                bins_deg=GAIN_MAGNITUDE_BINS_DEG):
+    """①大舵角ゲイン仮説(実舵角が指令に対しゲイン<1で追従し、大舵角ほど
+    ゲインが下がるのでは)を直接検証する。指令の急変(エッジ)ごとに、
+    エッジ前後で指令・実測をそれぞれsettle_window秒平均して差分を取り、
+    ratio=Δact/Δcmdを求める。|Δcmd|の大きさでビン分けし、ビンごとの
+    平均ratioを見ることで、大舵角ほどゲインが下がるかを確認する。"""
+    cmd_t = np.array([p[0] for p in steering_cmd])
+    cmd_v = np.degrees(np.array([p[1] for p in steering_cmd]))
+    act_t = np.array([p[0] for p in steering_act])
+    act_v = np.degrees(np.array([p[1] for p in steering_act]))
+
+    edges = detect_edges(cmd_t, cmd_v, threshold_deg)
+    samples = []
+    for idx in edges:
+        t0 = cmd_t[idx]
+        cmd_base_mask = (cmd_t >= t0 - 0.1) & (cmd_t < t0)
+        cmd_settle_mask = (cmd_t >= t0 + settle_window[0]) & (cmd_t <= t0 + settle_window[1])
+        act_base_mask = (act_t >= t0 - 0.1) & (act_t < t0)
+        act_settle_mask = (act_t >= t0 + settle_window[0]) & (act_t <= t0 + settle_window[1])
+        if not (np.any(cmd_base_mask) and np.any(cmd_settle_mask)
+                and np.any(act_base_mask) and np.any(act_settle_mask)):
+            continue
+        d_cmd = float(np.mean(cmd_v[cmd_settle_mask]) - np.mean(cmd_v[cmd_base_mask]))
+        d_act = float(np.mean(act_v[act_settle_mask]) - np.mean(act_v[act_base_mask]))
+        if abs(d_cmd) < threshold_deg:
+            continue
+        samples.append((abs(d_cmd), d_act / d_cmd))
+
+    bin_stats = []
+    for lo, hi in zip(bins_deg[:-1], bins_deg[1:]):
+        in_bin = [ratio for mag, ratio in samples if lo <= mag < hi]
+        if in_bin:
+            bin_stats.append({'lo': lo, 'hi': hi, 'n': len(in_bin),
+                               'mean_gain': float(np.mean(in_bin)),
+                               'median_gain': float(np.median(in_bin))})
+        else:
+            bin_stats.append({'lo': lo, 'hi': hi, 'n': 0, 'mean_gain': None, 'median_gain': None})
+    return {'n_edges': len(edges), 'n_samples': len(samples), 'bins': bin_stats}
+
+
+def estimate_gain_continuous(steering_cmd, steering_act, tau_s, sample_hz=40.0,
+                              bins_deg=GAIN_MAGNITUDE_BINS_DEG):
+    """エッジ法(estimate_gain_by_magnitude)は通常走行中に離散的なステップ状の
+    指令変化がほぼ存在しない(MPCが毎周期連続的に指令を更新するため)ため、
+    有効サンプルがほぼ得られなかった。代わりに、fit_fopdtで求めたtau(L=0)を
+    使い「ゲイン=1と仮定した場合の予測応答」(fopdt_predict)を連続的に生成し、
+    実測値との回帰(原点通過、act=gain*pred)を|予測振幅|のビューごとに行う
+    ことで、大舵角ほどゲインが低下するか(①大舵角ゲイン仮説)を全区間の
+    連続データから直接検証する。"""
+    cmd_t = np.array([p[0] for p in steering_cmd])
+    cmd_v = np.degrees(np.array([p[1] for p in steering_cmd]))
+    act_t = np.array([p[0] for p in steering_act])
+    act_v = np.degrees(np.array([p[1] for p in steering_act]))
+
+    t_lo = max(cmd_t[0], act_t[0])
+    t_hi = min(cmd_t[-1], act_t[-1])
+    if t_hi <= t_lo:
+        return None
+    grid = np.arange(t_lo, t_hi, 1.0 / sample_hz)
+    if len(grid) < 10:
+        return None
+    pred = fopdt_predict(cmd_t, cmd_v, grid, 0.0, tau_s)
+    act_i = np.interp(grid, act_t, act_v)
+
+    bin_stats = []
+    for lo, hi in zip(bins_deg[:-1], bins_deg[1:]):
+        mask = (np.abs(pred) >= lo) & (np.abs(pred) < hi)
+        n = int(np.sum(mask))
+        if n < 20 or np.sum(pred[mask] ** 2) < 1e-9:
+            bin_stats.append({'lo': lo, 'hi': hi, 'n': n, 'gain': None})
+            continue
+        gain = float(np.sum(act_i[mask] * pred[mask]) / np.sum(pred[mask] ** 2))
+        bin_stats.append({'lo': lo, 'hi': hi, 'n': n, 'gain': gain})
+    return {'n_total': len(grid), 'bins': bin_stats}
+
+
+def format_gain_continuous_report(results):
+    lines = []
+    lines.append('# 大舵角ゲイン仮説の検証(連続データ、|予測振幅|ビュー別 回帰ゲイン)')
+    lines.append('')
+    lines.append('fit_fopdtのtau(L=0)でゲイン=1想定の予測応答を生成し、実測との原点通過'
+                 '回帰(act=gain*pred)をビン別に実施。gain<1ならゲイン不足、大舵角ビンほど'
+                 'gainが下がれば①大舵角ゲイン仮説を支持。')
+    lines.append('')
+    for r in results:
+        g = r.get('gain_continuous')
+        lines.append(f"## {r['label']}")
+        if g is None:
+            lines.append('データ不足')
+            lines.append('')
+            continue
+        lines.append(f"n_total={g['n_total']}")
+        lines.append('')
+        lines.append('| |予測振幅|範囲[deg] | n | gain |')
+        lines.append('|---|---|---|')
+        for b in g['bins']:
+            if b['gain'] is None:
+                lines.append(f"| {b['lo']:.0f}-{b['hi']:.0f} | {b['n']} | N/A(データ不足) |")
+            else:
+                lines.append(f"| {b['lo']:.0f}-{b['hi']:.0f} | {b['n']} | {b['gain']:.3f} |")
+        lines.append('')
+    return '\n'.join(lines)
+
+
+def format_gain_report(results):
+    lines = []
+    lines.append('# 大舵角ゲイン仮説の検証(|Δcmd|ビン別 実測/指令 ratio)')
+    lines.append('')
+    lines.append(f'エッジ後settle_window={GAIN_SETTLE_WINDOW_S[0]}-{GAIN_SETTLE_WINDOW_S[1]}s平均で'
+                 'Δact/Δcmdを算出。ratio<1ならゲイン不足、大舵角ビンほどratioが下がれば'
+                 '①大舵角ゲイン仮説を支持。')
+    lines.append('')
+    for r in results:
+        g = r['gain']
+        lines.append(f"## {r['label']}")
+        lines.append(f"n_edges={g['n_edges']} n_samples(有効)={g['n_samples']}")
+        lines.append('')
+        lines.append('| |Δcmd|範囲[deg] | n | mean gain | median gain |')
+        lines.append('|---|---|---|---|')
+        for b in g['bins']:
+            if b['n'] == 0:
+                lines.append(f"| {b['lo']:.0f}-{b['hi']:.0f} | 0 | - | - |")
+            else:
+                lines.append(f"| {b['lo']:.0f}-{b['hi']:.0f} | {b['n']} | "
+                              f"{b['mean_gain']:.3f} | {b['median_gain']:.3f} |")
+        lines.append('')
+    return '\n'.join(lines)
+
+
 def analyze_bag(bag_path, label, sample_hz=40.0, mode='steering'):
     """mode='steering': 操舵指令→実測操舵角(ローカルのみ、tau=190msと同じ量)。
     mode='yawrate': 操舵指令→実測ヨーレート(予選でも測定可、L_effは車両
@@ -208,7 +343,13 @@ def analyze_bag(bag_path, label, sample_hz=40.0, mode='steering'):
         noise_floor = RESPONSE_NOISE_FLOOR_DEG
     fopdt = fit_fopdt(steering_cmd, response, sample_hz=sample_hz)
     edges = estimate_delay_by_edges(steering_cmd, response, noise_floor_deg=noise_floor)
+    gain = (estimate_gain_by_magnitude(steering_cmd, response) if mode == 'steering' else None)
+    gain_continuous = None
+    if mode == 'steering' and fopdt is not None:
+        gain_continuous = estimate_gain_continuous(steering_cmd, response, fopdt['tau_s'],
+                                                     sample_hz=sample_hz)
     return {'label': label, 'bag_path': bag_path, 'mode': mode, 'fopdt': fopdt, 'edges': edges,
+            'gain': gain, 'gain_continuous': gain_continuous,
             'n_cmd': len(steering_cmd), 'n_act': len(response)}
 
 
@@ -267,6 +408,11 @@ def main(argv=None):
         results.append(analyze_bag(bag_path, label, sample_hz=args.sample_hz, mode=args.mode))
 
     print(format_report(results, default_tau_s=args.default_tau_s))
+    if args.mode == 'steering':
+        print()
+        print(format_gain_report(results))
+        print()
+        print(format_gain_continuous_report(results))
     return 0
 
 

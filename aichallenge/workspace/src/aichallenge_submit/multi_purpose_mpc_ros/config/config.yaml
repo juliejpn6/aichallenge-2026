@@ -51,6 +51,12 @@ bicycle_model:
   use_curvature_bias_correction: false
   curvature_bias_slope: 0.772
   curvature_bias_intercept: 0.016
+  # actuator_gain: delta_actual状態が定常収束する先を指令deltaの何倍にするか(既定1.0)。
+  #   2026-08-03、ローカル実走行でgain=0.67を試したところ「切りすぎ(過剰操舵)」が
+  #   目視で確認され、estimate_gain_continuousの実測(0.67)自体が振動信号への回帰に
+  #   よる過小評価アーティファクトだった疑いが強まったため、1.0(無効)へ復元。
+  #   design_docs/axis06_gain_correction_design_20260803.md参照(再検証要)。
+  actuator_gain: 1.0
 
 mpc:
   N: 20

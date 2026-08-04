@@ -76,14 +76,19 @@ def test_bicycle_model_n_states_is_4():
     assert len(car.spatial_state) == 4
 
 
-def test_default_tau_is_190ms_when_unspecified():
+def test_default_tau_is_160ms_when_unspecified():
     """mpc_controller.py/path_constraints_provider.pyのcreate_car()はtau引数を
     渡していないため、この既定値がそのまま使われる(config.yaml非依存、201節)。
     202/203節続報を経てtau=190msを確定・AXIS06クローズ(208節)。213節でtau=240ms
     (Test A、持続直線蛇行対策)を試したが、実測で持続直線std 3.17→4.40°・コーナー
-    立ち上がり後std 6.10→7.14°と両方悪化したため190msへ復元した。"""
+    立ち上がり後std 6.10→7.14°と両方悪化したため190msへ復元した。2026-08-03、
+    `analyze_actuator_delay.py`のFOPDT実測(v_max=15/20km/h×Q=700k/1.0Mの4条件中3条件
+    で一致)でtau=160msと判明したため190msから変更(緩和策①[ゲイン]棄却後の次善策)。
+    150msも別途ローカルA/Bで検証したが、160ms/150msどちらが優れるかは指標により逆転し
+    (design_docs/axis06_gain_correction_design_20260803.md参照)、現在は160msを既定値
+    として採用中。"""
     car = BicycleModel(reference_path=_RefPathStub(), length=1.0, width=0.5, Ts=0.1)
-    assert car.actuator_lag_tau_s == pytest.approx(0.19)
+    assert car.actuator_lag_tau_s == pytest.approx(0.16)
 
 
 # ---------------------------------------------------------------------------
