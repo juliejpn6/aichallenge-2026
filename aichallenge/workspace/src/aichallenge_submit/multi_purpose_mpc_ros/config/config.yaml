@@ -79,7 +79,7 @@ mpc:
   delta_max_deg: 52.0 # degrees (iASL値。物理最大転舵角80°に対するMPC側ソフト上限)
   # アクチュエータ実測(2026-07-03): 実舵レート上限≈109°/s → raw 1.1rad/sに較正済み確定値。
   steer_rate_max: 1.1 # rad/s raw
-  control_rate: 40.0 # Hz。72Hz化調査は継続中(未採用)。詳細はdesign_docs/mpc-control-rate-increase-design.md参照
+  control_rate: 40.0 # Hz。72Hz化調査は継続中(未採用)。2026-08-04: PartA(FAILSAFEストール注入テスト)をSet A同一構成でクリーンに検証するため40Hzへ復元。詳細はdocs/superpowers/specs/2026-07-31-mpc-control-rate-increase-design.md参照
   # mpc_controllerプロセスをos.sched_setaffinityで指定コアへ固定する72Hz調査用の実験パラメータ
   #   (262節続報)。既定は空リスト=無効(現状と完全に同一挙動)。レートスケーリング対象外。
   cpu_affinity: []  # 例: [2, 3] で論理CPU2-3へ固定。空なら無効
@@ -110,10 +110,10 @@ mpc:
   use_max_kappa_pred: false # CSV kappaの過大スパイクにMPCが踊らされるのを防ぐ(iASL確定)
   # debug_extra_actuator_delay_s: 予選環境との遅延差分をローカルで再現する実験用パラメータ
   #   (196/197節)。既定0.0=完全に無効。rqtでライブ変更可。競技提出時は必ず0.0のまま維持すること。
-  debug_extra_actuator_delay_s: 0.0 # [s]
+  debug_extra_actuator_delay_s: 0.0 # [s] 2026-08-04: 予選提出前チェック(CLAUDE.md §1.2)により0.0へ復元
   # enable_diag_log: STEER-XCORR等の1Hz診断計算・ログI/Oの有効化(214節、予選3vCPU対策)。
   #   既定true(ローカル調査継続のため)、予選提出時のみfalseへ切り替える運用。
-  enable_diag_log: true
+  enable_diag_log: false # 2026-08-04: 予選提出前チェック(CLAUDE.md §1.2)によりfalseへ
   # line_follow_w: 横目標を「壁コリドー中心」(0.0)〜「レースライン」(1.0)へブレンドする重み。
   #   179節の検証で単独犯ではないと判明し中間値0.5で確定(詳細はMPCパラメータ一覧⑥参照)。
   line_follow_w: 0.5
@@ -157,8 +157,13 @@ mpc:
   #v_max: 15.0
   #ay_max: 5.5
 
-  # Q0(Q[e_y])は700,000で確定(2026-07-30、v_max=20km/h再スイープ2巡目パターン3、250節)。
-  Q: [700000.0, 100000000.0, 200000.0, 0.0]
+  # Q0(Q[e_y])は200,000で確定(2026-08-04、予選実地A/B/C比較、stage15 278節)。
+  #   250節の700,000確定判断は270-271節の対数スイープ知見と矛盾していたが、
+  #   実地(Set A vs Set B)で200,000が直線層wobble_std(17.35→5.87°)・
+  #   wp269-282 p95|ekf_ey|(1.99→1.64m)とも明確に優位と確認され、250節の判断を覆した。
+  # Q1(Q[e_psi])は1,000,000で確定(2026-08-04、ハード制約[wp269-282 stall/p95]先行判定、
+  #   stage15 273-275節)。旧基準1e8から変更。
+  Q: [200000.0, 1000000.0, 200000.0, 0.0]
   QN: [1000000.0, 1000.0, 10000.0, 0.0]
   # ay_profile: 曲率エンベロープ(v_max非適用)専用の横G予算。ヘアピン実測で較正済み確定値。
   ay_profile: 2.6

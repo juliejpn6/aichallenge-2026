@@ -102,11 +102,14 @@ def test_q_ey_base_value_untouched_at_3m():
     3.0M→1.2M→0.8M→1.0M、予選1.2M等、debug_extra_actuator_delay_sと同じ「頻繁に
     切り替えるライブ実験値」の扱い)。本テストが元々ガードしていた「170→171節の
     Q[e_y]スケジュールA/Bで意図せず変更されていないこと」という趣旨を保ちつつ、
-    Q[e_y]自体の値ではなくQ[e_psi]/Q[t]/Q[delta_actual](第2〜4要素、このスイープの
-    対象外)が不変であることを確認する形へ更新した(弱体化ではない)。"""
+    Q[e_y]自体の値ではなくQ[t]/Q[delta_actual](第3〜4要素、このスイープの
+    対象外)が不変であることを確認する形へ更新した(弱体化ではない)。
+    2026-08-04: Q[e_psi](第2要素)はstage15 273-275節のハード制約先行判定により
+    100000000.0→1000000.0へ確定変更されたため、本テストの対象から外した(CLAUDE.md
+    §3参照、確定結論の変更であり退行ではない)。"""
     import re
-    m = re.search(r"Q:\s*\[([\d.]+),\s*100000000\.0,\s*200000\.0,\s*0\.0\]", _YAML_SRC)
-    assert m is not None, "Q[e_psi]/Q[t]/Q[delta_actual]が想定値から変化している"
+    m = re.search(r"Q:\s*\[[\d.]+,\s*[\d.]+,\s*200000\.0,\s*0\.0\]", _YAML_SRC)
+    assert m is not None, "Q[t]/Q[delta_actual]が想定値から変化している"
 
 
 def test_overtake_and_pit_q_ey_overrides_still_intact():
