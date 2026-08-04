@@ -147,6 +147,12 @@ class MPC:
         self._seg_fallback = 0.6
         self._seg_fb_n = None
 
+        # --- シャドーQP評価用(Part B、2026-08-05): 本線のget_control()が組んだ
+        #   stage dict(d)をここへ複製するだけで、本線の状態(wp_id/_active/_fast/
+        #   previous_steering等)には一切触れない。solve_shadow_candidates()専用。
+        self.last_stage_data = None
+        self.last_shadow_solve_time = 0.0
+
         if not self.use_obstacle_avoidance:
             self.model.reference_path.update_simple_path_constraints(
                 N, self.model.safety_margin)
@@ -442,6 +448,78 @@ class MPC:
         return self.optimizer
 
     # ------------------------------------------------------------------
+    # シャドーQP評価(Part B、2026-08-05): OT判断のMPC化検討の一環。
+    # 「候補ごとにQPを解いてコストで比較する」診断機能。本線制御には一切影響しない
+    # (self.model / self._active / self._fast / self.optimizer / self.previous_steering
+    #  / self.current_control 等、get_control()が読み書きする状態を一切触れない)。
+    # ------------------------------------------------------------------
+    def solve_shadow_candidates(self, candidates):
+        """左右など複数の lateral_target/lateral_blend 候補について、直近の
+        get_control()呼び出しで組んだコリドー・線形化(self.last_stage_data)を
+        再利用し、参照(xr)だけを候補ごとに差し替えて独立にQPを解く。
+
+        本線が使うP(コスト構造)・A(力学+レート制約)・l/u(コリドー境界含む)は
+        候補間・本線とも完全に同一(xrはqにしか影響しない、_vectors()参照)。
+        よって_corridor()/_stage_data()を再呼び出しする必要がなく
+        (再呼び出しするとself.model.wp_idが二重加算される致命的な副作用がある、
+        _stage_data()のwp_id_offset加算箇所を参照)、コリドー生成本体
+        (update_path_constraints、CLAUDE.md §1.3で保護)には一切触れない。
+
+        candidates: [(label:str, lateral_target:float, lateral_blend:float,
+                      lateral_psi_bias:float), ...]
+        戻り値: [{'label':str,'solved':bool,'obj_val':float,'solve_time':float}, ...]
+                self.last_stage_dataが無ければ空リスト(呼び出し元は毎周期nullチェック不要)。
+        """
+        d = self.last_stage_data
+        if not candidates or d is None or 'ub0' not in d:
+            return []
+        nx = self.nx
+        N = d['N']
+        lb = d['lb0']
+        ub = d['ub0']
+        center = (lb + ub) / 2.0
+
+        _t0 = _time.perf_counter()
+        results = []
+        try:
+            # P・A・l・uは候補間で共通(xrに依存しない)。一度だけ組み立てて使い回す。
+            P, _q_unused, A_full, l, u = self._assemble_legacy(N, d)
+        except Exception as e:
+            self.last_shadow_solve_time = _time.perf_counter() - _t0
+            return [{'label': 'error', 'solved': False, 'obj_val': float('nan'),
+                     'solve_time': 0.0, 'error': repr(e)}]
+
+        for label, lateral_target, lateral_blend, lateral_psi_bias in candidates:
+            xr = np.zeros(nx * (N + 1))
+            if lateral_blend > 0.0:
+                tgt = (1.0 - lateral_blend) * center + lateral_blend * lateral_target
+                xr[nx::nx] = np.clip(tgt, lb, ub)
+            else:
+                xr[nx::nx] = center
+            if lateral_psi_bias != 0.0:
+                xr[nx + 1::nx] = lateral_psi_bias
+            d_shadow = dict(d)  # 浅いコピー: xrのみ差し替え、他は本線のdをそのまま参照
+            d_shadow['xr'] = xr
+            q, _l_unused, _u_unused = self._vectors(N, d_shadow)
+
+            t1 = _time.perf_counter()
+            try:
+                prob = osqp.OSQP()
+                prob.setup(P=P, q=q, A=A_full, l=l, u=u, verbose=False)
+                dec = prob.solve()
+                solved = dec.info.status_val in _OSQP_OK
+                obj_val = float(dec.info.obj_val) if solved else float('nan')
+            except Exception:
+                solved = False
+                obj_val = float('nan')
+            results.append({
+                'label': label, 'solved': solved, 'obj_val': obj_val,
+                'solve_time': _time.perf_counter() - t1,
+            })
+        self.last_shadow_solve_time = _time.perf_counter() - _t0
+        return results
+
+    # ------------------------------------------------------------------
     # ③-b fast経路: 構造凍結テンプレート + update()
     # ------------------------------------------------------------------
     def _build_fast(self, N, d):
@@ -636,6 +714,9 @@ class MPC:
         _t0 = _time.perf_counter()
         d = self._init_problem(N, sm)
         self.last_setup_time += _time.perf_counter() - _t0
+        # シャドーQP評価用に複製を保持(Part B)。d自体は_stage_data()の戻り値の
+        # 参照であり以後この関数内で書き換えないため、複製せずそのまま保持してよい。
+        self.last_stage_data = d
 
         try:
             _t0 = _time.perf_counter()

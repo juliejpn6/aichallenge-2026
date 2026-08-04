@@ -1311,6 +1311,16 @@ class MPCController(Node):
             # 追い越し後の「戻りfunnel」: ライン外から徐々にレースラインへ復帰させる
             self._ot_return_done = float(_otget("return_done_ey", 0.7))  # [m] |e_y|<これで復帰完了
             self._ot_returning = False  # 追い越し後の復帰中フラグ
+            # --- シャドーQP評価(Part B、2026-08-05、design_docs 283/285節参照) ---
+            _shq = getattr(self._cfg, "ot_shadow_qp", None)
+            def _shqget(name, default):
+                try:
+                    return getattr(_shq, name) if _shq is not None else default
+                except AttributeError:
+                    return default
+            self._ot_shadow_qp_enable = bool(_shqget("enable", False))
+            self._ot_shadow_qp_period = max(1, int(_shqget("period_cycles", 1)))
+            self._ot_shadow_qp_cycle = 0  # 間引き用カウンタ
             self._ot_state = "NORMAL"   # NORMAL / OVERTAKING / STOPPING
             self._ot_side = 0           # +1=左, -1=右, 0=未選択（e_y規約: +左/-右）
             self._ot_side_locked = 0    # A: コミット中の側（一時STOPPINGを跨いで保持。通過完了/恒久失敗で解除）
@@ -5248,6 +5258,53 @@ class MPCController(Node):
             self._f3_taper_zone_prev = _f3_zone
         return _v_safe
 
+    def _run_ot_shadow_qp(self):
+        """シャドーQP評価(Part B、2026-08-05、design_docs 283/285節)。
+        左右へ完全コミットした場合のQPコスト(進行/追従/操舵努力を含む目的関数値)を
+        本線のget_control()呼び出し後に独立に解き、[OT-SHADOW]へログするだけの
+        診断機能。self._ot_side/self._mpc.lateral_target等、本線が次周期以降に
+        読む状態には一切書き込まない(呼び出し元でも戻り値を捨てるだけで良い設計)。
+
+        側の定義は本線と同じくe_y規約(+1=左, -1=右)。左右とも lateral_blend=1.0
+        (コリドー内で許される限り最大限その側へ寄せる)で比較する簡略化版であり、
+        本線が実際に使う_target_mag(相手位置・corr_bound依存の動的な値)とは
+        一致しない — 「現在のコリドー形状のみを条件に、側の選好にどれだけの
+        コスト差があるか」を測る一次近似の診断値である点に注意(design_docs 283節の
+        予測ホライズン実測を踏まえた将来のPart C設計で、より忠実な値へ発展させる)。
+        """
+        self._ot_shadow_qp_cycle += 1
+        if (self._ot_shadow_qp_cycle % self._ot_shadow_qp_period) != 0:
+            return
+        d_off = self._ot_d_off
+        candidates = [
+            ("left", d_off, 1.0, 0.0),
+            ("right", -d_off, 1.0, 0.0),
+        ]
+        results = self._mpc.solve_shadow_candidates(candidates)
+        _shadow_dt = getattr(self._mpc, 'last_shadow_solve_time', 0.0)
+        self._pf_add('ot_shadow_solve', _shadow_dt)
+        # 計算予算の実測に応じた自動間引き(依頼書④): 40Hz予算(25ms)の1/4を専有し
+        # 続けたら間引き周期を倍にする(上限8周期に1回)。ヒステリシス無しの単純な
+        # 片方向ラチェットで十分(シャドーは診断用途であり、精度より予算超過回避を優先)。
+        _budget_s = 1.0 / max(self._cfg.mpc.control_rate, 1.0)  # type: ignore
+        if _shadow_dt > 0.25 * _budget_s and self._ot_shadow_qp_period < 8:
+            self._ot_shadow_qp_period *= 2
+            self.get_logger().warn(
+                f"[OT-SHADOW] solve_ms={_shadow_dt * 1000:.2f}が予算の25%超過 -> "
+                f"間引き周期を{self._ot_shadow_qp_period}へ拡大")
+        if not results or any(not r.get('solved', False) for r in results):
+            return
+        by_label = {r['label']: r for r in results}
+        obj_left = by_label['left']['obj_val']
+        obj_right = by_label['right']['obj_val']
+        shadow_side = 1 if obj_left <= obj_right else -1
+        self.get_logger().info(
+            f"[OT-SHADOW] state={self._ot_state} cur_side={self._ot_side} "
+            f"obj_left={obj_left:.4f} obj_right={obj_right:.4f} "
+            f"diff={obj_left - obj_right:+.4f} shadow_side={shadow_side} "
+            f"solve_ms={getattr(self._mpc, 'last_shadow_solve_time', 0.0) * 1000:.2f} "
+            f"wp={self._mpc.model.wp_id}")
+
     def _control(self):
         if not hasattr(self, '_pf_acc'):
             self._pf_init()
@@ -7148,6 +7205,16 @@ class MPCController(Node):
         # 179節続報: setupの内訳をさらに切り分け(線形化ループ vs コリドー光線走査)
         self._pf_add('mpc_linearize', getattr(self._mpc, 'last_linearize_time', 0.0))
         self._pf_add('mpc_corridor', getattr(self._mpc, 'last_corridor_time', 0.0))
+
+        # --- シャドーQP評価(Part B、design_docs 283/285節参照)---
+        # get_control()完了「後」に呼ぶこと。self._mpc.last_stage_dataは直前の
+        # get_control()が組んだ値であり、u/max_delta(本線の出力)には一切影響しない
+        # 完全に付加的な処理。例外はここで飲み込み、本線を止めない。
+        if self._ot_shadow_qp_enable:
+            try:
+                self._run_ot_shadow_qp()
+            except Exception as _e:
+                self.get_logger().warn(f"[OT-SHADOW] exception (no effect on control): {_e!r}")
 
         # --- 案X: get_control 後にMPCコリドー診断を収集（記録のみ）---
         if self.USE_OBSTACLE_AVOIDANCE:
