@@ -17,6 +17,12 @@ Claude Codeの永続メモリに直接記録される(セッションをまた�
 形式立った記録が欲しい場合は`/log-decision <内容>`を使う(下記)。両方使っても
 問題ない(`#`は保険、`/log-decision`は正式な記録)。
 
+**注意**: `#`メモはCLAUDE.md §0のルールにも`/audit-env`の監査対象にも入らない、
+完全に別経路の記録である。つまり`#`で打った内容とCLAUDE.mdが将来矛盾しても、
+`/audit-env`はそれを検出できない。`#`だけで済ませた決定は必ず後日
+`/log-decision`で正式記録へ昇格させること——`#`はあくまで一時的な保険であり、
+正式な記録の代わりにはならない。
+
 ## `/log-decision` — 方針決定の正式記録
 
 方針決定をした際、`/log-decision <決定内容>`を打つと、design_docsの新節と
@@ -41,6 +47,10 @@ CLAUDE.mdの内容(特に§3禁止リスト)が実態とズレていないかを
 
 - **フェーズ節目**(Phase1出口ゲート判定時、v_max段階を引き上げる時等)
 - **内部締切前後**(2026-08-25の凍結移行時)
+- **外部環境の変更を適用した直後**(AWSIMのアップデート等。運営側のsteer rate
+  変更がプラント特性を変えた実績があり、環境が変わった際は初日測定キット
+  [`step_response_test.py`]と並んで、CLAUDE.mdの禁止リスト・環境情報が
+  新環境でも正しいかの監査が必要になる)
 - 何か「あれ、これ前に禁止したはずでは?」と違和感を覚えた時(いつでも歓迎)
 
 読み取り専用の監査であり、見つかったズレの反映は人間の承認を得てから別途行う。
@@ -50,13 +60,16 @@ CLAUDE.mdの内容(特に§3禁止リスト)が実態とズレていないかを
 `.claude/hooks-draft/`配下のフック・permissions提案は**まだ有効化されていない**。
 有効化したい場合は`.claude/hooks-draft/README.md`の手順に従うこと。要点:
 
-1. `permissionDecision: "ask"`のJSON出力形式が現行のClaude Codeバージョンで
-   サポートされているか確認する。
-2. `hooks.settings.json`の中身を`.claude/settings.json`または
+1. `hooks.settings.json`の中身を`.claude/settings.json`または
    `.claude/settings.local.json`の`hooks`キーへ手動でマージする。
-3. `permissions-proposal.json`から承認した項目だけを
+2. `permissions-proposal.json`から承認した項目だけを
    `permissions.allow`/`permissions.ask`へ追記する。
-4. 新しいセッションで動作確認する(フックはセッション開始時に読み込まれる)。
+3. 新しいセッションを開始し(フックはセッション開始時に読み込まれる)、
+   CLAUDE.mdを軽く編集してみる。**これが`permissionDecision: "ask"`の
+   動作確認を兼ねる**——確認ダイアログが出れば対応している。何も起きず
+   素通りする場合は未対応なので、`claude_md_edit_guard.sh`を単純な
+   `exit 2`(無条件ブロック+stderr表示)方式へ書き換える
+   (`.claude/hooks-draft/README.md`の該当箇所参照)。
 
 承認後は、以下のテンプレートでClaude Codeへ結果を報告すると記録が残しやすい
 (コピーして値を埋めるだけで使える):
