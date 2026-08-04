@@ -76,7 +76,7 @@ def test_called_from_ordinary_exit_clear():
     """通常のexit_clear離脱(前方クリア連続、5033行目付近)で呼ばれていることを
     確認する。"""
     idx = _SRC.index("if self._fwd_clear_count >= self._ot_exit_clear:")
-    idx_end = idx + 400
+    idx_end = idx + 500
     snippet = _SRC[idx:idx_end]
     assert 'self._ot_state = "NORMAL"' in snippet
     assert "self._reset_ot_offset_state()" in snippet
@@ -86,7 +86,7 @@ def test_called_from_infeasibility_forced_exit():
     """infeasibility強制STOPPING(5053行目付近、0728-04 wp243の実事例)で
     呼ばれていることを確認する。"""
     idx = _SRC.index("if self._mpc.infeasibility_counter == self._ot_infeasible_stop:")
-    idx_end = idx + 500
+    idx_end = idx + 600
     snippet = _SRC[idx:idx_end]
     assert 'self._ot_state = "STOPPING"' in snippet
     assert "self._reset_ot_offset_state()" in snippet

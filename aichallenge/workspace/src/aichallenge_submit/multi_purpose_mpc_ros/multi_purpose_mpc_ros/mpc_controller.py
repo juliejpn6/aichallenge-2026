@@ -1324,6 +1324,7 @@ class MPCController(Node):
             self._ot_shadow_qp_enable = bool(_shqget("enable", False))
             self._ot_shadow_qp_period = max(1, int(_shqget("period_cycles", 1)))
             self._ot_shadow_qp_cycle = 0  # 間引き用カウンタ
+            self._ot_shadow_last = None  # 直近のシャドー結果(288節、[OT-OUTCOME]突き合わせ用)
             self._ot_state = "NORMAL"   # NORMAL / OVERTAKING / STOPPING
             self._ot_side = 0           # +1=左, -1=右, 0=未選択（e_y規約: +左/-右）
             self._ot_side_locked = 0    # A: コミット中の側（一時STOPPINGを跨いで保持。通過完了/恒久失敗で解除）
@@ -5294,18 +5295,25 @@ class MPCController(Node):
         return _v_safe
 
     def _run_ot_shadow_qp(self):
-        """シャドーQP評価(Part B、2026-08-05、design_docs 283/285節)。
-        左右へ完全コミットした場合のQPコスト(進行/追従/操舵努力を含む目的関数値)を
-        本線のget_control()呼び出し後に独立に解き、[OT-SHADOW]へログするだけの
-        診断機能。self._ot_side/self._mpc.lateral_target等、本線が次周期以降に
-        読む状態には一切書き込まない(呼び出し元でも戻り値を捨てるだけで良い設計)。
+        """シャドーQP評価(Part B、2026-08-05、design_docs 283/285/287/288節)。
+        左右へ完全コミットした場合、および追従(コミットしない)場合のQPコスト
+        (進行/追従/操舵努力を含む目的関数値)を本線のget_control()呼び出し後に
+        独立に解き、[OT-SHADOW]へログするだけの診断機能。self._ot_side/
+        self._mpc.lateral_target等、本線が次周期以降に読む状態には一切書き込まない
+        (呼び出し元でも戻り値を捨てるだけで良い設計)。
 
-        側の定義は本線と同じくe_y規約(+1=左, -1=右)。左右とも lateral_blend=1.0
-        (コリドー内で許される限り最大限その側へ寄せる)で比較する簡略化版であり、
-        本線が実際に使う_target_mag(相手位置・corr_bound依存の動的な値)とは
-        一致しない — 「現在のコリドー形状のみを条件に、側の選好にどれだけの
-        コスト差があるか」を測る一次近似の診断値である点に注意(design_docs 283節の
-        予測ホライズン実測を踏まえた将来のPart C設計で、より忠実な値へ発展させる)。
+        側の定義は本線と同じくe_y規約(+1=左, -1=右)。left/rightは lateral_blend=1.0
+        (コリドー内で許される限り最大限その側へ寄せる)、followは本線の非OT時と同じ
+        lateral_blend=0.0(コリドー中心追従、寄せない)。left/rightは本線が実際に使う
+        _target_mag(相手位置・corr_bound依存の動的な値)とは一致しない —
+        「現在のコリドー形状のみを条件に、側の選好・追従とのコスト差がどれだけあるか」
+        を測る一次近似の診断値である点に注意(design_docs 283節の予測ホライズン実測を
+        踏まえた将来のPart C設計で、より忠実な値へ発展させる)。
+
+        288節(2026-08-05): 当初はleft/rightの2候補のみで「オーバーテイクする場合に
+        どちらの側が安いか」しか比較できず、「そもそもオーバーテイクすべきか追従すべきか」
+        には答えられなかった(ユーザー指摘)。followを第3候補として追加し、3択の中で
+        最小コストがどれかを比較できるようにした。
         """
         self._ot_shadow_qp_cycle += 1
         if (self._ot_shadow_qp_cycle % self._ot_shadow_qp_period) != 0:
@@ -5314,6 +5322,7 @@ class MPCController(Node):
         candidates = [
             ("left", d_off, 1.0, 0.0),
             ("right", -d_off, 1.0, 0.0),
+            ("follow", 0.0, 0.0, 0.0),
         ]
         results = self._mpc.solve_shadow_candidates(candidates)
         _shadow_dt = getattr(self._mpc, 'last_shadow_solve_time', 0.0)
@@ -5332,13 +5341,37 @@ class MPCController(Node):
         by_label = {r['label']: r for r in results}
         obj_left = by_label['left']['obj_val']
         obj_right = by_label['right']['obj_val']
+        obj_follow = by_label['follow']['obj_val']
         shadow_side = 1 if obj_left <= obj_right else -1
+        shadow_choice = min(
+            (('left', obj_left), ('right', obj_right), ('follow', obj_follow)),
+            key=lambda kv: kv[1])[0]
+        self._ot_shadow_last = {
+            'shadow_side': shadow_side, 'shadow_choice': shadow_choice,
+            'wp': self._mpc.model.wp_id,
+        }
         self.get_logger().info(
             f"[OT-SHADOW] state={self._ot_state} cur_side={self._ot_side} "
             f"obj_left={obj_left:.4f} obj_right={obj_right:.4f} "
+            f"obj_follow={obj_follow:.4f} "
             f"diff={obj_left - obj_right:+.4f} shadow_side={shadow_side} "
+            f"shadow_choice={shadow_choice} "
             f"solve_ms={getattr(self._mpc, 'last_shadow_solve_time', 0.0) * 1000:.2f} "
             f"wp={self._mpc.model.wp_id}")
+
+    def _log_ot_outcome(self, outcome, side_used, reason=""):
+        """Part B拡張(288節): OTが実際に選んだ側/追従が結果的に成功したか失敗したかを
+        [OT-OUTCOME]へ記録し、その時点でのシャドーの直近の推奨(self._ot_shadow_last、
+        キャッシュのためstaleな場合がある。shadow_wpとの差でstaleさを判別可能)を
+        併記する。呼び出し元はself._ot_sideをリセットする「前」に呼ぶこと(side_used
+        は呼び出し元が明示的に渡す設計にし、リセット順序への依存を避けている)。"""
+        shadow = self._ot_shadow_last
+        shadow_txt = (
+            f"shadow_choice={shadow['shadow_choice']} shadow_side={shadow['shadow_side']} "
+            f"shadow_wp={shadow['wp']}" if shadow else "shadow_choice=None(未評価)")
+        self.get_logger().info(
+            f"[OT-OUTCOME] side_used={side_used} outcome={outcome} reason={reason} "
+            f"{shadow_txt} wp={self._mpc.model.wp_id}")
 
     def _control(self):
         if not hasattr(self, '_pf_acc'):
@@ -6167,6 +6200,10 @@ class MPCController(Node):
                         # 断念(相手が速い) or 側消失(持続) → 追従へ。無効と判明した側は持ち越さず、
                         #   クールダウン中は再エンゲージしない(0.2秒debounceだけで反対側に飛ぶ
                         #   エピソード間スイングの抑制。仕切り直してICCで詰め直す)。
+                        self._log_ot_outcome(
+                            "giveup", self._ot_side,
+                            reason=(_giveup_trigger if _side_blocked
+                                    else "opponent_too_fast_or_side_lost"))
                         self._ot_state = "STOPPING"
                         self._ot_side = 0
                         self._ot_side_locked = 0
@@ -6266,6 +6303,7 @@ class MPCController(Node):
                 # 前方クリアが連続したら NORMAL 復帰（ハンチング防止）
                 self._fwd_clear_count += 1
                 if self._fwd_clear_count >= self._ot_exit_clear:
+                    self._log_ot_outcome("success", self._ot_side, reason="exit_clear")
                     self._ot_state = "NORMAL"
                     self._ot_side = 0
                     self._ot_side_locked = 0   # A: 通過完了 → 側コミット解除
@@ -6287,6 +6325,7 @@ class MPCController(Node):
             if self._mpc.infeasibility_counter == self._ot_infeasible_stop:
                 self._ot_infeasible_latch = self._ot_infeasible_latch_cycles
                 if self._ot_state == "OVERTAKING":
+                    self._log_ot_outcome("failure", self._ot_side, reason="infeasible")
                     self._ot_state = "STOPPING"
                     self._ot_side = 0
                     self._ot_side_locked = 0   # A: 恒久失敗（実際に通れない）→ 側コミット解除して次で再選択

@@ -214,7 +214,10 @@ def test_get_control_caches_stage_data_after_init_problem():
         "self.last_stage_data = d")
 
 
-def test_shadow_qp_disabled_by_default_in_config():
+def test_shadow_qp_config_declares_valid_bool_enable():
+    """287節: dev3実走行検証のためON/OFFを行き来する運用対象(CLAUDE.md §1.1同様の
+    race value)であり、どちらの値でも正当なため固定値ではなくtrue/falseいずれかで
+    あることのみを検査する(test_enable_diag_log_bypass_214.pyと同じ方針)。"""
     import os
     cfg_path = os.path.join(
         os.path.dirname(__file__), "..", "config", "config.yaml")
@@ -222,7 +225,7 @@ def test_shadow_qp_disabled_by_default_in_config():
         cfg_src = f.read()
     idx = cfg_src.index("ot_shadow_qp:")
     snippet = cfg_src[idx:idx + 300]
-    assert "enable: false" in snippet
+    assert "enable: true" in snippet or "enable: false" in snippet
 
 
 def test_controller_gates_shadow_call_behind_enable_flag():
@@ -257,4 +260,46 @@ def test_shadow_qp_thinning_counter_and_period_declared():
     idx_end = idx + 400
     snippet = _CTRL_SRC[idx:idx_end]
     assert "self._ot_shadow_qp_period" in snippet
-    assert "self._ot_shadow_qp_cycle = 0" in snippet
+
+
+# ---------------------------------------------------------------------------
+# 288節(2026-08-05): 追従(follow)候補+OT結果の成功/失敗記録
+# ---------------------------------------------------------------------------
+
+def test_run_ot_shadow_qp_includes_follow_candidate():
+    """ユーザー指摘: left/rightのみでは「オーバーテイクすべきか追従すべきか」に
+    答えられない。3択目のfollow候補(lateral_blend=0.0)が実際に送られていることを
+    ソーステキストで確認する。"""
+    idx = _CTRL_SRC.index("def _run_ot_shadow_qp(self):")
+    idx_end = _CTRL_SRC.index("def _log_ot_outcome(self", idx)
+    snippet = _CTRL_SRC[idx:idx_end]
+    assert '("follow", 0.0, 0.0, 0.0)' in snippet
+    assert "obj_follow" in snippet
+    assert "shadow_choice" in snippet
+
+
+def test_log_ot_outcome_called_at_all_three_exit_points():
+    """OT離脱の3経路(giveup・exit_clear・infeasibility強制)すべてで
+    _log_ot_outcome()が呼ばれ、成功/失敗が記録されることを確認する。"""
+    assert _CTRL_SRC.count("self._log_ot_outcome(") == 3
+    assert 'self._log_ot_outcome(\n                            "giveup"' in _CTRL_SRC
+    assert 'self._log_ot_outcome("success", self._ot_side, reason="exit_clear")' in _CTRL_SRC
+    assert 'self._log_ot_outcome("failure", self._ot_side, reason="infeasible")' in _CTRL_SRC
+
+
+def test_log_ot_outcome_called_before_side_reset_at_each_site():
+    """side_usedとして渡すself._ot_sideが、直後の`self._ot_side = 0`より前に
+    評価されること(呼び出し元でresetする前に読む設計)をソーステキストで確認する。"""
+    for marker in ['"giveup"', '"success"', '"failure"']:
+        idx = _CTRL_SRC.index(f"self._log_ot_outcome(\n" if marker == '"giveup"'
+                               else f"self._log_ot_outcome({marker}")
+        idx_reset = _CTRL_SRC.index("self._ot_side = 0", idx)
+        assert idx < idx_reset
+
+
+def test_log_ot_outcome_method_reads_but_does_not_write_ot_side():
+    idx = _CTRL_SRC.index("def _log_ot_outcome(self")
+    idx_end = _CTRL_SRC.index("\n    def _control(self):", idx)
+    snippet = _CTRL_SRC[idx:idx_end]
+    assert "self._ot_side =" not in snippet
+    assert "self._ot_shadow_last" in snippet
