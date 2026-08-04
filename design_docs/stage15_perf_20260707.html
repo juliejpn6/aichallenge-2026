@@ -8438,5 +8438,65 @@ soloで可、CLAUDE.md §2ルール6によりdev3必須なのは提出前の最�
 待ち</b>。
 </p>
 
+<h2>2026-08-05: オーバーテイク判断のMPC化検討 — Part B(シャドー2-QP実装)</h2>
+<h3>285. シャドーQP評価の実装 — 共有コリドー+左右lateral_targetバイアス版、回帰3075件PASS</h3>
+<p class="small">
+Part A(283節)の監査結果をユーザーへ報告した上でPart Bへ着手。実装前調査(Exploreエージェント)
+で依頼書の前提(「既存のコリドー生成を側指定で2回呼ぶ」)が実装と食い違うと判明した:
+<code>update_path_constraints</code>にside引数は無く、空き区間の全組み合わせ探索で
+面積最大の単一経路を1本だけ選ぶ設計。実際の側選択はこの関数の<b>外側</b>で、1本の
+共有コリドー内の目標位置(<code>lateral_target</code>)を左右へソフトオフセットする
+ことで実現されている。ユーザーに選択肢を提示し、<b>「共有コリドー+左右lateral_target
+バイアス版」(update_path_constraints本体には一切触れない、CLAUDE.md §1.3/§3の
+コンビナトリクス保護に抵触しない設計)を採用</b>することで合意した。
+</p>
+<p class="small">
+<b>安全設計の核心</b>: <code>core/MPC.py</code>の<code>_stage_data()</code>は
+reuse無しで呼ぶたびに<code>self.model.wp_id</code>を加算する副作用を持つため
+(262節ガード関連)、シャドー評価がこれを再呼び出しすると本線のwp追従が二重加算で
+壊れる致命的リスクがあった。調査の結果、QPのP(コスト構造)・A(力学+レート制約)・
+l/u(コリドー境界含む)はxr(参照ベクトル、lateral_target由来)に一切依存せず、
+候補間・本線とも完全に同一と判明(<code>_vectors()</code>参照)。よって
+<b>本線のget_control()が既に組んだstage dict(新設<code>self.last_stage_data</code>)を
+再利用し、xr(→q)のみ候補ごとに差し替えて独立にosqp.OSQP()を都度setup/solveする</b>
+設計とした——コリドー生成本体・線形化ループ・self.model.wp_idには一切触れない。
+</p>
+<p class="small">
+<b>実装内容</b>: ①<code>core/MPC.py</code>: <code>self.last_stage_data</code>
+(get_control()内で`d`確定直後にキャッシュ)、新規メソッド
+<code>solve_shadow_candidates(candidates)</code>(候補ごとにxr再構築→q再計算→
+独立QP solve、P/A/l/uは使い回し、例外は内部で握り潰しerror結果を返す)。
+②<code>config.yaml</code>: 新設<code>ot_shadow_qp:</code>セクション(
+<code>enable: false</code>既定OFF、<code>period_cycles</code>で間引き)。
+③<code>mpc_controller.py</code>: <code>_run_ot_shadow_qp()</code>(左右へ
+<code>lateral_blend=1.0</code>で完全コミットした場合のコストを比較する簡略版。
+本線が使う動的な<code>_target_mag</code>[相手位置・corr_bound依存]とは異なる
+一次近似の診断値である点に注意)。<code>[OT-SHADOW]</code>ログ(state/cur_side/
+obj_left/obj_right/diff/shadow_side/solve_ms/wp)。get_control()呼び出しの<b>直後</b>
+(本線のu/max_delta確定後)に<code>try/except</code>で囲んで呼び出し、例外は本線を
+止めない。計算予算超過時(40Hz予算の25%超過)は間引き周期を自動的に倍化(上限8周期に1回)。
+</p>
+<p class="small">
+<b>検証</b>: 新規テスト<code>test/test_ot_shadow_qp_part_b_20260805.py</code>(15件)——
+①stage data未設定/候補空リストで安全に空リストを返す②候補ごとに正しく解けobj_valが
+非対称な目標で異なる値になる③<b>最重要: solve_shadow_candidates()が
+_stage_data/_corridorを一切呼ばない(fakeに未定義のままAttributeErrorなく完走)</b>
+④last_stage_dataの中身を書き換えない⑤self(fakeオブジェクト)へ新規属性を増やさない
+(last_shadow_solve_time以外)⑥内部例外を外へ漏らさずerror結果を返す⑦ソーステキスト
+構造検証(configゲート・try/except配置・呼び出し順序・_ot_side/lateral_target/
+lateral_blendへの書き込みが本体に存在しないこと)。既存の262節ガードテストと同じ
+「ダックタイプのfake self」パターンを踏襲。<b>回帰スイート3075件全PASS
+(コリドー等価性回帰1518件含む)</b>。
+</p>
+<p class="small">
+<b>未実施(次のステップ)</b>: 依頼書の評価項目(dev3走行2本[ON]+側反転事例区間の
+再現走行によるシャドーvs現行`_ot_side`の一致率・不一致事例の質・コスト拮抗域の
+割合・solve時間の実測)は実走行が必要なため未着手。現時点の`_target_mag`簡略化
+(左右へ`lateral_blend=1.0`の完全コミット固定)が実用上十分な近似か、それとも
+本線の動的な目標量[相手位置・corr_bound依存]を再現する必要があるかも、この
+実走行評価で判断する。Part C(予測制御の開発計画書)はPart Bの実走行結果を待って
+着手する。
+</p>
+
 </body>
 </html>
