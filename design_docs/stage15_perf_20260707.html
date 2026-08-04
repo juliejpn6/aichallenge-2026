@@ -8619,5 +8619,35 @@ Part A(判断パイプライン地図化、283節)で洗い出した「現在値
 <b>コード変更なし(config.yamlのv_maxはライブパラメータのみ変更、永続化なし)</b>。
 </p>
 
+<h3>288. シャドーへ「追従」候補を追加、OT結果の成功/失敗記録を新設 — run3で動作確認</h3>
+<p class="small">
+ユーザー指摘: 287節時点のシャドーはleft/right2択のみで「オーバーテイクすべきか、
+それとも無駄なオーバーテイクをせず追従すべきか」に答えられなかった。3択目
+<code>follow</code>(lateral_blend=0.0、コリドー中心追従)を追加し
+<code>shadow_choice</code>(left/right/follow)を記録するようにした。あわせて、
+OT離脱の3経路(giveup・exit_clear・infeasibility強制)それぞれに
+<code>[OT-OUTCOME]</code>ログを新設し、実際に選んだ側/追従(<code>side_used</code>)が
+成功(<code>exit_clear</code>)したか失敗(<code>giveup</code>/<code>infeasible</code>)
+したかを、その時点での直近シャドー推奨と併記して記録する。回帰スイート3079件全PASS。
+</p>
+<p class="small">
+<b>dev3 run3(d1=20/d2=17/d3=15km/h)で動作確認</b>: <code>[OT-SHADOW]</code>に
+<code>obj_follow</code>/<code>shadow_choice</code>が正しく出力され、
+<code>[OT-OUTCOME]</code>も期待通り発火した。<b>副産物として、exit_clear経路の
+既存ロジック(287節以前から存在、今回変更していない箇所)が、NORMAL復帰後も同一wpで
+outcome=successを繰り返し発火させる挙動(<code>side_used=0</code>、<code>_fwd_clear_count</code>
+がリセットされないまま条件を満たし続ける疑い)を発見した</b>——実害の有無は未調査
+だが、ログ肥大化の原因になりうるため別途確認が必要。今回の分析では
+<code>side_used=0</code>の行(明らかに離脱後の再発火)を除外して集計した。
+</p>
+<p class="small">
+<b>予備的傾向(n=14件、確定判断には全く不十分)</b>: giveup(失敗)10件中6件で
+シャドーの推奨側と実際に使った側が不一致、success(成功)4件中3件で一致——
+「シャドーと不一致の時ほど失敗しやすい」という方向を示唆するが、CLAUDE.md §2
+ルール1(n=1で確定しない)に照らしn=14は全く不十分であり、参考程度に留める。
+本格的な検証にはより長時間・複数走行でのエピソード数の積み増しが必要
+(タスク#296の後継として記録)。
+</p>
+
 </body>
 </html>
