@@ -62,7 +62,9 @@ def test_ot_log_includes_margin_field():
     確認する(state/plan_pass呼び出しの有無に関わらず必ず出力される点が
     [PLAN-OBS]/[PLAN-VETO]との違い)。"""
     idx = _SRC.index('f"[OT] state=')
-    snippet = _SRC[max(0, idx - 300):idx + 1800]
+    # 2026-08-04追加: [OT]ログへmin_needed_mag(対象車位置ベースの最小オフセット
+    #   診断フィールド)が挿入されたため、窓を1800→2000へ拡大(検証対象は無変更)。
+    snippet = _SRC[max(0, idx - 300):idx + 2000]
     assert "_sm_ot" in snippet
     assert "margin={_sm_ot:.3f}" in snippet
 

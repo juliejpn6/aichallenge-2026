@@ -94,7 +94,9 @@ def test_lateral_target_uses_corr_bound_ahead_helper():
     #   挿入されたため、窓を400→600へ拡大(検証対象そのものは無変更)。
     # 2026-07-24追加(168節): 非正転落時に凍結保持する分岐(_ot_last_valid_target_mag)
     #   が間に挿入されたため、窓を600→1600へ再拡大(検証対象そのものは無変更)。
-    snippet = _SRC[max(0, idx - 1600):idx]
+    # 2026-08-04追加: 対象車位置ベースの最小オフセット計算(min_needed_mag)が間に
+    #   挿入されたため、窓を1600→3200へ再拡大(検証対象そのものは無変更)。
+    snippet = _SRC[max(0, idx - 3200):idx]
     assert "self._corr_bound_ahead(self._ot_side)" in snippet
 
 

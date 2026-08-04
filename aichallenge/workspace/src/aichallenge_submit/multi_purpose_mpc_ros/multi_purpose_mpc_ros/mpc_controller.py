@@ -6374,7 +6374,31 @@ class MPCController(Node):
                 #   planLf/planRfとの乖離を、発生地点(何m先)込みで次回ログから直接判別する)。
                 _fwd_dbg["corr_bound"] = round(_corr_bound, 3) if np.isfinite(_corr_bound) else _corr_bound
                 _fwd_dbg["corr_bound_at"] = round(self._dbg_corr_bound_at_m, 2)
-                _target_mag = self._ot_d_off
+                # 2026-08-04修正(ユーザー指摘: wp340-8でD2がD3へ2.294mまで幅寄せし2周連続
+                #   再現、直線同然の区間でも発生): 従来はd_off(3.0m、固定)をcorr_boundで
+                #   クランプするだけで、「対象車を安全にクリアするのに必要な最小オフセット」
+                #   を計算する項が無く、コリドーが許す限り常に上限まで幅寄せしていた
+                #   (オーバーテイクは成功すればよく、余分な幅寄せは不要というユーザー方針)。
+                #   対象車(_ot_target_vid)の現在の横位置(_scan["cars"]のlat、e_yと同一
+                #   フレーム)が分かれば、side*lat+クリアランス(自車半幅+block_half、
+                #   =対象車の半幅+余裕)が「これだけ離れれば十分」という必要最小量になる。
+                #   safety_margin_overtakeはcorr_bound側(ub0/lb0)に既に織り込み済みのため
+                #   ここでは二重に足さない。対象車が今周期のcars候補から外れている場合
+                #   (視野外・ds<0化等)は旧来通りd_off固定へフォールバックし退行を防ぐ。
+                _opp_lat_now = None
+                for _c_ds, _c_lat, _c_vlong, _c_dlat, _c_vid, _c_wp in _scan["cars"]:
+                    if _c_vid == self._ot_target_vid:
+                        _opp_lat_now = _c_lat
+                        break
+                if _opp_lat_now is not None:
+                    _clear_needed = self._mpc.model.width / 2.0 + self._ot_block_half
+                    _target_mag = max(0.0, min(
+                        self._ot_d_off,
+                        float(self._ot_side) * _opp_lat_now + _clear_needed))
+                else:
+                    _target_mag = self._ot_d_off
+                _fwd_dbg["min_needed_mag"] = (
+                    round(_target_mag, 3) if _opp_lat_now is not None else None)
                 if np.isfinite(_corr_bound):
                     if _corr_bound > 0.0:
                         _target_mag = min(_target_mag, _corr_bound)
@@ -7321,6 +7345,7 @@ class MPCController(Node):
                         f"v_safe_src={_v_safe_src} "
                         f"offset={_fwd_dbg.get('offset')} psi_bias={_fwd_dbg.get('psi_bias')} "
                         f"corr_bound={_fwd_dbg.get('corr_bound')}@{_fwd_dbg.get('corr_bound_at')}m "
+                        f"min_needed={_fwd_dbg.get('min_needed_mag')} "
                         f"corr[ub0={_fwd_dbg.get('corr_ub0')} lb0={_fwd_dbg.get('corr_lb0')} "
                         f"xr0={_fwd_dbg.get('corr_xr0')} wmin={_fwd_dbg.get('corr_wmin')} "
                         f"src={_fwd_dbg.get('corr_src')} nseg0/1/2={_fwd_dbg.get('nseg0')}/{_fwd_dbg.get('nseg1')}/{_fwd_dbg.get('nseg2')}] "
