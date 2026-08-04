@@ -7846,5 +7846,129 @@ v_max=20km/h環境でもステアリングの蛇行(AXIS06)が未収束のため
 <b>検証</b>: 実際に観測した764msストールを模した単体テスト(<code>test_failsafe_dt_watchdog_264.py</code>、発火条件・非発火境界・閾値無効化・操舵保持・速度/加速度オーバーライド・<code>_last_u</code>簿記との順序・MPC本体への不干渉・config既定値登録を網羅)を新規追加し、回帰スイート全体2996件PASS(既存2981件+新規15件、制御ロジックの他部分は無変更)。<code>control_rate=40.0</code>・<code>cpu_affinity=[]</code>・<code>failsafe_dt_threshold_ms=200.0</code>の安全側既定を維持。
 </p>
 <p class="small">生成: 2026-07-07 / 2026-08-02追記(264〜267節: C0〜C4'双方向アフィニティ実験・simulator隔離による根本原因確定・DT-SPIKE計装/J定義統一/cgroup修正・蛇行PSD分析で過渡応答仮説確定・dt異常フェイルセーフ実装) / 計装: mpc_controller.py [PERF](区間5+gc/v2x/opp_pubフック)、[PERF-DT]/[PERF-DT-SPIKE](実効周期dt分布・margin・ストール検知、257/259/260/266節)、[PERF-SPIKE](スパイク法医学、262/263節)、[PERF-PLATFORM](プラットフォーム状態・cgroup、262/263節)、[FAILSAFE](dt異常時の安全側コマンド上書き、267節)、reference_path.py [PERF-CORRIDOR](phaseA/phaseB内訳・cache_builds、256/258/261節) / 分析ツール: scripts/analyze_perf_gap.py・scripts/analyze_steering_psd.py(266節) / 前レポート: stage1_test_20260706.html / ロードマップ: roadmap_20260705_targets.html / 72Hz化調査の設計書: docs/superpowers/specs/2026-07-31-mpc-control-rate-increase-design.md</p>
+
+<h2>2026-08-04: AXIS06本体調査 — レート飽和棄却からQ[e_y]×Q[e_psi]反復調整へ</h2>
+<div class="note">
+本節群は、緩和策①(ゲイン)②(tau)の実地失敗(design_docs/axis06_gain_correction_design_20260803.md)を受けた、蛇行(AXIS06、0.6-0.7Hz)対策の再出発点。「推測せず計装で実測してから決める」というStage1.5以来の方針を、蛇行の機構解明そのものに適用した一連の調査。
+</div>
+
+<h3>268. Phase1: レート飽和検査 — 曲率SWING駆動仮説を実測で棄却</h3>
+<p class="small">
+「SWING区間で必要操舵レート dδ/dt≈L_wb·κ'·v が実舵レート上限r_maxで飽和し過渡オーバーシュートを生む」という統一機構仮説を、新規<code>scripts/analyze_steer_rate_saturation.py</code>で検証した。真のκ'=dκ/ds(弧長ベース中央差分、既存のR[delta]swingスケジュール[177節]が使う「窓内max-min」とは異なる)を新規実装し、トラック全域を窓(≈5m)単位で区切って局所蛇行指標(操舵角std)を|κ'|·v·L_wbへ原点通過回帰、説明できる分(成分A、κ'駆動)と残差(成分B、κ'非依存)に分解した。
+</p>
+<p class="small">
+実予選ログ7本(2026-08-01〜04、tau=190ms基準6本+tau=160ms失敗版1本)全てで<b>成分Bが圧倒的に支配的</b>(回帰R²は全ログで-128%〜-2048%、4層[直線/低/中/高swing]のwobble_stdはほぼフラット)と判明。飽和率も全層0.4-1.2%で高swing層への集中なし。直線区間のwaypoint CSV量子化ノイズ検査(κ'のRMS・点間隔CV)では直線幾何は綺麗と確認——パスキンク補正は直線側の蛇行に効かないことも同時に判明した。単位較正はconfig解析的候補(A: rawそのまま63.0°/s、B: raw×gain103.3°/s)よりも<b>実測(全ログプールp99.5)の199.3°/s</b>を優先して使用(推測でなく実測較正)。テスト13件追加、回帰3042件PASS。
+</p>
+<p class="small">
+この結果は180節(2026-07-25、track全体一様悪化)・263節続報(2026-08-02、OT状態非依存・PSD)と完全に整合し、<b>3つの独立実測が「蛇行はコーナー形状ではなくAXIS06本体のκ非依存な機構に起因する」という同じ結論に収束</b>した。
+</p>
+
+<h3>269. (A)排除検査: 蛇行は物理現象、EKF推定アーティファクトではない</h3>
+<p class="small">
+新規<code>scripts/analyze_ekf_artifact_check.py</code>で、ekf_ey(EKF融合後推定)とgnss_ey(生GNSS測位、EKFフィルタを経ない独立測定路)の限界サイクル帯(0.5-0.9Hz)パワー比を比較した。実予選ログ7本全てでgnss/ekf比が1.06-1.09と一貫(gnss側がむしろわずかに高い)——<b>独立した2つの測定路が同じ振幅の振動を見ているため、蛇行はEKFのフィルタリングが生むアーティファクトではなく物理的な現象と確定</b>した。これによりQ[e_y]/Q[e_psi]調整で対処しうる問題であるという前提が確認できた。
+</p>
+<p class="small">
+周回間の位相ロック検査(wp整列ekf_ey残差の周回間相関)は当初の実装に「周回間平均を引くと位置固定パターン自体が相殺され検出不能になる」設計バグがあり(合成データのテストで発覚)、個別デトレンド方式へ修正。修正後の相関は0.22-0.51(7ログ中2本が閾値0.3超)で、純粋なランダム位相でも強い位置固定でもない中間的な結果となった。テスト8件追加、回帰3050件PASS。
+</p>
+
+<h3>270. Q[e_y]対数スイープ: 直線層std・コーナー出口振幅が明確な単調増加</h3>
+<p class="small">
+Gemini・別Claude両者の提案(Q[e_psi]×tauの相互作用による自己励起的限界サイクル仮説)を受けた本命実験。Q[e_y]=200000/400000/700000(基準)/1400000/2800000の5点、各n=1・solo・v_max=20・debug_extra_actuator_delay_s=0.055(既存較正値)で実施(自動化スクリプトによるLOG_DIR/BAG_TAG分離+ラップ完了検知)。
+</p>
+<table class="xtab" style="width:100%; font-size:0.85rem;">
+<tr><th>Q[e_y]</th><th>200k</th><th>400k</th><th>700k(基準)</th><th>1.4M</th><th>2.8M</th></tr>
+<tr><td>直線層std</td><td><b>5.64°</b></td><td>6.80°</td><td>8.21°</td><td>10.01°</td><td>11.42°</td></tr>
+<tr><td>コーナー出口平均初期振幅</td><td><b>5.10°</b></td><td>5.60°</td><td>6.96°</td><td>7.13°</td><td>9.48°</td></tr>
+<tr><td>ラップタイム平均</td><td><b>64.85s</b></td><td>65.13s</td><td>66.22s</td><td>—</td><td>—</td></tr>
+</table>
+<p class="small">
+直線層std・コーナー出口振幅ともに桁を通じて明確な単調増加。ラップタイムも同順(蛇行減=速度低下ではなく、むしろ速い)。ユーザーのリアルタイム目視(200k=落ち着き→400k=蛇行する→700k=頑張って耐えている→1.4M/2.8M=蛇行する)と完全に一致した。
+</p>
+
+<h3>271. 絞り込みラウンド: n=2で単調再現、副産物としてwp280-281の間欠衝突を発見</h3>
+<p class="small">
+200000/400000/700000の3点×n=2(6run)。直線層stdの単調性がn=2でも統計的に頑健に再現(条件間差1.5-2.2°に対し条件内ばらつき0.19-1.10°)。ラップタイムも同順。<b>ただし6run中2run(Q400000・Q700000各1)で実際の壁衝突が発生し、両方とも寸分違わずwp280-281(kappa≈-0.11〜-0.15、既知のwp269-282ホットスポット)の同一地点だった</b>。直前の単発スイープではQ700000は無傷だった実績があり、Q依存というより地点固有の間欠的脆弱性の可能性が高いと判断し、Q値選定とは独立の別課題として保留した。
+</p>
+<p class="small">
+「直線PSDピーク比較」が「データ不足」になる問題(直線/コーナーラベルが数mごとに切替わり既存PSD分析の最低区間長フィルタ8秒に抵触)を、<code>smooth_short_label_runs()</code>(短い切替を前の系列へ吸収)で修正。テスト4件追加、回帰3054件PASS。
+</p>
+
+<h3>272. STUCK復帰: D→P→R修正の実装と、実地でのP→R失敗の発見</h3>
+<p class="small">
+セッション中、対戦車ありA/B検証中にP1(D1)が壁に激突し、STUCK↔BACKUP-BLOCKED↔NORMALのループを30サイクル・100秒以上繰り返し自力脱出不能になる事象が発生(<code>make down</code>で強制リセット)。調査の結果、従来のSTUCK復帰ロジックはgear_report確認を待たずいきなり<code>GearCommand.REVERSE</code>を送り続けており、これが「D→Rへ直接シフトできず、D→P→Rの順でのみRレンジが入る」という実車/AWSIM双方の仕様(ユーザー確認)と矛盾していたと判明。<code>_stuck_enter_wait_reverse</code>の突入先を新設<code>WAIT_PARK</code>(PARKを送りgear_settle_cycles確定待ち)へ変更し、必ずP経由でRへ向かうよう修正した。テスト7件追加、回帰3029件PASS。
+</p>
+<p class="small">
+本日後半、Q[e_y]×Q[e_psi]検証run中の実際の壁衝突(wp280-283、絞り込みラウンドと同一のホットスポット)でこの修正の実地効果を確認する機会があった。ログ実測: <b>D→P(WAIT_PARK)は成功したが、P→Rの遷移はこのケースで失敗</b>(gear_report=PARKのまま6回のBACKUP試行が全て空振り)。SHUFFLE→WAIT_DRIVE_PUSH→PUSH(DRIVE)で前進側から脱出し、周回を継続できた。このサイクルがcycle=0,1,2と3回連続発生(微小前進0.15-0.16mで「cleared」判定→数秒後に同じSTUCKを再検知)。単純なD→P→Rの2段階修正だけでは、壁への強い衝突直後の特定条件下でのギア遷移不全を完全には解消できないことが実地で判明した。前進側フォールバック(PUSH)自体は機能しており、部分的な改善効果は確認できた。
+</p>
+
+<h3>272続報. P→R失敗の根本原因特定とgear_park_dwell_cycles対策(2026-08-04)</h3>
+<p class="small">
+Q[e_psi]=2500000のn=2実験(q25_r1・q25_r2)でも同一パターン(wp282-289帯)が再発。
+うちq25_r2はshuffle_cycleがエピソード横断でリセットされない既存の設計ギャップ
+(WAIT_DRIVE_PUSH/PUSHにすら到達しなくなる)と重なり、約390秒間ノンストップで
+STUCKループが継続し<b>target8周回に対し0周回でrun全体を喪失</b>した(詳細は
+[[stuck-escalation-gap-confirmed-full-run-loss-0804]]、要ユーザーメモリ参照。
+q25_r2は破棄しq25_r2_retryとして再実験、そちらでも同一地点で2回発火、うち1回は
+自動PUSH脱出、1回はユーザーが手動でRレンジへ切替して脱出)。同日中の実地5件
+(このセッションの前半3件+今回2件)全てでD→Pは成功・P→Rは失敗というパターンが
+完全に一貫していた。
+</p>
+<p class="small">
+ログを精査した結果、<b>根本原因はconfirmedフラグの即時偽陽性</b>と判明した:
+WAIT_PARK突入直後(1周期未満、実測で1.3ms程度)に<code>gear_report.report==PARK</code>
+が既にTrueになっており、confirmed扱いで即座にWAIT_REVERSEへ通過していた——これは
+今回のPARK要求が実際に処理された結果ではなく、直前エピソード
+(STUCK-BACKUP-BLOCKED giveup等)の残存状態を拾っているだけの疑いが強い。対処として、
+WAIT_PARKの遷移条件からconfirmedを完全に除去し、新設パラメータ
+<code>gear_park_dwell_cycles</code>(既定40周期≈1.0s)による無条件の固定滞留に
+変更した(<code>_handle_stuck_recovery</code>のWAIT_PARK分岐、mpc_controller.py)。
+テスト`test_stuck_wait_park_before_reverse_0804.py`を新設計に合わせ全面更新、
+回帰スイート3060件全PASS。<b>実地(dev3/qualifying)再検証は未実施</b>。なお、
+このバグの発生自体はユーザー確認によりローカルAWSIM環境限定(予選環境では未確認)
+であり、本修正の目的は予選挙動の改善ではなくローカル反復実験のスループット
+改善である点に留意。
+</p>
+
+<h3>273. Q[e_psi]の発見とスイープ: 直線改善とコーナー代償のU字トレードオフ</h3>
+<p class="small">
+config.yamlのQベクトルが<code>[e_y, e_psi, t, delta_actual]</code>の4要素形式で、<b>Q[e_psi]=100,000,000がQ[e_y]勝者(200000)の500倍</b>という極端な値であることが判明。Gemini初期相談時の代替仮説(「Q[e_psi]が高すぎて姿勢を無理に合わせようとステアリングを過剰に切り返している」)と符合するため、Q[e_y]=200000固定でQ[e_psi]=1e8(基準)/2e7/5e6/1e6/2e5の5点をスイープした(1e8は絞り込みラウンドのn=2データを再利用)。
+</p>
+<table class="xtab" style="width:100%; font-size:0.85rem;">
+<tr><th>Q[e_psi]</th><th>1e8(基準)</th><th>2e7</th><th>5e6</th><th>1e6</th><th>2e5</th></tr>
+<tr><td>直線層std</td><td>5.6-6.1°</td><td>3.22°</td><td>2.42°</td><td>2.48°</td><td><b>2.33°</b></td></tr>
+<tr><td>振幅検出不能数(/18)</td><td>0</td><td>3</td><td>6</td><td>4</td><td>7</td></tr>
+</table>
+<p class="small">
+直線層stdはQ[e_psi]を下げるほど単調改善し5e6以下でほぼ飽和(2.3-2.5°)。一方、振幅検出不能数(リンギングのピークが2個未満で検出不能=振動ではなく別種の乱れの疑い)が増加。ユーザーの目視で「Q[e_psi]=1e6でコーナー進入の向き遅れ・過剰操舵」「2e5ではコーナーで不安定」を確認。AWSIM起動ハング(90秒超過してもLOC-XCHECK皆無)を初めて経験し、原因(<code>autostart_orchestrator</code>のワークフローが<code>/awsim/state</code>のReady待ちで停止)を特定、以降のスクリプトに90秒ハング検知+自動リトライを組み込んだ。テスト9件追加。
+</p>
+
+<h3>274. Q[e_y]×Q[e_psi] 2×3クロスチェック: Q[e_y]の支配を再確認</h3>
+<p class="small">
+別Claudeの「Q[e_psi]低減で蛇行が消えた以上、Q[e_y]を上げてコーナー向き遅れを補える可能性がある」という仮説を検証するため、Q[e_y]∈{200k,400k,700k}×Q[e_psi]∈{5e6,1e6}の2×3(既存2セル+新規4run)を実施。
+</p>
+<table class="xtab" style="width:100%; font-size:0.85rem;">
+<tr><th>Q[e_y]\Q[e_psi]</th><th>5e6</th><th>1e6</th></tr>
+<tr><td>200000</td><td><b>2.42°</b></td><td>2.48°</td></tr>
+<tr><td>400000</td><td>5.16°</td><td>6.31°</td></tr>
+<tr><td>700000</td><td>11.03°</td><td>12.58°</td></tr>
+</table>
+<p class="small">
+（表は直線層std）Q[e_y]が支配的で、700kまで上げると直線層stdが200k比で約5倍悪化する一方、ホットスポット改善効果は最大でも約2倍程度に留まった。<b>「Q[e_y]を上げてコーナー向き遅れを補う」仮説はこのデータで明確に否定された</b>——ユーザー目視(700k×1e6は直線・コーナーとも悪い)とも一致。Q[e_y]=200000を確定し、Q[e_psi]の選定へ絞り込んだ。
+</p>
+
+<h3>275. n=2確認での判定逆転とコーナーバイアス検査ツールの新設</h3>
+<p class="small">
+Q[e_psi]=5e6 vs 1e6を各n=2で再確認したところ、n=1では5e6優勢に見えた判定が<b>逆転</b>した。直線層stdは両条件で実質同一(5e6平均2.40° vs 1e6平均2.41°)。一方wp269-282のホットスポットstall率は5e6が2本とも11.1%、1e6が2本とも0.0%——再現性のある差で1e6が明確に優位。
+</p>
+<p class="small">
+しかしユーザーは1e6の走行でwp180・wp252(内巻き)・wp340(蛇行)を目視確認しており、既存のコーナー出口振幅分析(リンギング検出の枠組み)ではこの種の符号付きバイアス(振動ではなくライン逸脱そのもの)を捕捉できない可能性が高いと判断し、新規<code>scripts/analyze_corner_bias_check.py</code>(指定wp区間の符号付きekf_ey統計を周回別に算出)を実装した。既存4ログに適用したところ、<b>周回間でほぼ完全に再現する系統的バイアスを検出</b>(wp175-185: 5e6=-0.825m/-0.825m vs 1e6=-0.955m/-0.957m、wp247-257: 5e6=0.29m vs 1e6=0.50m、wp335-345: 5e6は変動域が狭い[-0.075m止まり]が1e6は-0.55m台まで拡大)——目視観察はノイズではなく実在する現象と確定した。テスト5件追加、回帰3059件PASS。
+</p>
+<p class="small">
+<b>結論</b>: wp269-282(ハード制約)では1e6優位、wp180/252/340(質的懸念)では5e6優位という一見矛盾する結果が得られ、「向き追従の最適量はコーナーのタイプ(切り返し型 vs 単調型)で逆向きに効く」という解釈で両者と合意。Gemini・別Claude共通の提案で、中間値Q[e_psi]=2,500,000のn=2検証を反復調整ラウンドAとして実施中(結果は次節)。
+</p>
+<p class="small">
+<b>反復調整の型(Gemini・別Claude合意、将来v_max=25/30/35km/hへの引き上げ時に再利用予定)</b>: ①感度順の特定(広域スイープで支配パラメータを特定、今回はQ[e_y])②座標降下(支配側から対数スイープ→絞り込み→n=2確定、n=1で確定しない)③判定は2段(ハード制約[stall/衝突/p95悪化なし]を先に適用→生存者をソフト指標[蛇行std・目視]で選ぶ)④交互再確認は1往復まで(勝者不変なら収束、変われば1往復のみ追加)⑤各ラウンドを同一様式で記録し将来の速度段階に積み重ねる。</p>
+
+<p class="small">生成: 2026-07-07 / 2026-08-04追記(268〜275節: レート飽和検査で曲率SWING仮説を棄却、EKF/GNSS比較で蛇行の物理性確定、Q[e_y]・Q[e_psi]の反復スイープでAXIS06本体の主犯パラメータを特定、STUCK復帰のP→R失敗を実地発見、wp269-282間欠衝突とコーナーバイアスという2つの独立した副課題を発見)/ 新規分析ツール: scripts/analyze_steer_rate_saturation.py・analyze_ekf_artifact_check.py・analyze_corner_bias_check.py / 関連メモリ(セッション横断): phase1-rate-saturation-component-b-dominant-0804・ekf-artifact-exclusion-check-0804・q-ey-log-sweep-monotonic-wobble-0804・q-ey-narrowing-round-wp280-collision-0804・stuck-normal-handoff-infinite-loop-wall-pin-0804・q-grid-final-and-overtake-pit-q-0804 / 相談記録: docs/superpowers/specs/2026-08-04-*.md(Gemini×5、別Claude×4)</p>
 </body>
 </html>
