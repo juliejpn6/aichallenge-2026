@@ -351,7 +351,7 @@ overtake:
 # QPコストを本線とは別に解いて[OT-SHADOW]ログへ記録するだけの診断機能。既定OFF、
 # ONでも本線のside選択・コリドー・状態機械には一切書き戻さない(design_docs 283/285節)。
 ot_shadow_qp:
-  enable: false          # 既定OFF。ONでも制御出力は変化しない(構造的等価性テスト参照)
+  enable: true           # 2026-08-05: 次回実走行でPart B([OT-SHADOW]ログ)を検証するためON
   period_cycles: 1       # [周期] この数おきに1回実行(間引き、[PERF]予算超過時は自動増加)
 
 # 発進地点(車庫/ピット)とコース上を自動判別し、参照経路と速度を切り替える。
