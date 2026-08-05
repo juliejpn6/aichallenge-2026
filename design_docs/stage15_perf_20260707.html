@@ -8744,5 +8744,33 @@ SIGINT/TERM転送改善、我々のBLASスレッド制限+upstreamのexec化、�
 未使用・現行トラック(final_ver3)には影響なし。
 </p>
 
+<h3>291続報. マージ後に発覚: x-autoware-eval-baseアンカー欠落でmake dev3が起動不能</h3>
+<p class="small">
+tau n=2検証(294節)のためrun6を起動しようとしたところ、
+<code>yaml: line 161, column 11: unknown anchor 'autoware-eval-base' referenced</code>
+で<code>make dev3</code>が即座に失敗した。291節の6件コンフリクト解決時には
+<code>docker-compose.yml</code>の<b>conflict-flag付き</b>ハンクのみを確認しており、
+<code>x-autoware-eval-base</code>アンカーの<b>定義</b>ブロック(<code>autoware-d1</code>〜
+<code>autoware-d4</code>が参照、非conflict扱いで自動マージされた別セクション)は
+確認対象外だった。
+</p>
+<p class="small">
+<code>git show b499125:docker-compose.yml</code>(マージ直前コミット)で当該定義が
+存在すること、<code>git show origin/main:docker-compose.yml</code>ではupstream側が
+そもそもこのアンカーを持たない構成(<code>docs/spec/</code>系の再構成に伴う設計変更と
+推測)であることを確認。3-wayマージが「upstream側で削除・自分側で無変更」と機械的に
+判定し、conflictを起こさず定義ブロックのみを静かに消去したと結論した(参照側4箇所は
+自分側の変更として残ったため不整合が発生)。<code>pytest</code>回帰では検知不可能
+(YAML専用のバグ、Python側は無関係)で、実際に<code>docker compose</code>を起動する
+まで気づけなかった。b499125時点の内容をそのまま復元し、
+<code>docker compose config -q</code>でYAML健全性・回帰スイート3089件全PASSを確認して
+コミット(<code>ed3aa2c</code>)。
+</p>
+<p class="small">
+<b>教訓</b>: 大規模merge後の検証は、conflictマーカーが立った箇所だけでなく
+「非conflict自動マージ」区間も(特にYAML/anchorのような行ベースdiffが意味を壊しうる
+形式では)実際にツールを起動して確認する必要がある。
+</p>
+
 </body>
 </html>
