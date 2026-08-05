@@ -53,7 +53,11 @@ def test_counters_initialized_to_zero():
 
 
 def test_params_declared_in_yaml_with_correct_defaults():
-    assert "r_delta_swing_boost: 400.0" in _YAML_SRC
+    """2026-08-05(task#295、306節続報3)にboost値400.0→800.0へ改定。dev3 A/Bで
+    wp340-40帯の周回間std改善(1周目暖機を除きほぼ0.00-0.03m、旧400.0時は
+    0.19-0.85m)を確認し、他ホットスポット・対照区への悪影響なしを確認した上で
+    採用した(config.yamlのr_delta_swing_boost行コメント参照)。"""
+    assert "r_delta_swing_boost: 800.0" in _YAML_SRC
     assert "r_delta_swing_kappa_lo: 0.12" in _YAML_SRC
     assert "r_delta_swing_kappa_hi: 0.30" in _YAML_SRC
     assert "r_delta_swing_lookahead_wp: 16" in _YAML_SRC
@@ -63,8 +67,10 @@ def test_params_declared_in_yaml_with_correct_defaults():
 def test_boost_restored_after_ab_test_exonerated_it_178():
     """178節: dev3実走行で超過率29.5-52.75%を観測しboost=0.0のA/Bテストを行ったが、
     boost=0.0でも超過率31.75-45%とほぼ同水準(r_delta_swing_total avg=0.1ms、updates=1で
-    固定)であり、本機構は処理落ちの原因ではないと判定された。400.0へ復帰する。"""
-    assert "r_delta_swing_boost: 400.0" in _YAML_SRC
+    固定)であり、本機構は処理落ちの原因ではないと判定された。400.0へ復帰した。
+    2026-08-05(306節続報3): 別の実験(wp340-40帯対策)により400.0→800.0へ再改定。
+    テスト名は歴史的経緯を示す旧名のまま維持し、値のみ現行に追従する。"""
+    assert "r_delta_swing_boost: 800.0" in _YAML_SRC
 
 
 def test_base_r_array_unchanged_500():
