@@ -96,8 +96,10 @@ def test_wait_park_block_precedes_wait_reverse_block_and_requests_park():
     snippet = _SRC[idx_park:idx_reverse]
     # 2026-08-05更新(293節続報): GearCommandパブリッシュがエッジトリガー化ヘルパー
     #   (_publish_gear_cmd_throttled)経由になったため、直接代入ではなく呼び出しを確認する。
-    assert "self._publish_gear_cmd_throttled(now, GearCommand.PARK)" in snippet
-    assert "self._gear_report.report == GearReport.PARK" in snippet
+    # さらに同日、公式仕様(command: 1=NEUTRAL/2=DRIVE/20=REVERSE、PARK=22は非対応)が
+    #   判明したため、中間ギアをPARKからNEUTRALへ変更した(状態名"WAIT_PARK"自体は維持)。
+    assert "self._publish_gear_cmd_throttled(now, GearCommand.NEUTRAL)" in snippet
+    assert "self._gear_report.report == GearReport.NEUTRAL" in snippet
     assert 'self._stuck_state = "WAIT_REVERSE"' in snippet
     # 退行防止: WAIT_PARK内でBACKUPへ直接進む旧経路を誤って残していないこと
     assert 'self._stuck_state = "BACKUP"' not in snippet

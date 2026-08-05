@@ -121,14 +121,16 @@ def test_no_direct_gear_cmd_publish_remains_in_handle_stuck_recovery():
         break
     snippet = _SRC[idx:idx_end]
     assert "self._gear_cmd_pub.publish(gear_cmd)" not in snippet
-    assert snippet.count("self._publish_gear_cmd_throttled(now, GearCommand.PARK)") == 1
+    # 2026-08-05追加修正(293節続報): 公式仕様(PARK=22は非対応)判明を受け、WAIT_PARK
+    #   ステップの送信値をPARKからNEUTRALへ変更した(状態名"WAIT_PARK"自体は維持)。
+    assert snippet.count("self._publish_gear_cmd_throttled(now, GearCommand.NEUTRAL)") == 1
     assert snippet.count("self._publish_gear_cmd_throttled(now, GearCommand.REVERSE)") == 2
     assert snippet.count("self._publish_gear_cmd_throttled(now, GearCommand.DRIVE)") == 2
 
 
 def test_total_helper_call_count_is_five():
     n = _SRC.count("self._publish_gear_cmd_throttled(now, GearCommand.")
-    assert n == 5, f"想定は5箇所(PARK1・REVERSE2・DRIVE2)だが{n}箇所で見つかった"
+    assert n == 5, f"想定は5箇所(NEUTRAL1・REVERSE2・DRIVE2)だが{n}箇所で見つかった"
 
 
 # ---------------------------------------------------------------------------

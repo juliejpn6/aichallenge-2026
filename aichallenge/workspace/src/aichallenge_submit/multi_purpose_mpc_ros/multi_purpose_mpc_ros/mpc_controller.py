@@ -2152,23 +2152,33 @@ class MPCController(Node):
         2026-08-05追加(293節続報): GearCommandのパブリッシュは_publish_gear_cmd_throttled
         経由(エッジトリガー+間引き再送)へ統一した。詳細は同メソッドのdocstring参照。"""
         if self._stuck_state == "WAIT_PARK":
-            # 2026-08-04追加(ユーザー確認: D→Rへ直接シフトできず、D→P→Rの順でのみ
-            #   Rレンジが入る仕様): WAIT_REVERSEの前段として必ずPARKを経由する。
+            # 2026-08-04追加(ユーザー確認: D→Rへ直接シフトできず、D→?→Rの順でのみ
+            #   Rレンジが入る仕様): WAIT_REVERSEの前段として必ず中間ギアを経由する。
             # 2026-08-04同日さらに修正: 実測(本日5件、全てwp282-289帯)で、この直後の
-            #   P→R遷移(WAIT_REVERSE)が毎回失敗していた。ログ調査の結果、WAIT_PARK
+            #   ?→R遷移(WAIT_REVERSE)が毎回失敗していた。ログ調査の結果、WAIT_PARK
             #   突入直後(1周期未満)にgear_report.report==PARKが既に真になっており
             #   即座にconfirmed扱いで通過していた——直前エピソード(STUCK-BACKUP-BLOCKED
-            #   giveup等)の残存状態を拾っているだけで、「今回のPARK要求が実際に処理された」
+            #   giveup等)の残存状態を拾っているだけで、「今回の要求が実際に処理された」
             #   ことの確認になっていない疑いが強い。confirmedを信用せず、
             #   gear_park_dwell_cycles周期は無条件で滞留してからWAIT_REVERSEへ進む
             #   (ローカルAWSIM限定の既知問題への対策、詳細は
             #   [[stuck-normal-handoff-infinite-loop-wall-pin-0804]]。実地未検証)。
-            self._publish_gear_cmd_throttled(now, GearCommand.PARK)
+            # 2026-08-05修正(293節続報、PARK->NEUTRAL): ユーザー提示の公式仕様
+            # (/control/command/gear_cmd の command: 1=NEUTRAL, 2=DRIVE, 20=REVERSE)に
+            #   PARK(22)が含まれていないと判明した。08/04時点では「自動車の一般常識」で
+            #   中間ギアにPARKを選んだが、これは未検証の仮定であり、公式に列挙された
+            #   値ではなかった。gear_settle_cycles/gear_park_dwell_cycles拡大・
+            #   エッジトリガー化の2回連続でREVERSE確認が改善しなかった根本原因は、
+            #   そもそも仕様外のPARKを送り続けていたことだった可能性が高い。
+            #   中間ギアをNEUTRAL(1、仕様に明記された値)へ変更する。状態名"WAIT_PARK"
+            #   自体は既存の状態遷移・ログ文言・テストへの影響を抑えるため維持するが、
+            #   実際に送信・確認する値はNEUTRALへ切り替える。
+            self._publish_gear_cmd_throttled(now, GearCommand.NEUTRAL)
             self._stuck_gear_wait_count += 1
-            _confirmed = (self._gear_report.report == GearReport.PARK)
+            _confirmed = (self._gear_report.report == GearReport.NEUTRAL)
             if self._stuck_gear_wait_count >= self._stuck_gear_park_dwell_cycles:
                 self.get_logger().warn(
-                    f"[STUCK] gear=PARK {'confirmed' if _confirmed else '未確認だが規定周期経過'} "
+                    f"[STUCK] gear=NEUTRAL {'confirmed' if _confirmed else '未確認だが規定周期経過'} "
                     f"(実際のgear_report={self._gear_label(self._gear_report.report)}) -> WAIT_REVERSEへ")
                 self._stuck_state = "WAIT_REVERSE"
                 self._stuck_gear_wait_count = 0
