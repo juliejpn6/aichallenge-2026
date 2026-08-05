@@ -353,6 +353,12 @@ overtake:
   pass_block_kappa: 0.10  # [1/m] きついコーナー閾値(R≤10m、この内側は選ばない)
   pass_clear: 3.0         # [m] 抜き切り=相手の前にこれだけ出る
   pass_t_max: 8.0         # [m] パス所要時間の予算(超えるなら追従の方がロスが少ないと判断)
+  # 2026-08-05追加(候補④、task#293): 相手が走行中の場合のENGAGE遅延(追いつくまで
+  #   既定経路を走行、最短距離オーバーテイク)。外部AI相談+Phase 0オフライン実測
+  #   (scripts/analyze_engage_vs_icc_ordering.py)でmargin=1.0〜1.5秒が実用バランス点
+  #   と判明。既定OFF: 実地dev3検証(n≥2)未実施のため、有効化は今後の検証を経てから。
+  catchup_predict_enable: false   # 相手走行中の追いつき予測ENGAGE遅延を有効化するか
+  catchup_engage_margin_s: 1.5    # [s] 追いつき予測の閾値へ上乗せする安全マージン
   def_enter_cycles: 5     # [周期] 被追い越し判定のデバウンス(ON、素早く)
   def_exit_cycles: 15     # [周期] 被追い越し判定のデバウンス(OFF、ゆっくり=チャタ防止)
   # H4-lite: infeasible自己ロックの前進リカバリ(壁際でMPC不可解→u0=0固着への対策)。

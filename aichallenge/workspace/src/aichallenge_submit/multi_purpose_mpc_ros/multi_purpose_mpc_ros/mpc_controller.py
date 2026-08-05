@@ -910,6 +910,16 @@ class MPCController(Node):
             self._ot_pass_block_kappa = float(_otget("pass_block_kappa", 0.10))   # [1/m] 内側可否判定のきついコーナー閾値(R≤10m)
             self._ot_pass_clear = float(_otget("pass_clear", 3.0))                # [m] 「抜き切り」= 相手の前にこれだけ出る
             self._ot_pass_t_max = float(_otget("pass_t_max", 8.0))                # [s] パス所要時間の予算(超過=追従の方が速い)
+            # 2026-08-05追加(候補④、task#293、design_docs
+            #   predictive_control_overtake_development_plan_20260805.md 6-9節):
+            #   相手が走行中の場合のENGAGE遅延(追いつくまで既定経路を走行)。
+            #   外部AI相談+Phase 0オフライン実測(scripts/analyze_engage_vs_icc_ordering.py)
+            #   でmargin=1.0〜1.5秒が実用バランス点と判明、1.5を既定値とする。
+            #   既定OFF: 実地dev3検証(n≥2)未実施のため、有効化は今後の検証を経てから判断する。
+            self._ot_catchup_predict_enable = bool(
+                _otget("catchup_predict_enable", False))  # 相手走行中の追いつき予測ENGAGE遅延を有効化するか
+            self._ot_catchup_engage_margin_s = float(
+                _otget("catchup_engage_margin_s", 1.5))   # [s] 追いつき予測の閾値へ上乗せする安全マージン
             self._def_enter_cycles = self._rate_scaled_cycles(
                 "def_enter_cycles", int(_otget("def_enter_cycles", 5)))           # [周期] 被追い越しON確定(≈0.12s連続)
             self._def_exit_cycles = self._rate_scaled_cycles(
@@ -3077,13 +3087,33 @@ class MPCController(Node):
             max(self._ot_engage_max_dist,
                 _closing_est * self._ot_t_lateral + self._ot_pass_clear))
         _t_reach_profile = None
+        _t_reach_margin = 0.0
         _is_stopped_for_profile = (opp_sit.fwd_vopp is not None
                                     and opp_sit.fwd_vopp < self._opp_obstacle_speed)
         if _is_stopped_for_profile and scan.get("fwd_wp") is not None:
             _t_reach_profile = self._predicted_time_to_wp(
                 int(self._mpc.model.wp_id), int(scan["fwd_wp"]), self._fwd_max_consider)
+        # 2026-08-05追加(候補④、task#293、design_docs
+        #   predictive_control_overtake_development_plan_20260805.md 6-9節):
+        #   相手が走行中の場合も、config gate(既定OFF、実地未検証のため)がONの
+        #   ときのみ_predicted_catch_up_timeで追いつき時刻を予測する。停止相手の
+        #   既存分岐(上のif)は無変更(退行防止)。外部AI相談(Gemini・別Claude)+
+        #   Phase 0オフライン実測(scripts/analyze_engage_vs_icc_ordering.py)で、
+        #   icc_stop側には一切触れず、この閾値へmargin(既定1.5秒、
+        #   overtake.catchup_engage_margin_s)を上乗せするだけで、icc_stopの
+        #   制動開始距離より先にENGAGEが発火する順序を高v_rel域でほぼ完全に
+        #   保証できることを確認済み(低v_rel域は構造的限界があるが、僅差の
+        #   相手には無理に突っ込まず速度を合わせる、というレース的に正しい
+        #   劣化として許容する設計判断済み)。
+        elif (self._ot_catchup_predict_enable and not _is_stopped_for_profile
+              and opp_sit.fwd_vopp is not None and opp_sit.fwd_ds is not None):
+            _t_reach_profile = self._predicted_catch_up_time(
+                int(self._mpc.model.wp_id), opp_sit.fwd_ds, opp_sit.fwd_vopp,
+                self._fwd_max_consider)
+            _t_reach_margin = self._ot_catchup_engage_margin_s
         if _t_reach_profile is not None:
-            _t_reach_thr = self._ot_t_lateral + self._ot_pass_clear / _closing_est
+            _t_reach_thr = (self._ot_t_lateral + _t_reach_margin
+                             + self._ot_pass_clear / _closing_est)
             _close_enough = _t_reach_profile <= _t_reach_thr
         else:
             _close_enough = (opp_sit.fwd_ds is not None
@@ -3582,6 +3612,65 @@ class MPCController(Node):
                 v_kmh = float(self._cfg.mpc.v_max)  # type: ignore
             v = max(kmh_to_m_per_sec(v_kmh), 0.1)
             total_t += seg / v
+            total_d += seg
+            if total_d > max_dist:
+                return None
+            wp = nxt
+        return None
+
+    def _predicted_catch_up_time(self, from_wp: int, opp_ds_now: float,
+                                  opp_v: float, max_dist: float):
+        """2026-08-05追加(候補④、task#293 Part C・design_docs
+        predictive_control_overtake_development_plan_20260805.md 6-9節、外部AI
+        [Gemini・別Claude]相談+Phase 0オフライン実測で設計確定): 上記
+        _predicted_time_to_wp(相手が停止/低速の場合専用)を、相手が走行中
+        (等速仮定)の場合にも拡張した2体問題版。
+
+        相手の現在弧長ギャップ(opp_ds_now)から抜き切りクリアランス
+        (self._ot_pass_clear)を差し引いた「詰める必要のある距離」を、区間ごとの
+        自車計画速度(v_ego、_predicted_time_to_wpと同じref_vel_configulator参照)と
+        相手の現在速度(opp_v、短時間等速仮定)の相対速度で閉形式に解く。区間内で
+        相対速度v_relが正(自車の方が速い)かつギャップが区間通過時間内に詰まる
+        場合はその区間内で解が確定する(反復・二分探索は不要、外部AI相談で
+        「区間ごとの閉形式+線形走査」を推奨されたことに基づく)。
+
+        追い越し地点(コーナー)を推定し、そこに到達するまではオフセットせず
+        既定経路(レースライン/コリドー中心)を走行する、というユーザー要求の
+        実現に使う。呼び出し側で本関数の結果と閾値の比較により_close_enough
+        (ENGAGE可否)を決めることで、新しい中間状態を作らずに済む設計
+        (既存のSTOPPING状態が自然に「追いつくまで待つ」区間として機能する)。
+
+        ref_vel_configulatorが無い・相手情報が欠落・max_dist超過の場合は
+        Noneを返し、呼び出し側は既存のフォールバック(_engage_dist_dynamic)へ
+        委ねる(退行防止、安全側デフォルト)。"""
+        if self._ref_vel_configulator is None:
+            return None
+        if opp_ds_now is None or opp_v is None:
+            return None
+        _gap = opp_ds_now - self._ot_pass_clear
+        if _gap <= 0.0:
+            return 0.0  # 既に抜き切りクリアランス以内(既に十分近い)
+        rp = self._reference_path
+        n = len(self._wp_s_cum)
+        wp = int(from_wp) % n
+        t = 0.0
+        total_d = 0.0
+        for _ in range(n):
+            nxt = (wp + 1) % n
+            seg = float(self._wp_s_cum[nxt]) - float(self._wp_s_cum[wp])
+            if rp.circular and seg < 0.0:
+                seg += rp.length
+            try:
+                v_kmh = self._ref_vel_configulator.get_ref_vel(wp)
+            except Exception:
+                v_kmh = float(self._cfg.mpc.v_max)  # type: ignore
+            v_ego = max(kmh_to_m_per_sec(v_kmh), 0.1)
+            _seg_time = seg / v_ego
+            _v_rel = v_ego - opp_v
+            if _v_rel > 1e-6 and _gap <= _v_rel * _seg_time:
+                return t + _gap / _v_rel   # この区間内で閉形式に追いつく
+            _gap -= _v_rel * _seg_time     # v_rel<=0ならgapはむしろ広がる(自然に扱われる)
+            t += _seg_time
             total_d += seg
             if total_d > max_dist:
                 return None
