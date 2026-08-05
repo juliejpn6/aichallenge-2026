@@ -8917,5 +8917,55 @@ giveup閾値の精査に着手したが、対象パラメータ(<code>alongside_
 先に集めてから着手する。
 </p>
 
+<h3>296. リバース自動化の追求を凍結 — 最小再現ノードで強い状況証拠、ただし未確定のまま(task#304完了)</h3>
+<p class="small">
+293〜295節にわたる一連の対処(gear_settle_cycles拡大20→50→200、GearCommand
+エッジトリガー化、中間ギアPARK→NEUTRAL修正、WAIT_REVERSE行動ベース確認方式
+[外部AI(Gemini/Claude)相談の最有力仮説]への転換)をdev3で連続して実地検証したが、
+いずれもREVERSE確認成功率(dev3実測)を改善できなかった(一貫して0%近辺)。
+</p>
+<p class="small">
+<b>最小再現ノード試験</b>: 外部AI(通称TPACさんの分析を含む)の提案に従い、
+自作の<code>mpc_controller</code>を完全停止した状態で、無関係な最小限の
+rclpyノードから直接REVERSE要求+継続的な制御指令(20Hz、毎回stamp更新)を
+10秒間送り続けた。結果: 1秒以内にGearReportがPARK(22)へ変化し、以降10秒間
+REVERSEへ戻らなかった(速度は終始ノイズレベルでゼロ)。同一環境で直前に実施した
+「Manualで手動Rへ入れた状態のままAutonomousへ復帰」する差分試験では、
+mpc_controller停止時はRレンジが維持されることも確認済み。
+</p>
+<p class="small">
+<b>訂正(第3回相談での指摘)</b>: 当初「REVERSE要求がROS経由で一瞬受理された」
+「AWSIM側のR入力経路自体が拒否している」と断定したが、これは時期尚早だった。
+(1)本試験は直前のManual→Autonomous差分試験の直後に同一車両で実施したため、
+t=0時点のREVERSE状態はManual操作の残存の可能性があり「ROS要求が受理された」
+証拠にはならない。(2)AWSIM公式仕様では<code>longitudinal.speed</code>は未使用で、
+本試験の<code>speed=-1.0</code>は無意味だった——実際に効いていたのは
+<code>acceleration=-1.0</code>のみで、これが「後退駆動」か「ブレーキ」かは
+未分離。<code>GearCommand.REVERSE</code>単体・ゼロ制御単体・負加速度単体を
+分離した追加試験(4種、外部AI提案)はまだ未実施。<b>「本線コントローラや
+publisher競合が原因ではない」ことは確実に言えるが、「AWSIM自体の入力経路の
+バグ」と確定するには材料不足</b>という、より正確な状況認識へ訂正する
+(詳細は`docs/superpowers/specs/2026-08-05-awsim-reverse-gear-minimal-repro-
+result.md`の訂正版参照)。
+</p>
+<p class="small">
+念のため<code>./setup.bash download awsim</code>でAWSIM.zipの再取得も実施したが、
+MD5ハッシュが完全に一致(2026-07-26版から更新なし)であり、この経路では解決しない
+ことを確認した。
+</p>
+<p class="small">
+<b>ユーザー判断によりこの制約を前提として受け入れ、ROS側でのREVERSE自動化の
+追求はここで凍結する</b>。既存の安全網(291節、<code>stuck_recovery.
+shuffle_hard_limit</code>、経路非依存でSTUCK復帰を断念しNORMALへ委譲する
+仕組み)がある限り、自動REVERSE不能でも「run全体喪失」級の実害は限定される
+(自力回復できずともPUSHのみでの脱出試行やタイムアウトによる復帰断念が働く)。
+本節時点でのコード変更は無し(293〜294節続報で実装した各修正——gear_settle_cycles
+=200、エッジトリガー化、NEUTRAL中間ギア、行動ベース確認——は、いずれも無害な
+改善のため revert はしていない)。今後の一手は、4種の因果分離試験の実施・
+大会運営への問い合わせ(最小再現結果を添付)を選択肢として残しつつ、当面は
+task#300/302/305(OT giveup閾値・ENGAGE可否判定・ステアリング急操作)など、
+レーティングへの影響がより大きい課題へリソースを振り向ける。
+</p>
+
 </body>
 </html>
