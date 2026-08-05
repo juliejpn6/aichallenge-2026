@@ -1,8 +1,10 @@
 # opp_lat_pred根本修正 + 並走ガード + 離脱意味論 設計書(task#295/306統合対応)
 
-**ステータス**: 設計完了、実装前。外部AIレビュー待ち。
+**ステータス**: 外部AIレビュー(Gemini・別Claude)反映済み、実装未着手。
 **根拠**: `predictive_control_overtake_development_plan_20260805.md` 14-19節、
 `stage15_perf_20260707.html` 306節続報3。
+**改訂**: 2026-08-06、レビュー反映(§8参照、must-fix 3点+推奨4点を本文へ
+統合済み)。
 
 ## 0. 対象とする3つの不具合、および設計方針
 
@@ -100,6 +102,19 @@ def _estimate_opp_lateral_velocity(self, vid, wp) -> Optional[float]:
 既存の`self._ot_min_needed_lat_vel_clamp`(既定2.0m/s)を最終防御として
 射影後の値にも適用する(縮退防止・保険、新規パラメータは増やさない)。
 
+**2026-08-06追加(外部AIレビューmust-fix 3)**: 実装着手前に
+`tracker.velocity()`の実挙動を以下の3ケースについて調査し、意味論を
+確定させる: (a)未知vid(トラッカーが一度も観測していない相手)、
+(b)速度窓未充足(新規vid検出直後、`speed_window`個のサンプルが
+まだ揃っていない)、(c)`clamp_hold_enabled`のON/OFF両設定でのV2X速度
+異常発生中。現状のコード(`velocity()`実装、`v2x_vehicle_tracker.py:116`)
+は未観測時に`(0.0, 0.0)`を返す設計に見えるが、**「相手速度0」と
+「データなし」を混同しない**よう、`_estimate_opp_lateral_velocity()`
+側で以下のフォールバックを明示する: データなし・鮮度失効(直近update()
+からの経過時間が閾値超)の場合はNoneを返し、呼び出し側は
+`opp_lat_pred = opp_lat_now`(外挿なし、300節導入前の安全な挙動と同一)
+とし、診断ログへ理由を記録する。
+
 ### 1.5 診断ログへの影響
 
 `opp_wp`/`opp_raw_lat_vel`(2026-08-05追加の診断フィールド)は、旧実装の
@@ -139,28 +154,69 @@ def _update_overlap_state(self, opp_ds_now: Optional[float]) -> bool:
 
 ### 2.2 オフセット床の適用(共有ヘルパー、新規)
 
+**2026-08-06改訂(外部AIレビューmust-fix 1)**: 当初案は既存の168節フリーズ値
+(`self._ot_last_valid_target_mag`)を床として二重利用する設計だったが、
+外部AI(Gemini・別Claude)の指摘により2つの欠陥が判明し**廃案**とした:
+(a) この変数はコリドー崩壊対策自身が「今周期の(既に崩壊しかけた)
+target_mag」で毎周期更新されるため、床として読む時点で既に汚染されている
+可能性がある(更新→参照が同一周期内で同じ変数に対して起きるため、
+実装のわずかな順序次第で床自体が崩落する)、(b) 一度フリーズした値を
+そのまま床にすると、その後コリドー自体が本当に狭まった場合に床が壁を
+突き破りうる。専用の新規状態変数へ分離し、適用時に必ず現在のcorr_boundで
+再キャップする。
+
 ```python
-def _apply_overlap_floor(self, target_mag: float, opp_ds_now: Optional[float]) -> float:
-    """並走中はtarget_magを縮小させない。既存の168節フリーズ値
-    (self._ot_last_valid_target_mag、corr_bound>0だった直近周期のmin(min_needed,
-    corr_bound))を床として再利用する(新規の床専用変数を増やさない=非冗長性)。
-    コリドー実測(corr_bound)は既にこのフリーズ値へ織り込み済みのため、壁を
-    優先する既存の優先順位(168節)はそのまま維持される——本ガードはコリドーの
-    上限を上書きしない。"""
-    if (self._update_overlap_state(opp_ds_now)
-            and self._ot_last_valid_target_mag is not None):
-        target_mag = max(target_mag, self._ot_last_valid_target_mag)
+def _apply_overlap_floor(self, target_mag: float, opp_ds_now: Optional[float],
+                          corr_bound: float) -> float:
+    """並走中はtarget_magを縮小させない。床は並走エピソード専用の新規状態
+    (self._ot_overlap_floor_mag、ピーク保持=単調非減少)を使う——既存の
+    168節フリーズ値(_ot_last_valid_target_mag)とは別変数にし、意味論の
+    衝突(同一変数が「コリドー崩壊対策」と「並走ガード」の二重の意味を
+    持つことによるバグ)を避ける。
+
+    不変条件(単体テストで保証すること):
+      - 床は同一並走エピソード内で単調非減少(下がらない)。
+      - 床適用後のtarget_magは、常に「現在のcorr_bound - マージン」以下
+        (=床がコリドーの壁を突き破ることは原理的に発生しない、今周期の
+        実測corr_boundで毎回再キャップするため)。"""
+    overlapping = self._update_overlap_state(opp_ds_now)
+    if overlapping:
+        self._ot_overlap_floor_mag = max(self._ot_overlap_floor_mag or 0.0, target_mag)
+        floor = self._ot_overlap_floor_mag
+        if np.isfinite(corr_bound) and corr_bound > 0.0:
+            floor = min(floor, corr_bound - self._ot_overlap_corr_margin_m)
+        target_mag = max(target_mag, floor)
     return target_mag
 ```
 
+新規状態: `self._ot_overlap_floor_mag = None`(エピソードリセットで初期化)。
+新規config: `overtake.overlap_corr_margin_m`(既存の他マージン定数と揃えた
+既定値を想定、要チューニング)。
+
 ### 2.3 呼び出し箇所(2箇所、同一ヘルパーで重複排除)
 
-1. OVERTAKING分岐の`_target_mag`確定直後(mpc_controller.py:6968直前):
-   `_target_mag = self._apply_overlap_floor(_target_mag, _opp_ds_now)`
+1. OVERTAKING分岐の`_target_mag`確定直後(mpc_controller.py:6968直前、
+   既存の168節コリドー崩壊フリーズ処理より**後**、`self._mpc.lateral_target=...`
+   より**前**の位置で呼ぶ——corr_boundの今周期値が既に計算済みであること
+   を利用する):
+   `_target_mag = self._apply_overlap_floor(_target_mag, _opp_ds_now, _corr_bound)`
 2. STOPPING/proactive-bias分岐(mpc_controller.py:6989直前): 同様に適用。
-   ただしこちらは`_stopped_opp`(停止・低速車)向けの小さいバイアスであり、
-   対象車のds値が同じ形で手に入るか要実装時確認(手に入らない場合はこの
-   分岐は対象外とし、その理由をコメントで明記する)。
+   対象車のds値は`_scan_traffic()`から取得可能(外部AIレビューで確認済み)
+   なため、実装時に配線する。
+
+### 2.4 並走解除時のスムージングに関する確認事項(外部AIレビュー、Gemini)
+
+Geminiより「並走を完全に抜けた直後、`lateral_target`が床の値から
+本来の値(0.0m等)へステップ状に落ちることを防ぐスムージングは、既存の
+経路生成ロジック側で担保されているか」という質問があった。確認したところ、
+既存の`self._ot_alpha`(0..1、mpc_controller.py:7015-7026)は**「目標へ
+どれだけブレンドするか」の重みをランプするものであり、`lateral_target`の
+値自体の変化率を制限する専用機構ではない**。alphaが既に1.0(完全コミット)
+の状態で`lateral_target`が変わった場合、MPC自身のR[delta]コスト・
+`steer_rate_max`制約が結果的に急な物理応答を抑えるが、`lateral_target`
+という**目標値そのものの急変を防ぐ専用の保証は存在しない**。これは
+6章のPhase 1反実仮想検証で実際にステップ状の悪化が生じないか確認すべき
+項目として明記する(6.7として追加)。
 
 ---
 
@@ -195,6 +251,15 @@ lat_ttc系の減速に委ねる(offsetを床(Fix B)で維持したまま自然�
 
 ### 3.3 実装(giveup分岐の先頭に追加)
 
+**2026-08-06改訂(外部AIレビューmust-fix 2)**: 当初案は、giveup条件自体が
+不成立(`_giveup_now`が最初からFalse、=通常のOVERTAKING継続中)の周期に
+`_ot_pending_disengage_count`をリセットする経路がなく、以前の保留エピソードの
+カウントが残存したまま次回の(無関係な理由による)giveupへ引き継がれる
+欠陥があった(例: 保留中に相手が減速しgiveup条件自体が解消→カウント
+5で放置→数秒後に別理由[room_exhausted]でgiveup発生→本来0から始まる
+べき保留が5から再開し、上限に到達するタイミングが早まる)。`_giveup_now`
+がFalseの経路にも明示的なリセットを追加する。
+
 ```python
 _side_blocked = _lat_dec.force_giveup or _room_exhausted
 _giveup_now = (self._ot_giveup_count >= self._ot_giveup_cycles
@@ -209,6 +274,10 @@ if _giveup_now and not _lat_dec.footprint_risk_triggered:
             _giveup_now = False  # 今回は保留、OVERTAKING継続
     else:
         self._ot_pending_disengage_count = 0
+else:
+    # 2026-08-06追加(must-fix 2): giveup条件自体が不成立の周期は、
+    #   以前の保留エピソードの残存カウントを必ず0へ戻す。
+    self._ot_pending_disengage_count = 0
 if _giveup_now:
     self._ot_pending_disengage_count = 0
     # ↓ 既存のgiveup処理、無変更
@@ -229,11 +298,22 @@ if _giveup_now:
   既存の3値(NORMAL/STOPPING/OVERTAKING)を維持)。
 - STUCK検知(`_handle_stuck_recovery`)は`_ot_state`と独立にv≈0を監視する
   既存設計のため、保留中にegoが実際に停止すれば通常どおりSTUCKへ移行
-  する(相互干渉なし、要実装時に単体テストで確認)。
+  する(相互干渉なし)。**2026-08-06追加(外部AIレビュー推奨4)**:
+  STUCK進入時にも`_reset_ot_episode_tracking_state()`を呼び、STUCK復帰後に
+  古い保留カウント・並走状態・床を持ち越さないようにする。
 - footprint_risk・LAT-TTC C2等の安全系トリガーは保留の影響を受けない
   (3.3で明示的に除外)。
 - switchback(側反転、`_lat_dec.side_override`)は保留とは独立の分岐
   (6336行目、giveup分岐より前で評価済み)であり、影響なし。
+  **2026-08-06追加(外部AIレビュー確認、Gemini)**: switchback分岐は
+  giveup分岐より前で評価され、発火時は`_reset_ot_episode_tracking_state()`
+  相当のリセット(6348-6355)を伴うため、`_ot_pending_disengage_count`も
+  同時にリセットされ、旧側での保留状態が新側へ持ち越されることはない
+  (設計は無変更のまま整合性を確認)。
+- **2026-08-06追加(外部AIレビュー推奨7)**: OVERTAKING継続のまま
+  `fwd_vid`(対象車ID)だけが切り替わる経路の有無を実装時に確認し、
+  もし存在すればそこにも`_reset_ot_episode_tracking_state()`を追加する
+  (旧対象車の並走状態・床を新対象車へ引き継がない)。
 
 ---
 
@@ -257,24 +337,39 @@ Fix A採用により`_ot_opp_lat_prev`系4変数は削除されるため、重�
 ```python
 def _reset_ot_episode_tracking_state(self) -> None:
     """側変更・新規エンゲージ・OVERTAKING離脱の全ての契機で共通に呼ぶ、
-    エピソード単位の追跡状態リセット(4箇所の重複実装を統合)。"""
+    エピソード単位の追跡状態リセット(4箇所の重複実装を統合)。
+    2026-08-06改訂: Fix Bの専用床変数(_ot_overlap_floor_mag、must-fix 1)
+    もここでリセットする。"""
     self._ot_last_valid_target_mag = None
     self._ot_last_valid_min_needed_mag = None
     self._ot_overlapping = False
+    self._ot_overlap_floor_mag = None
     self._ot_pending_disengage_count = 0
 ```
 
-4箇所の該当行をこの1行呼び出しへ置換する。
+4箇所の該当行をこの1行呼び出しへ置換する。**2026-08-06追加**: これに加え
+STUCK進入時(推奨4)・`fwd_vid`切替経路が存在する場合(推奨7)にも同じ
+呼び出しを追加する(呼び出し箇所は4→最大6程度になる見込み、実装時に
+最終確定)。
 
 ---
 
-## 5. config.yaml 新規パラメータ(2個、既定値は要チューニング)
+## 5. config.yaml 新規パラメータ
+
+**2026-08-06改訂(外部AIレビュー、Claude)**: Fix Aと Fix B/Cを独立した
+configゲートに分離する(効果の帰属を分離して検証できるようにするため。
+両方を同時にONにすると、実地検証でどちらの寄与かが判別できなくなる)。
 
 ```yaml
 overtake:
-  overlap_margin_m: 0.5          # 並走(縦オーバーラップ)判定のヒステリシス幅
+  lat_vel_source_tracker: false   # false=現行の自前差分/true=Fix A(tracker.velocity()再利用)
+  overlap_guard_enabled: false    # false=現行/true=Fix B(オフセット床)+Fix C(離脱保留)を一括有効化
+  overlap_margin_m: 0.5           # 並走(縦オーバーラップ)判定のヒステリシス幅
+  overlap_corr_margin_m: 0.1      # Fix Bの床をcorr_boundで再キャップする際のマージン(must-fix 1)
   pending_disengage_max_cycles: 80  # 離脱保留の上限周期数(既定=giveup_cycles*2目安)
 ```
+
+いずれも既定`false`(現行挙動と完全に一致、新規追加は無効化状態から開始)。
 
 ---
 
@@ -292,22 +387,70 @@ overtake:
    「余計な保留」件数とその時間コスト(離脱遅延=ラップ損失見込み)を
    集計する。偽陽性コストが小さいことを実装採否の判断材料とする。
 3. **単体テスト**: ヒステリシス境界(enter/exit)・footprint_risk免除・
-   保留上限フェイルセーフ・STUCK非干渉・4箇所→1関数への統合の等価性。
+   保留上限フェイルセーフ・STUCK非干渉・4箇所→1関数への統合の等価性・
+   床の単調非減少+corr_bound再キャップ不変条件(must-fix 1)・giveup
+   条件解消時の保留カウンタリセット(must-fix 2)・tracker.velocity()の
+   None/鮮度失効フォールバック(must-fix 3)・**全configゲートOFF時に
+   現行と完全にビット等価**であることの確認。
 4. **回帰スイート全件PASS**(既存3156件+新規)。
-5. **dev3実地検証(2本以上)**: ガード発動ログ・衝突/STUCK/OT成功率の
-   非悪化、Fix Aによる`opp_lat_pred`分布のクランプ張り付き率改善
-   (14節の24%基準と比較)。
-6. 上記が全てPASSして初めて予選環境投入を検討する(CLAUDE.md §2ルール7、
+5. **dev3実地検証(2本以上、Fix A・Fix B+Cは独立フラグで個別にON)**:
+   ガード発動ログ・衝突/STUCK/OT成功率の非悪化、Fix Aによる
+   `opp_lat_pred`分布のクランプ張り付き率改善(14節の24%基準と比較)。
+6. **2026-08-06追加(外部AIレビュー推奨5)**: 反実仮想の集計に「強制
+   フォールバック(`pending_disengage_max_cycles`到達)発火時になお並走中
+   だった件数」を必須集計項目として追加する(Fix Cの残存リスクの定量、
+   このケースは対策未完了のまま離脱するため実質的にFix C導入前と同じ
+   リスクが残る)。
+7. **2026-08-06追加(外部AIレビュー、Gemini 2.4)**: 並走解除の瞬間に
+   `lateral_target`がステップ状に変化しないか(2.4節参照)を反実仮想
+   リプレイで直接確認する。
+8. 上記が全てPASSして初めて予選環境投入を検討する(CLAUDE.md §2ルール7、
    予選ログのn=1評価を過信しない)。
 
 ---
 
 ## 7. 未解決・要レビュー事項
 
-- Fix Bの2箇所目(STOPPING/proactive-bias分岐)へ同一ガードを適用できるか
-  (対象車dsの入手可否)は実装時に要確認。
-- `overlap_margin_m`/`pending_disengage_max_cycles`の具体的な既定値は
-  未チューニング(設計段階の暫定値)。
-- Fix C実装方式(新規フラグ+カウンタ vs 既存`_ot_giveup_count`の転用)は、
-  外部AI(別Claude)が提案した「低侵襲な方を選ぶ」方針に従い、実装時に
-  再検討の余地を残す。
+- **2026-08-06更新**: Fix Bの2箇所目(STOPPING/proactive-bias分岐)は
+  対象車dsが`_scan_traffic()`から取得可能と外部AIレビューで確認済み、
+  実装時に配線する(解決)。
+- `overlap_margin_m`/`overlap_corr_margin_m`/`pending_disengage_max_cycles`
+  の具体的な既定値は未チューニング(設計段階の暫定値)。
+- **2026-08-06更新**: Fix C実装方式は、外部AI(Gemini・別Claude)双方が
+  「既存`_ot_giveup_count`の転用は意味論的過負荷(giveupトリガー継続時間
+  と物理的並走継続時間という異なる概念を1変数に混在させる)を招き
+  非推奨、新規カウンタを追加すべき」と一致して判断したため、当初案
+  (新規`_ot_pending_disengage_count`追加)を**そのまま採用・確定**する。
+- 並走解除時の`lateral_target`ステップ変化(2.4節)の実害有無は反実仮想
+  リプレイでの確認待ち(未解決、6.7参照)。
+
+---
+
+## 8. 外部AIレビュー結果の要約(2026-08-06)
+
+`docs/superpowers/specs/2026-08-06-opp-lat-pred-overlap-guard-design-review-prompt.md`
+でGemini・別Claudeへレビュー依頼した。要点:
+
+- **状態遷移の一貫性**: 問題なし(switchbackがgiveup判定より前で評価され、
+  発火時のリセットで保留カウントも巻き込まれるため矛盾しない)。
+- **Fix A**: 妥当。既存の`clamp_hold_enabled`(V2X異常対策)の恩恵が
+  横方向予測にも自動的に波及する副次効果も確認。
+- **Fix B**: **must-fix**。当初の`_ot_last_valid_target_mag`二重利用案は
+  (a)同一周期内の更新順序次第で床自体が汚染される、(b)コリドーが
+  真に狭まった場合に床が壁を突き破りうる、の2つの欠陥があり廃案。
+  専用状態`_ot_overlap_floor_mag`(ピーク保持+適用時に現在corr_boundで
+  再キャップ)へ設計変更した(§2.2に反映済み)。
+- **Fix C**: **must-fix**。giveup条件が不成立の周期に保留カウンタを
+  リセットする経路が漏れていた欠陥を修正(§3.3に反映済み)。
+- **共通**: `tracker.velocity()`のAPI実挙動(未知vid・速度窓未充足・
+  V2X異常時)を実装前に調査し意味論を確定する必要性(**must-fix**、
+  §1.4に反映済み)。
+- **推奨事項(全て採用・反映済み)**: STUCK進入時のリセット追加(§3.4)、
+  反実仮想集計への強制フォールバック残存件数の追加(§6.6)、
+  `fwd_vid`切替経路の確認(§3.4)、configゲートをFix Aと Fix B/Cで
+  分離(§5)。
+- Fix C実装方式(新規カウンタ vs 既存流用)は両AIが一致して新規カウンタ
+  維持を支持、当初案を確定とした。
+
+以上を全て本文へ反映済み。次のアクションは実装着手(Phase 1反実仮想
+リプレイを最優先)。
