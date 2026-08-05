@@ -2206,27 +2206,26 @@ class MPCController(Node):
             self._publish_gear_cmd_throttled(now, GearCommand.REVERSE)
             self._stuck_gear_wait_count += 1
             _confirmed = (self._gear_report.report == GearReport.REVERSE)
-            # 2026-08-05修正(294節続報、外部AI相談[Gemini/Claude]で得た最有力仮説への対処):
-            #   従来は「GearReport==REVERSEが確認できるまで速度指令ゼロで待つ」設計だったが、
-            #   これはAWSIM側で「シフト受理直後も運動指令が継続しないと静止+無入力とみなされ
-            #   自動的にPARKへ戻される」挙動と相性が悪い可能性が高いという分析を複数の
-            #   外部AIから得た(手動操作は「Rに入れて即アクセル」の連続動作であり、
-            #   confirm待ちの空白が無いこととも整合する)。確認を待たず、REVERSE要求と同時に
-            #   後退運動指令(backup_speed)を送り始め、実際に車両が後退し始めたこと
-            #   (v <= reverse_move_confirm_v)を、GearReport確認・タイムアウトと並ぶ
-            #   第3の成功シグナルとして扱う。
-            _v_now = self._odom.twist.twist.linear.x
-            _moving_backward = _v_now <= self._stuck_reverse_move_confirm_v
-            if _confirmed or _moving_backward or self._stuck_gear_wait_count >= self._stuck_gear_settle_cycles:
+            # 2026-08-05再修正(294節続報の再訂正、最小再現ノードでの因果分離試験で判明):
+            #   直前の294節続報では「確認を待たず同時に運動指令を送る」方式へ変更したが、
+            #   これは誤りだった。最小ノードでの分離試験で、(a)N→Rの遷移をacceleration=0.0
+            #   固定(運動指令なし)で完了させてからconfirmを得た場合はRが安定して維持され、
+            #   (b)確認前から同時にacceleration!=0を送った場合は1秒以内に強制的にPARKへ
+            #   戻る、という明確な差が確認された。つまりAWSIM側は「ギア遷移中に運動指令が
+            #   混ざっている」ことを拒否条件としている可能性が高く(実車のインターロックに近い
+            #   挙動)、294節続報の「常時運動指令を送る」設計はまさにこれに抵触していた。
+            #   よってconfirm前は速度・加速度とも完全ゼロで待つ設計へ戻す(288節以前の
+            #   原設計と同じ形だが、中間ギアが今回のNEUTRAL修正で正しい値になっている点が
+            #   決定的に異なる)。行動ベース確認(moving_backward)は運動指令の送出を前提と
+            #   するため、この再訂正により意味を失い削除する。
+            if _confirmed or self._stuck_gear_wait_count >= self._stuck_gear_settle_cycles:
                 # 2026-07-11診断追加: 「未確認のまま進む」場合、実際のギア値を記録する。
                 #   追突後にPレンジのまま発進しなくなる事象の原因切り分け用
                 #   (0.5秒タイムアウトでBACKUPへ進むが、実車が本当にREVERSEへ入ったかは
                 #   この時点では未検証のため)。
-                _reason = ("confirmed" if _confirmed else
-                           "moving_backward" if _moving_backward else "未確認だが規定周期経過")
                 self.get_logger().warn(
-                    f"[STUCK] gear=REVERSE {_reason} "
-                    f"(実際のgear_report={self._gear_label(self._gear_report.report)} v={_v_now:.3f}) -> BACKUP")
+                    f"[STUCK] gear=REVERSE {'confirmed' if _confirmed else '未確認だが規定周期経過'} "
+                    f"(実際のgear_report={self._gear_label(self._gear_report.report)}) -> BACKUP")
                 self._stuck_state = "BACKUP"
                 self._stuck_backup_start = (pose.x, pose.y)
                 self._stuck_backup_start_time = now  # 2026-07-13追加: ウォッチドッグ用
@@ -2246,10 +2245,11 @@ class MPCController(Node):
                     self.get_logger().info(
                         f"[STUCK-BACKUP-REAR-LIMIT] 後方の相手車を考慮し後退距離を"
                         f"{self._stuck_backup_dist:.2f}m->{self._stuck_backup_dist_eff:.2f}mへ制限")
-            # 上記のif分岐(状態遷移の判定・後処理)に関わらず、u/accは常に後退運動指令を送る
-            # (確認待ちの間もゼロ指令で待たない、294節続報の主眼)。
-            u = [self._stuck_backup_speed, 0.0]
-            acc = self._stuck_backup_accel
+                u = [self._stuck_backup_speed, 0.0]
+                acc = self._stuck_backup_accel
+            else:
+                u = [0.0, 0.0]
+                acc = 0.0
 
         elif self._stuck_state == "BACKUP":
             self._publish_gear_cmd_throttled(now, GearCommand.REVERSE)

@@ -1,21 +1,29 @@
-"""WAIT_REVERSEの行動ベース確認方式への転換(294節続報、2026-08-05)。
+"""WAIT_REVERSEのゼロ加速度待機方式(294節続報の再訂正、2026-08-05)。
 
-背景: 293-294節でgear_settle_cycles拡大(20→50→200)・エッジトリガー化・中間ギア
-PARK→NEUTRAL修正と対処を重ねたが、REVERSE自体のGearReport確認成功率は
-dev3実測で一貫して0%のままだった(NEUTRALは100%まで改善)。外部AI(Gemini/Claude)へ
-相談した結果、最有力仮説として「WAIT_REVERSEが速度指令ゼロで確認を待つ設計自体が、
-AWSIM側の『シフト受理後も運動指令が継続しないと静止+無入力とみなし自動的にPARKへ
-戻す』可能性のある挙動と根本的に相性が悪い」という分析を得た(手動操作は
-「Rに入れて即アクセル」の連続動作であり confirm待ちの空白が無いこととも整合)。
+背景: 293-294節でgear_settle_cycles拡大・エッジトリガー化・中間ギアPARK→NEUTRAL
+修正と対処を重ねたが、REVERSE自体のGearReport確認成功率はdev3実測で一貫して0%の
+ままだった(NEUTRALは100%まで改善)。外部AI(Gemini/Claude)へ相談した結果、
+「WAIT_REVERSEが速度指令ゼロで確認を待つ設計自体が、AWSIM側の『シフト受理後も
+運動指令が継続しないと静止+無入力とみなし自動的にPARKへ戻す』可能性のある挙動と
+相性が悪い」という仮説を得て、確認を待たずREVERSE要求と同時に後退運動指令を送る
+「行動ベース確認方式」へ一度転換した(コミット809cb09)。
 
-対処: WAIT_REVERSEでGearReport確認を待たず、REVERSE要求と同時に後退運動指令
-(backup_speed)を送り始める。成功シグナルを「GearReport==REVERSE確認」
-「実速度が後退方向へ動き始めた(reverse_move_confirm_v以下)」「タイムアウト」の
-3種類に拡張し、いずれか1つでも満たせばBACKUPへ遷移する(既存の確認方式・
-タイムアウト方式は削除せず、行動ベースの確認を追加する形)。
+しかし別の外部AI(TPACさん)から「t=0のREVERSEはManual操作の残存の可能性がある」
+「longitudinal.speedはAWSIM未使用」という重要な指摘を受け、本線コントローラを
+完全に停止した最小再現ノードで因果分離試験を実施した。結果:
+- N→Rの遷移をacceleration=0.0固定(運動指令なし)で完了させた場合 → Rが安定して
+  5秒以上維持された
+- 確認前から同時にacceleration!=0(運動指令あり)を送った場合 → 1秒以内に
+  強制的にPARKへ戻った
+
+これにより「行動ベース確認方式」(確認前から運動指令を送る)は**逆効果**であり、
+AWSIM側は「ギア遷移中に運動指令が混ざっている」ことを拒否条件としている
+(実車のインターロックに近い挙動)と判明した。本節で、WAIT_REVERSEを
+「confirmするまでは速度・加速度とも完全ゼロで待つ」設計へ再訂正する
+(中間ギアがNEUTRAL[293節続報で修正済み]である点は288節以前の原設計と異なる)。
 
 mpc_controller.pyはrclpy依存で直接importできないため、既存の同種テストと同じ
-「ロジックのミラー実装+ソーステキスト検証」の方針を踏襲する。
+「ソーステキスト構造検証」の方針を踏襲する。
 """
 import os
 
@@ -24,76 +32,6 @@ _SRC_PATH = os.path.join(
 with open(_SRC_PATH) as _f:
     _SRC = _f.read()
 
-_CFG_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "config", "config.yaml")
-with open(_CFG_PATH) as _f:
-    _CFG = _f.read()
-
-
-def _wait_reverse_transition_step(gear_report_is_reverse, v_now, wait_count,
-                                   settle_cycles, move_confirm_v):
-    """WAIT_REVERSE分岐の遷移判定のミラー実装。
-    戻り値: (transitions_to_backup: bool, reason: str)。"""
-    confirmed = gear_report_is_reverse
-    moving_backward = v_now <= move_confirm_v
-    if confirmed or moving_backward or wait_count >= settle_cycles:
-        reason = ("confirmed" if confirmed else
-                  "moving_backward" if moving_backward else "timeout")
-        return True, reason
-    return False, None
-
-
-# ---------------------------------------------------------------------------
-# ①ロジック検証: 3種類の成功シグナルそれぞれが単独で遷移を引き起こす
-# ---------------------------------------------------------------------------
-
-def test_gear_report_confirmed_alone_transitions():
-    ok, reason = _wait_reverse_transition_step(
-        gear_report_is_reverse=True, v_now=0.0, wait_count=1,
-        settle_cycles=200, move_confirm_v=-0.05)
-    assert ok and reason == "confirmed"
-
-
-def test_moving_backward_alone_transitions_even_without_gear_confirm():
-    """行動ベース確認の核心: GearReportが未確認でも、実速度が後退していれば遷移する。"""
-    ok, reason = _wait_reverse_transition_step(
-        gear_report_is_reverse=False, v_now=-0.10, wait_count=1,
-        settle_cycles=200, move_confirm_v=-0.05)
-    assert ok and reason == "moving_backward"
-
-
-def test_timeout_alone_transitions_when_neither_signal_fires():
-    ok, reason = _wait_reverse_transition_step(
-        gear_report_is_reverse=False, v_now=0.0, wait_count=200,
-        settle_cycles=200, move_confirm_v=-0.05)
-    assert ok and reason == "timeout"
-
-
-def test_no_signal_does_not_transition():
-    ok, _ = _wait_reverse_transition_step(
-        gear_report_is_reverse=False, v_now=0.0, wait_count=50,
-        settle_cycles=200, move_confirm_v=-0.05)
-    assert not ok
-
-
-def test_positive_velocity_does_not_count_as_moving_backward():
-    """前進方向の速度(正値)は後退確認にカウントしない。"""
-    ok, reason = _wait_reverse_transition_step(
-        gear_report_is_reverse=False, v_now=0.10, wait_count=1,
-        settle_cycles=200, move_confirm_v=-0.05)
-    assert not ok
-
-
-def test_boundary_exactly_at_move_confirm_v_counts():
-    ok, reason = _wait_reverse_transition_step(
-        gear_report_is_reverse=False, v_now=-0.05, wait_count=1,
-        settle_cycles=200, move_confirm_v=-0.05)
-    assert ok and reason == "moving_backward"
-
-
-# ---------------------------------------------------------------------------
-# ②ソーステキスト構造検証: WAIT_REVERSEが常に後退運動指令を送ること
-# ---------------------------------------------------------------------------
 
 def _wait_reverse_body():
     idx = _SRC.index('elif self._stuck_state == "WAIT_REVERSE":')
@@ -101,54 +39,63 @@ def _wait_reverse_body():
     return _SRC[idx:idx_end]
 
 
-def test_wait_reverse_always_commands_backup_motion_unconditionally():
-    """u/accの代入が、if/elseの分岐の外側(=常に実行される位置)にあることを、
-    最後のif関連行より後ろに現れる位置関係で確認する。"""
+# ---------------------------------------------------------------------------
+# ①ソーステキスト構造検証: confirm前は完全ゼロで待機すること
+# ---------------------------------------------------------------------------
+
+def test_wait_reverse_holds_zero_before_confirmed():
+    """confirmedでもタイムアウトでもない(else)分岐は、速度・加速度とも
+    完全ゼロで待機する(294節続報の再訂正の核心)。"""
     snippet = _wait_reverse_body()
-    idx_last_if_body = snippet.rindex("後方の相手車を考慮し後退距離を")
-    idx_u_assign = snippet.index("u = [self._stuck_backup_speed, 0.0]")
-    idx_acc_assign = snippet.index("acc = self._stuck_backup_accel")
-    assert idx_u_assign > idx_last_if_body
-    assert idx_acc_assign > idx_last_if_body
-    # 退行防止: 旧来のゼロ保持パターン(hold_accelでの待機)がWAIT_REVERSE本体に
-    #   残っていないこと(WAIT_PARK側は別途0.0保持へ変更済みのため対象外)。
-    assert "acc = self._stuck_hold_accel" not in snippet
+    idx_else = snippet.rindex("else:")
+    tail = snippet[idx_else:]
+    assert "u = [0.0, 0.0]" in tail
+    assert "acc = 0.0" in tail
 
 
-def test_wait_reverse_checks_velocity_feedback():
+def test_wait_reverse_only_sends_backup_motion_after_transition_decided():
+    """後退運動指令(backup_speed/backup_accel)は、状態遷移(BACKUPへ進む)が
+    決定したif分岐の内側でのみ送られ、confirm前のelse分岐には無いこと。"""
     snippet = _wait_reverse_body()
-    assert "self._odom.twist.twist.linear.x" in snippet
-    assert "self._stuck_reverse_move_confirm_v" in snippet
-    assert "_moving_backward = _v_now <= self._stuck_reverse_move_confirm_v" in snippet
+    idx_else = snippet.rindex("else:")
+    head = snippet[:idx_else]
+    tail = snippet[idx_else:]
+    assert "u = [self._stuck_backup_speed, 0.0]" in head
+    assert "acc = self._stuck_backup_accel" in head
+    assert "self._stuck_backup_speed" not in tail
+    assert "self._stuck_backup_accel" not in tail
 
 
-def test_wait_reverse_transition_condition_includes_all_three_signals():
+def test_wait_reverse_transition_condition_is_confirmed_or_timeout_only():
+    """294節続報で追加した行動ベース確認(moving_backward)は、確認前から
+    運動指令を送ることを前提とするため本節の再訂正で削除された。
+    confirmedとタイムアウトの2条件のみへ戻っていることを確認する。"""
     snippet = _wait_reverse_body()
-    idx = snippet.index("if _confirmed or _moving_backward or self._stuck_gear_wait_count")
-    assert idx >= 0
+    assert 'if _confirmed or self._stuck_gear_wait_count >= self._stuck_gear_settle_cycles:' in snippet
+    assert "_moving_backward" not in snippet
+    assert "reverse_move_confirm_v" not in snippet.lower() or "self._stuck_reverse_move_confirm_v" not in snippet
 
 
-def test_wait_park_kept_zero_hold_not_backup_motion():
-    """WAIT_PARK(NEUTRAL要求フェーズ)は本節の対象外であり、引き続き速度ゼロで
-    待機すること(後退運動を送るのはWAIT_REVERSE以降のみ)。"""
-    idx_park = _SRC.index('if self._stuck_state == "WAIT_PARK":')
-    idx_reverse = _SRC.index('elif self._stuck_state == "WAIT_REVERSE":')
-    snippet = _SRC[idx_park:idx_reverse]
-    assert "u = [0.0, 0.0]" in snippet
-    assert "acc = 0.0" in snippet
+def test_wait_reverse_still_publishes_reverse_gear_request():
+    """ゼロ加速度待機に戻っても、REVERSE要求自体(エッジトリガー化ヘルパー経由)は
+    引き続き毎周期行われること(293節続報の成果は維持)。"""
+    snippet = _wait_reverse_body()
+    assert "self._publish_gear_cmd_throttled(now, GearCommand.REVERSE)" in snippet
+
+
+def test_wait_reverse_still_checks_gear_report_confirmed():
+    snippet = _wait_reverse_body()
+    assert "_confirmed = (self._gear_report.report == GearReport.REVERSE)" in snippet
 
 
 # ---------------------------------------------------------------------------
-# ③config配線・既定値確認
+# ②最小再現ノードでの因果分離試験結果を裏付ける回帰(config定義は残置、
+#   本線ロジックからは参照されなくなったことを明示的に確認)
 # ---------------------------------------------------------------------------
 
-def test_config_declares_reverse_move_confirm_v_default():
-    idx = _CFG.index("reverse_move_confirm_v:")
-    snippet = _CFG[idx:idx + 60]
-    assert "reverse_move_confirm_v: -0.05" in snippet
-
-
-def test_controller_reads_reverse_move_confirm_v_with_default():
-    assert ('self._stuck_reverse_move_confirm_v = float(\n'
-            '                _stkget("reverse_move_confirm_v", -0.05))' in _SRC
-            or '_stkget("reverse_move_confirm_v", -0.05)' in _SRC)
+def test_reverse_move_confirm_v_config_read_removed_from_wait_reverse_logic():
+    """_stuck_reverse_move_confirm_vの読み込み自体(__init__)は将来の再利用に
+    備えて残すが、WAIT_REVERSEの遷移判定からは参照されなくなったことを確認する。"""
+    assert 'self._stuck_reverse_move_confirm_v = float(' in _SRC
+    snippet = _wait_reverse_body()
+    assert "self._stuck_reverse_move_confirm_v" not in snippet
