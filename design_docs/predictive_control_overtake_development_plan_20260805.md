@@ -322,5 +322,33 @@ icc_stopには一切触れていない(7-8節の最終結論通り)。既存の�
 3133件PASS。
 
 **未実施**: dev3実地でのn≥2検証(config既定OFFのため、有効化してからの
-実地走行試験が次のステップ)。task#265(side別engage_cooldown)は設計方針
-(7節)まで決定済みだが実装は未着手。
+実地走行試験が次のステップ)。
+
+## 11. task#265(side別engage_cooldown)実装完了+重大バグ発見・修正(2026-08-05、コミットb346254)
+
+7節の設計方針に基づき実装。新規state`_ot_engage_cooldown_l/_r`+config
+`overtake.cooldown_per_side`(既定false)。giveup理由が空間的失敗
+(`_side_blocked`かつfootprint_risk起因でない)の場合のみ該当側の専用
+クールダウンをセットし、`_evaluate_engage_readiness`呼び出し元で
+`left_ok`/`right_ok`へAND。`_plan_pass`は独自の地形判定でsideを選ぶため、
+選ばれた側がブロック中ならplan_okを事後に打ち消すガードも追加した。
+
+**実装直後の自己レビュー(ユーザー指摘「状態遷移の一貫性・考慮漏れ」)で
+重大バグを発見**: 当初の実装はグローバル`self._ot_engage_cooldown`を
+そのまま残してside別値を追加するだけだったため、`_cd_clear`(グローバル
+判定、無変更)がグローバル値のみを見る構造上、side別クールダウンをいくら
+分離してもグローバルが残っている間は`_cheap_ok`全体がブロックされ続け、
+**side分離の効果が事実上ゼロになっていた**(グローバルとside別を同一値・
+同一タイミングでセットしていたため)。gate ONかつroom_exhausted系giveup
+時はグローバルを0へリセットするよう修正し、再発防止テストを追加した。
+
+回帰: 新規11件(バグ修正の再発防止テスト含む)+全体3144件PASS。
+
+## 12. engage_cooldown固定タイマー(4秒)の早期解除設計(2026-08-05、検討中)
+
+ユーザー指摘「4秒何もしないのはロスになる場合がある」を受け、既存の
+footprint_risk専用「実測解消」パターン(148節②、`_ot_footprint_risk_clear_count`)
+を、他のgiveup理由(①相手が速すぎる・③room_exhausted)にも横展開する案を
+検討中。外部AI相談プロンプト
+(`docs/superpowers/specs/2026-08-05-engage-cooldown-early-release-consultation-prompt.md`)
+を作成、回答待ち。コード変更はまだ行っていない。
