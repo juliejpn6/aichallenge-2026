@@ -8896,5 +8896,26 @@ DDS配線(トピック名・QoS)・enum数値(<code>GearCommand.PARK=22</code>/
 実地検証(run9)は進行中。
 </p>
 
+<h3>295. OT giveup閾値(lat_ttc_C2/FOOTPRINT_RISK)は物理下限であり緩和不可、ENGAGE側が本丸(task#300暫定結論)</h3>
+<p class="small">
+run6実測(giveup5件・success1件、288節の予備傾向n=14と同方向)を受けtask#300として
+giveup閾値の精査に着手したが、対象パラメータ(<code>alongside_min_width=1.45</code>、
+<code>along_min_length=2.00</code>)を確認したところ、config.yamlに<b>「カート幅/全長
+未満の物理下限」</b>と明記されていることを確認した。つまりこれらはソフトな快適マージン
+ではなく、割り込むと物理的に接触しうる下限値そのものであり、<b>giveup過多を理由に
+緩和することは安全性を直接損なう</b>——CLAUDE.md §1.3の慎重さの精神に照らしても対象外
+と判断する。
+</p>
+<p class="small">
+<b>暫定結論</b>: giveup過多の真因は「giveup判定自体が過敏」ではなく、<b>そもそも
+これらの物理下限に迫るほど接近するまでENGAGE(追い越し開始)してしまっている</b>
+可能性が高い。task#300(閾値精査)は「閾値は正しい、緩和対象ではない」という形で
+一旦区切りとし、より有望な対処として<b>task#302(_evaluate_engage_readiness見直し)</b>
+へ焦点を移す。ただし_evaluate_engage_readinessは148/190-4/190-6節等、複数回にわたり
+慎重にチューニングされてきた多因子判定であり、投機的な変更ではなくログベースの
+データ(ENGAGE直後何秒でgiveupに至ったか、ENGAGE時点でのfwd_ds/fwd_dlatの分布等)を
+先に集めてから着手する。
+</p>
+
 </body>
 </html>
