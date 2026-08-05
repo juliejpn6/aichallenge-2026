@@ -168,3 +168,36 @@ LAT-TTC反応遅延パターン(危険検知〜衝突が0.2〜0.5秒)と相互�
 
 ユーザー承認の上、候補①から着手する(コミット分離: 設計調査は本書、実装は
 別コミット)。
+
+## 6. 候補④の外部AI相談結果とコード検証(2026-08-05)
+
+外部AI(Gemini・別Claudeインスタンス)へ候補④(最短距離オーバーテイク)と
+task#265(side別engage_cooldown)の設計相談を行った。詳細は
+`docs/superpowers/specs/2026-08-05-shortest-distance-overtake-consultation-prompt.md`
+(初回)・`2026-08-05-shortest-distance-overtake-followup-prompt.md`
+(フォローアップ)を参照。
+
+**採用する設計方針(コード検証で裏付け済み)**: 候補④は「OVERTAKING状態内で
+オフセットランプを遅延させる」(Gemini案)ではなく、**「ENGAGE自体
+(`_close_enough`判定)を遅らせる」**(別Claude案)を採用する。実際の
+`_evaluate_engage_readiness`のコードを確認したところ、`_close_enough`が
+Falseの間は既存の`STOPPING`状態(前車追従`icc_stop`)が自然に維持され、
+新しい中間状態を作らずにユーザー要求(「追いつくまでは既定経路を走行する」)
+を実現できることを確認した。既存の`_is_stopped_for_profile`
+(相手が停止/低速の場合のみ`_predicted_time_to_wp`を使う条件)を、相手が
+走行中の場合にも拡張する2体問題版の予測関数を追加する方針。
+
+**未解決の確認事項(フォローアッププロンプトで再相談中)**:
+1. `_close_enough`をFalseに保つ間、`icc_stop`(前車追従)が相手の遅い速度に
+   同期して自車を不要に減速させないか——STOPPING状態の速度制御側にも
+   「追いつき予測が近い将来成立する見込みなら自車計画速度で走ってよい」
+   という条件が必要になる可能性。
+2. `_ot_worth_count`(ENGAGE連続成立カウンタ)は`_close_enough`と独立した
+   `pass_worth`条件で動いており、意味論上の衝突はなさそうだが要確認。
+3. cooldownのgiveup原因は実際には3系統(①相手が速すぎる・②ロック外れ・
+   ③空間的失敗[force_giveup/room_exhausted、footprint_riskで細分化])あり、
+   別Claude案の(a)(b)2分類には①の扱いが未定義だった。
+4. side単独キーで十分という前提(近傍対戦車≤2台)は、本日実測したwp278-282
+   帯の3台密集事例(299節)と矛盾する可能性がある。
+
+**現時点でのコード変更**: なし。設計相談・コード構造検証のみ。
