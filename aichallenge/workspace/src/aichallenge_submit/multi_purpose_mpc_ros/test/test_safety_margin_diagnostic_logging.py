@@ -67,7 +67,10 @@ def test_ot_log_includes_margin_field():
     # 2026-08-05追加(300節、task#293候補①): [OT]ログへopp_lat_pred/t_reach(横位置
     #   外挿の実地検証用デバッグフィールド)が挿入されたため、窓を2000→2200へ再拡大
     #   (検証対象は無変更)。
-    snippet = _SRC[max(0, idx - 300):idx + 2200]
+    # 2026-08-05追加(診断ログ、opp_lat_predクランプ張り付き問題調査): opp_wp/
+    #   opp_raw_lat_velのf-string行が間に挿入されたため、窓を2200→2900へ再拡大
+    #   (検証対象は無変更)。
+    snippet = _SRC[max(0, idx - 300):idx + 2900]
     assert "_sm_ot" in snippet
     assert "margin={_sm_ot:.3f}" in snippet
 

@@ -104,7 +104,10 @@ def test_lateral_target_uses_corr_bound_ahead_helper():
     #   無変更)。
     # 2026-08-05追加(301節続報、ノイズ耐性強化): クランプ・ウォームアップカウンタが
     #   間に挿入されたため、窓を7000→8000へ再拡大(検証対象そのものは無変更)。
-    snippet = _SRC[max(0, idx - 8000):idx]
+    # 2026-08-05追加(診断ログ、opp_lat_predクランプ張り付き問題調査): opp_wp/
+    #   opp_raw_lat_velの診断フィールド代入が間に挿入されたため、窓を8000→8600へ
+    #   再拡大(検証対象そのものは無変更)。
+    snippet = _SRC[max(0, idx - 8600):idx]
     assert "self._corr_bound_ahead(self._ot_side)" in snippet
 
 

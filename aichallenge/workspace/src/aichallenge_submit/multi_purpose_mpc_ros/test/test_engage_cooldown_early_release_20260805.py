@@ -48,12 +48,19 @@ def test_new_state_variables_declared_with_safe_defaults():
     assert "self._ot_room_recover_count = 0" in _SRC
 
 
-def test_config_yaml_has_early_release_enable_default_false():
+def test_config_yaml_has_early_release_enable_key():
+    """2026-08-05修正: 当初はconfig.yamlの現在の運用値(false)を直接検証して
+    いたが、これは実地検証・予選投入のために意図的にtrueへ変更されうる
+    (現に本日中に変更された)運用値であり、テストとして不適切だった。
+    「既定値がfalseであること」の検証は上記test_new_state_variables_
+    declared_with_safe_defaultsが_otget()のPython側デフォルト引数を通して
+    既に行っているため、ここではconfig.yamlにキー自体が存在することのみ
+    確認する(既存のcatchup_predict_enable系テストと同じ設計に統一)。"""
     _cfg_path = os.path.join(
         os.path.dirname(__file__), "..", "config", "config.yaml")
     with open(_cfg_path) as f:
         cfg = f.read()
-    assert "early_release_enable: false" in cfg
+    assert "early_release_enable:" in cfg
 
 
 # ---------------------------------------------------------------------------

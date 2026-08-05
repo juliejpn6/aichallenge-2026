@@ -6844,12 +6844,23 @@ class MPCController(Node):
                 _opp_lat_now = None
                 _opp_vlong_now = None
                 _opp_ds_now = None
+                # 2026-08-05追加(診断専用、opp_lat_predクランプ張り付き問題調査、
+                #   design_docs predictive_control_overtake_development_plan_20260805.md
+                #   14-15節): 対象車の最近傍waypointインデックス(_c_wp、既存の
+                #   _scan_traffic出力、新規計算なし)をログへ流し、クランプ前の生の
+                #   横速度差分と突き合わせることで、外部AI(Gemini・別Claude)が
+                #   最有力と評価した仮説「waypointインデックス切り替えによる
+                #   フレーム回転混入」を実測データで検証できるようにする。判断への
+                #   反映は一切なし(ログのみ)。
+                _opp_wp_now = None
                 for _c_ds, _c_lat, _c_vlong, _c_dlat, _c_vid, _c_wp in _scan["cars"]:
                     if _c_vid == self._ot_target_vid:
                         _opp_lat_now = _c_lat
                         _opp_vlong_now = _c_vlong
                         _opp_ds_now = _c_ds
+                        _opp_wp_now = _c_wp
                         break
+                _fwd_dbg["opp_wp"] = _opp_wp_now
                 if _opp_lat_now is not None:
                     # 2026-08-05追加(299節続報、task#293候補①、ユーザー指摘「相手も
                     #   走行しているので次の瞬間にかわそうとしていた相手はもうそこには
@@ -6866,6 +6877,11 @@ class MPCController(Node):
                             and self._ot_opp_lat_prev_vid == self._ot_target_vid):
                         _dt = 1.0 / self._cfg.mpc.control_rate  # type: ignore
                         _raw_lat_vel = (_opp_lat_now - self._ot_opp_lat_prev) / _dt
+                        # 2026-08-05追加(診断専用、opp_lat_predクランプ張り付き問題調査):
+                        #   クランプ前の生の値をログへ保存する(下でクランプ後の値に
+                        #   上書きされる前に退避)。opp_wpの周期間変化と突き合わせて、
+                        #   waypointインデックス切り替え起因のジャンプかどうかを判別する。
+                        _fwd_dbg["opp_raw_lat_vel"] = round(_raw_lat_vel, 3)
                         # 2026-08-05追加(301節続報、ユーザー指摘「異常値を弾いた後の平均値で
                         #   計算すべき」): 微分は元々ノイズを増幅する演算であり、dev3実走行で
                         #   実際に異常値(逆算約-4.7m/sという物理的にあり得ない値)がEMAへ
@@ -7881,6 +7897,13 @@ class MPCController(Node):
                         # 2026-08-05追加(300節、task#293候補①): 対象車横位置外挿の実地検証用
                         #   (ロジック自体は無変更、デバッグ出力のみ)。
                         f"opp_lat_pred={_fwd_dbg.get('opp_lat_pred')} t_reach={_fwd_dbg.get('t_reach')} "
+                        # 2026-08-05追加(診断専用、opp_lat_predクランプ張り付き問題調査、
+                        #   design_docs predictive_control_overtake_development_plan_20260805.md
+                        #   14-15節): opp_wp(対象車の最近傍waypointインデックス)と
+                        #   opp_raw_lat_vel(クランプ前の生の横速度差分)。判断への反映は
+                        #   一切なし、外部AI相談で最有力とされた仮説(waypoint切り替えに
+                        #   よるフレーム回転混入)を実測データで検証するためのログのみ。
+                        f"opp_wp={_fwd_dbg.get('opp_wp')} opp_raw_lat_vel={_fwd_dbg.get('opp_raw_lat_vel')} "
                         f"corr[ub0={_fwd_dbg.get('corr_ub0')} lb0={_fwd_dbg.get('corr_lb0')} "
                         f"xr0={_fwd_dbg.get('corr_xr0')} wmin={_fwd_dbg.get('corr_wmin')} "
                         f"src={_fwd_dbg.get('corr_src')} nseg0/1/2={_fwd_dbg.get('nseg0')}/{_fwd_dbg.get('nseg1')}/{_fwd_dbg.get('nseg2')}] "

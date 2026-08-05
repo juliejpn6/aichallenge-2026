@@ -80,7 +80,10 @@ def test_pit_branch_no_longer_resyncs_removed_state():
 
 def test_ot_log_line_no_longer_prints_removed_fields():
     idx = _SRC.index('f"[OT] state=')
-    idx_end = idx + 2600
+    # 2026-08-05追加(診断ログ、opp_lat_predクランプ張り付き問題調査): opp_wp/
+    #   opp_raw_lat_velのf-string行が間に挿入されたため、窓を2600→3300へ再拡大
+    #   (検証対象そのものは無変更)。
+    idx_end = idx + 3300
     snippet = _SRC[idx:idx_end]
     assert "q_ey=" not in snippet
     assert "kappa_ahead=" not in snippet
