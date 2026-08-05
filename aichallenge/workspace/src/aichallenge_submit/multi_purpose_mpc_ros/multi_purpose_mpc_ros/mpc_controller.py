@@ -1208,6 +1208,10 @@ class MPCController(Node):
             #   実際に動けていない「見かけ上の回避成功」を弾く。
             self._stuck_push_min_dist_for_cleared = float(
                 _stkget("push_min_dist_for_cleared", 0.15))  # [m]
+            # 2026-08-05追加(291節): shuffle_max_cycles/max_giveup_streakの上限は
+            #   BACKUP-BLOCKED経路にしか実装されておらず、PUSH timeout繰り返し等の
+            #   他経路には上限が無かった実害(run全体喪失2回)への経路非依存の安全網。
+            self._stuck_shuffle_hard_limit = int(_stkget("shuffle_hard_limit", 20))
             self._stuck_backup_dist_eff = self._stuck_backup_dist  # 実効後退距離(BACKUP開始時に再計算)
             self._stuck_shuffle_cycle = 0          # 同一エピソード内のBACKUP→PUSH反復回数
             self._stuck_giveup_streak = 0          # 2026-07-26追加(186節続報): シャッフル上限に
@@ -1864,8 +1868,24 @@ class MPCController(Node):
         相当し、ローカル環境でgear_report=PARKのままREVERSEへ一切遷移しない事象
         ([[local-awsim-reverse-gear-unreliable]])の一因だった可能性がある。
         WAIT_PARK(新設、PARKを送りgear_settle_cycles確定待ち)をWAIT_REVERSEの
-        前段に挿入し、必ずP経由でRへ向かうようにする。"""
+        前段に挿入し、必ずP経由でRへ向かうようにする。
+        2026-08-05追加(291節、STUCKエスカレーション欠如バグ対策): 経路に依存しない
+        安全網として、shuffle_cycleがshuffle_hard_limitに達したら復帰そのものを
+        断念しNORMALへ委譲する。既存のshuffle_max_cycles/max_giveup_streakは
+        BACKUP-BLOCKED経路専用のエスカレーションで、PUSH timeoutを繰り返す経路には
+        上限が無かった(0804/0805で2回、run全体喪失という実害を確認済み)。"""
         self._stuck_update_shuffle_cycle(now, pose)  # 184節追加
+        if self._stuck_shuffle_cycle >= self._stuck_shuffle_hard_limit:
+            self.get_logger().warn(
+                f"[STUCK-SHUFFLE-ABANDON] shuffle_cycle={self._stuck_shuffle_cycle}が"
+                f"経路非依存の安全網shuffle_hard_limit={self._stuck_shuffle_hard_limit}に"
+                f"到達 -> 復帰を断念しNORMAL(通常のMPC/ICC)へ委譲")
+            self._stuck_shuffle_cycle = 0
+            self._stuck_giveup_streak = 0
+            self._stuck_push_side_flip = False
+            self._stuck_recovery_complete(reset_backup_state=True, reset_corridor=True,
+                                           now=now, pose=pose)
+            return
         self._stuck_state = "WAIT_PARK"
         self._stuck_count = 0
         self._stuck_stall_count = 0

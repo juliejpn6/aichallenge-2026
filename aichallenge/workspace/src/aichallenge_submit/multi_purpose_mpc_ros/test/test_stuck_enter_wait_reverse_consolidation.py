@@ -47,13 +47,24 @@ def test_helper_contains_full_reset_set():
     assert "self._handle_stuck_recovery(now, pose)" in snippet
 
 
-def test_helper_does_not_include_return_or_logging():
-    """②非冗長性: ヘルパーはreturn文・ログ出力(経路ごとに文言が異なるため
-    呼び出し元固有の責務)を含まず、状態リセットと復帰処理呼び出しのみに
-    責務を限定していることを確認する。"""
+def test_helper_does_not_include_path_specific_return_or_logging():
+    """②非冗長性: ヘルパーは経路ごとに文言が異なるログ(path=1/2 vs path=3)や、
+    制御フローの分岐点としてのreturnを含まず、状態リセットと復帰処理呼び出しに
+    責務を限定している……という原則を、291節で追加した「経路非依存の安全網」
+    (shuffle_hard_limit到達時の断念)は例外として明示的に許容する。この安全網は
+    経路1/2/3のどれから来たかに関わらず同一のログ・同一のreturnであり、
+    「経路ごとに異なる」という本テストが排除したい対象そのものではないため、
+    ヘルパーへ集約する方が非冗長(経路1/2/3の呼び出し元3箇所へ複製するより)。
+    291節のログ([OT-SHADOW]ではなく[STUCK-SHUFFLE-ABANDON])のみを許可対象として
+    除外し、それ以外の新規return/loggingが紛れ込んでいないことを検証する。"""
     snippet = _helper_body()
-    assert "\n        return" not in snippet  # 実際のreturn文(docstring内の言及は除外)
-    assert "self.get_logger()" not in snippet
+    snippet_without_hard_limit_guard = (
+        snippet.split("if self._stuck_shuffle_cycle >= self._stuck_shuffle_hard_limit:")[0]
+        + snippet.split('self._stuck_state = "WAIT_PARK"', 1)[1])
+    assert "\n        return" not in snippet_without_hard_limit_guard
+    assert "self.get_logger()" not in snippet_without_hard_limit_guard
+    # 291節の安全網自体は存在すること(前段のtest_hard_limit_*系で内容を検証済み)
+    assert "[STUCK-SHUFFLE-ABANDON]" in snippet
 
 
 # ---------------------------------------------------------------------------

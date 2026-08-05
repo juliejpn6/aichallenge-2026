@@ -271,6 +271,13 @@ stuck_recovery:
   shuffle_episode_radius_m: 3.0  # [m] 前回PUSH終了地点からこの距離内なら同一エピソード扱い
   max_giveup_streak: 3            # [回] シャッフル上限到達後、操舵方向を反転して再試行する回数の上限
   push_min_dist_for_cleared: 0.15  # [m] PUSH「reason=cleared」判定に必要な最小実移動量
+  # 2026-08-05追加(291節、STUCKエスカレーション欠如バグ対策): shuffle_max_cycles/
+  #   max_giveup_streakの上限チェックはBACKUP-BLOCKED経路にしか実装されておらず、
+  #   PUSH timeout(dist=0.00mでも無条件に完了扱い)を繰り返す経路には上限が無かった
+  #   ため、shuffle_cycleが無制限に増加し続ける実害(0804/0805で2回、run全体
+  #   [最大約30分]喪失)を確認した。経路に依存しない安全網として、
+  #   _stuck_enter_wait_reverse()でこの値に達したら無条件にNORMALへ委譲する。
+  shuffle_hard_limit: 20         # [回] 経路非依存の安全網。到達したら復帰断念しNORMALへ委譲
   # 自動衝突検知: 予選環境のbagにcondition系トピックがないため、実速度の急落を自車のみで直接監視する。
   collision_suspect_dv: 0.8  # [m/s] 1周期での急落閾値(正当な制動上限の何倍もの余裕を持たせた値)
   collision_suspect_cum_dv: 1.0    # [m/s] 直近collision_cum_window_cycles周期の最大値からの下落閾値

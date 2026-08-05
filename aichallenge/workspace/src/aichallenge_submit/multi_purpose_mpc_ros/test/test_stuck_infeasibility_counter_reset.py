@@ -61,11 +61,14 @@ def test_all_three_normal_transitions_reset_infeasibility_counter():
             f"missing _stuck_recovery_complete() call near anchor: {anchor!r}")
 
 
-def test_exactly_three_stuck_recovery_complete_call_sites():
-    """回帰: _stuck_recovery_complete()の呼び出しがちょうど3箇所であることを
-    確認する(将来の編集で4箇所目が増えたり、既存の1箇所が削られたりする
-    変化を検知するため。定義自体の1箇所は含まないよう呼び出し構文で数える)。"""
-    assert _SRC.count("self._stuck_recovery_complete(") == 3
+def test_exactly_four_stuck_recovery_complete_call_sites():
+    """回帰: _stuck_recovery_complete()の呼び出しがちょうど4箇所であることを
+    確認する(将来の編集で5箇所目が増えたり、既存の1箇所が削られたりする
+    変化を検知するため。定義自体の1箇所は含まないよう呼び出し構文で数える)。
+    2026-08-05追加(291節): STUCKエスカレーション欠如バグの安全網
+    (_stuck_enter_wait_reverse内、shuffle_hard_limit到達時の断念)で4箇所目が
+    増えた——経路非依存で復帰を断念する新しい正当な呼び出し元のため、3→4へ更新。"""
+    assert _SRC.count("self._stuck_recovery_complete(") == 4
 
 
 def test_stuck_recovery_complete_helper_always_resets_counter_unconditionally():
