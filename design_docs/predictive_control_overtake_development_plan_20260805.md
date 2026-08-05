@@ -309,3 +309,18 @@ ENGAGEしている**——これは新機構導入によって新たに生まれ
 (高v_rel域は完全保証、低v_rel域は許容可能な劣化に留める)と判断できる。
 実装(候補④コード、config gate既定OFF)に進む準備が整った。次はdev3実地で
 n≥2の検証を行う。
+
+## 10. 実装完了(2026-08-05、コミットa8e7ddf)
+
+新関数`_predicted_catch_up_time`(既存`_predicted_time_to_wp`の2体問題版)を
+追加し、`_evaluate_engage_readiness`の`_close_enough`計算へconfig gate
+(`overtake.catchup_predict_enable`、既定`false`)付きで統合した。
+`overtake.catchup_engage_margin_s`(既定1.5秒、Phase 0実測の実用バランス点)。
+icc_stopには一切触れていない(7-8節の最終結論通り)。既存の停止相手向け分岐
+(`_predicted_time_to_wp`呼び出し)は無変更、`_t_reach_margin=0.0`によりビット
+等価を維持。回帰: 新規12件(閉形式計算の数値検証4件+構造検証8件)+全体
+3133件PASS。
+
+**未実施**: dev3実地でのn≥2検証(config既定OFFのため、有効化してからの
+実地走行試験が次のステップ)。task#265(side別engage_cooldown)は設計方針
+(7節)まで決定済みだが実装は未着手。
