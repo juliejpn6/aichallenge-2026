@@ -229,13 +229,22 @@ stuck_recovery:
   v_thr: 0.3             # [m/s] 実速度がこれ未満
   hold_cycles: 60        # [周期] 継続でスタック判定(≈1.5s@40Hz。252節で120→60へ短縮)
   infeas_thr: 300        # [周期] u0を問わず連続infeasibleで即発動(≈7.5s@40Hz)
-  gear_settle_cycles: 20 # [周期] ギア切替の確定待ち(≈0.5s@40Hz、GearReport未配信環境向けの保険)
+  # 2026-08-05拡大(293節、20→50): 予選ログ(0729-01、検知→確認まで一貫して約65ms)と
+  #   ローカル全走行ログ(2026-07-23〜08-05、130件以上)の横断比較で、ローカルの
+  #   REVERSE確認成功率が1%未満(soloでもdev3でも同様、CPU負荷は主因でないと判明)と
+  #   確定した。唯一の局所成功例(20260805-065239)を精査すると、同一エピソード内で
+  #   8回もWAIT_PARK→WAIT_REVERSE→BACKUP失敗を繰り返した末、前回サイクルの遅延応答が
+  #   偶然追いついてconfirmedになっていた——AWSIM側の実際のギアシフト処理遅延が
+  #   従来の待ち時間(≈0.5s)より長い可能性が高いという仮説に基づき拡大する。
+  #   判断ロジック自体(confirmed OR timeout方式)は変更しない、待ち時間の数値のみ拡大。
+  gear_settle_cycles: 50 # [周期] ギア切替の確定待ち(≈1.25s@40Hz、GearReport未配信環境向けの保険)
   # 2026-08-04追加: WAIT_PARKで「gear_report==PARK」が実質0周期で即confirmed=Trueに
   #   なる(前エピソードの残存状態を拾っている可能性)実測が本日5件見つかり、
   #   P→R遷移(WAIT_REVERSE)が全件失敗する主因の疑いが強い。confirmedを信用せず、
   #   WAIT_PARKは常にこの周期数だけ滞留してからWAIT_REVERSEへ進む(ローカルAWSIM
   #   限定の既知問題への対策、詳細は[[stuck-normal-handoff-infinite-loop-wall-pin-0804]])。
-  gear_park_dwell_cycles: 40 # [周期] WAIT_PARKの固定滞留(≈1.0s@40Hz、gear_settle_cyclesの2倍から開始)
+  # 2026-08-05拡大(293節、40→80): gear_settle_cyclesと同じ根拠・同じ倍率(2倍)で拡大。
+  gear_park_dwell_cycles: 80 # [周期] WAIT_PARKの固定滞留(≈2.0s@40Hz、gear_settle_cyclesの2倍から開始)
   backup_dist: 2.0       # [m] 後退距離
   backup_speed: -3.0     # [m/s] サンプル準拠
   backup_accel: 1.5      # [m/s^2] サンプル準拠
