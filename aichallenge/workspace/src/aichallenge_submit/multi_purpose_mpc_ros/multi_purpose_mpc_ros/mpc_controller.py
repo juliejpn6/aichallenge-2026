@@ -943,6 +943,8 @@ class MPCController(Node):
             self._ot_speed_recover_count = 0   # 接近速度が回復条件を満たした連続周期数
             self._ot_room_gated = False        # 今回のcooldownが③(room_exhausted)起因か
             self._ot_room_recover_count = 0    # room_exhaustedの回復条件を満たした連続周期数
+            self._ot_speed_clear_logged = False  # [SPEED-COOLDOWN-CLEAR]の多重ログ防止
+            self._ot_room_clear_logged = False   # [ROOM-COOLDOWN-CLEAR]の多重ログ防止
             # 2026-07-21追加(148節②、実測に基づく再設計): 0721-01以降のローカルログ実測
             # (giveup後のfwd_dlat推移をwaypoint単位で追跡)で、footprint_risk起因のgiveup
             # 8件中3件は間隔がわずか1.3〜5.0秒で回復していたにもかかわらず、固定8秒
@@ -3212,6 +3214,25 @@ class MPCController(Node):
             self.get_logger().info(
                 f"[FP-COOLDOWN-CLEAR] footprint_risk条件が{self._ot_engage_debounce}周期"
                 f"連続で不成立となり解除(cd_timer_remain={self._ot_engage_cooldown}周期)")
+        # 2026-08-05追加(engage_cooldown早期解除①③、同時検証時の効果切り分け用):
+        #   ①③についてもfootprint_riskと同型のワンショット診断ログを追加する。
+        #   cd_timer_remain(=self._ot_engage_cooldown)が0でセットされていた
+        #   (=task#265のcooldown_per_sideが同時にグローバルを0リセットした)場合と、
+        #   実際にタイマーが残っていた状態から実測解消経路で解除された場合を、
+        #   このcd_timer_remainの値そのものから事後に区別できる。
+        if (self._ot_speed_gated and _cd_clear
+                and not self._ot_speed_clear_logged):
+            self._ot_speed_clear_logged = True
+            self.get_logger().info(
+                f"[SPEED-COOLDOWN-CLEAR] 接近速度が{self._ot_giveup_cycles}周期"
+                f"連続で回復し解除(cd_timer_remain={self._ot_engage_cooldown}周期)")
+        if (self._ot_room_gated and _cd_clear
+                and not self._ot_room_clear_logged):
+            self._ot_room_clear_logged = True
+            self.get_logger().info(
+                f"[ROOM-COOLDOWN-CLEAR] room_exhaustedが{self._ot_giveup_cycles}周期"
+                f"連続で解消し解除(cd_timer_remain={self._ot_engage_cooldown}周期 "
+                f"side={self._ot_prev_side})")
         _cheap_ok = (self._ot_enable and (left_ok or right_ok)
                      and self._ot_infeasible_latch == 0
                      and _cd_clear
@@ -6605,6 +6626,8 @@ class MPCController(Node):
                             not _lat_dec.footprint_risk_triggered and _room_exhausted)
                         self._ot_speed_recover_count = 0
                         self._ot_room_recover_count = 0
+                        self._ot_speed_clear_logged = False
+                        self._ot_room_clear_logged = False
                         self._ot_cleared = False
                         self._reset_ot_offset_state()
                     else:

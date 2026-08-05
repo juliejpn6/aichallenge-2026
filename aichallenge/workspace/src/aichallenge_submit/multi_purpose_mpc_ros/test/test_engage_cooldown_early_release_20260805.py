@@ -130,3 +130,41 @@ def test_cd_clear_includes_speed_and_room_early_release_branches():
     assert "if self._ot_room_gated" in snippet
     # 末端は必ず固定タイマーへ収束すること(gate OFF時の退行防止)
     assert snippet.count("self._ot_engage_cooldown == 0") >= 3
+
+
+# ---------------------------------------------------------------------------
+# ⑤診断ログ: task#265との同時検証時に効果を事後に切り分けられるよう、
+#   footprint_riskと同型のワンショットログを①③にも追加する
+#   (2026-08-05追記、ユーザー質問「同時に検証できるなら同時で良い、
+#   区別できないなら一つずつ」への対応)
+# ---------------------------------------------------------------------------
+
+def test_speed_cooldown_clear_log_exists_with_oneshot_guard():
+    assert "self._ot_speed_clear_logged = False" in _SRC
+    idx = _SRC.index("if (self._ot_speed_gated and _cd_clear")
+    idx_end = _SRC.index("if (self._ot_room_gated and _cd_clear", idx)
+    snippet = _SRC[idx:idx_end]
+    assert "self._ot_speed_clear_logged = True" in snippet
+    assert "[SPEED-COOLDOWN-CLEAR]" in snippet
+    assert "cd_timer_remain={self._ot_engage_cooldown}" in snippet
+
+
+def test_room_cooldown_clear_log_exists_with_side_field():
+    """③のログにはside(self._ot_prev_side)も含める——task#265が同時にONの
+    場合、cd_timer_remainが既に0だった(=task#265由来)のか、実測解消経路
+    そのもので減っていったのかを事後に見分ける材料になる。"""
+    assert "self._ot_room_clear_logged = False" in _SRC
+    idx = _SRC.index("if (self._ot_room_gated and _cd_clear")
+    idx_end = idx + 400
+    snippet = _SRC[idx:idx_end]
+    assert "self._ot_room_clear_logged = True" in snippet
+    assert "[ROOM-COOLDOWN-CLEAR]" in snippet
+    assert "side={self._ot_prev_side}" in snippet
+
+
+def test_oneshot_log_flags_reset_on_new_giveup_episode():
+    idx = _SRC.index("self._ot_speed_recover_count = 0\n"
+                      "                        self._ot_room_recover_count = 0")
+    snippet = _SRC[idx:idx + 260]
+    assert "self._ot_speed_clear_logged = False" in snippet
+    assert "self._ot_room_clear_logged = False" in snippet
