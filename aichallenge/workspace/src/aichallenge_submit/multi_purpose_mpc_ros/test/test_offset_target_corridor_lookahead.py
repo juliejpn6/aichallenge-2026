@@ -102,7 +102,9 @@ def test_lateral_target_uses_corr_bound_ahead_helper():
     # 2026-08-05追加(299節続報、task#293候補①): 対象車横方向速度のEMA推定+t_reach
     #   外挿ブロックが間に挿入されたため、窓を3800→7000へ再拡大(検証対象そのものは
     #   無変更)。
-    snippet = _SRC[max(0, idx - 7000):idx]
+    # 2026-08-05追加(301節続報、ノイズ耐性強化): クランプ・ウォームアップカウンタが
+    #   間に挿入されたため、窓を7000→8000へ再拡大(検証対象そのものは無変更)。
+    snippet = _SRC[max(0, idx - 8000):idx]
     assert "self._corr_bound_ahead(self._ot_side)" in snippet
 
 

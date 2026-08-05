@@ -857,6 +857,14 @@ class MPCController(Node):
                 _otget("min_needed_horizon_cap_s", 1.5))    # [s] 対象車横位置外挿のホライズン上限
             self._ot_min_needed_closing_floor = float(
                 _otget("min_needed_closing_floor", 0.5))    # [m/s] t_reach計算のゼロ割回避floor
+            # 2026-08-05追加(301節続報、ユーザー指摘「異常値を弾いた後の平均値で計算すべき」):
+            #   dev3実走行で対象車横方向速度の差分推定が異常値(逆算約-4.7m/s、物理的に
+            #   あり得ない)を拾いOT中衝突の直接原因になったことを受け、ノイズ耐性を追加。
+            self._ot_min_needed_lat_vel_clamp = float(
+                _otget("min_needed_lat_vel_clamp", 2.0))     # [m/s] 生の横速度差分をこの範囲へクランプ(異常値を弾く)
+            self._ot_min_needed_lat_vel_warmup_cycles = self._rate_scaled_cycles(
+                "min_needed_lat_vel_warmup_cycles",
+                int(_otget("min_needed_lat_vel_warmup_cycles", 20)))  # [周期] これ未満は予測を使わない(≈0.5s@40Hz)
             self._ot_max_consider = float(_otget("max_consider", 40.0))  # [m] 前方弧長の上限
             self._ot_v_cap = float(_otget("v_cap", 6.0))            # [m/s] 追い越し中の速度上限
             self._ot_exit_clear = int(_otget("exit_clear", 3))
@@ -946,6 +954,7 @@ class MPCController(Node):
             self._ot_opp_lat_prev = None       # [m] 前回周期の対象車横位置(同一対象車のときのみ有効)
             self._ot_opp_lat_prev_vid = None   # 前回周期の対象車ID(切替検知用)
             self._ot_opp_lat_vel_ema = None    # [m/s] 対象車横方向速度のEMA推定値
+            self._ot_opp_lat_warmup_count = 0  # [周期] 連続有効サンプル数(ウォームアップ判定用、301節続報)
             # 2026-07-17追加(94節、トークン整合性監査): scan_traffic の fwd_vid は
             #   毎周期「その時点で最も近い車」を選び直す実装であり、ロック中の対象車に
             #   固定されない。93節で修正したLAT-TTCのcritical_curvature_runと同じ理由で、
@@ -1849,6 +1858,7 @@ class MPCController(Node):
         self._ot_opp_lat_prev = None
         self._ot_opp_lat_prev_vid = None
         self._ot_opp_lat_vel_ema = None
+        self._ot_opp_lat_warmup_count = 0
         self._reset_ot_offset_state()
 
     def _reset_ot_offset_state(self) -> None:
@@ -6124,6 +6134,7 @@ class MPCController(Node):
                         self._ot_opp_lat_prev = None
                         self._ot_opp_lat_prev_vid = None
                         self._ot_opp_lat_vel_ema = None
+                        self._ot_opp_lat_warmup_count = 0
                         # 2026-07-14追加: 側が入れ替わったので_ot_clearedもリセットする。
                         #   他の側変更点(STOPPING遷移・NORMAL復帰・infeasible-stop)は全て
                         #   _ot_cleared=Falseを伴っており、ここだけ漏れていた。本節で
@@ -6271,6 +6282,7 @@ class MPCController(Node):
                                 self._ot_opp_lat_prev = None
                                 self._ot_opp_lat_prev_vid = None
                                 self._ot_opp_lat_vel_ema = None
+                                self._ot_opp_lat_warmup_count = 0
                                 self._ot_cleared = False
                                 self._ot_reacquire_count = 0
                                 self.get_logger().warn(
@@ -6408,6 +6420,7 @@ class MPCController(Node):
                         self._ot_opp_lat_prev = None
                         self._ot_opp_lat_prev_vid = None
                         self._ot_opp_lat_vel_ema = None
+                        self._ot_opp_lat_warmup_count = 0
                         self._lat_ttc.reset_episode()  # シャドウ検証(2026-07-11): 新規エンゲージ毎にリセット
                         # 2026-07-17追加(97節): line_cap EMAも新規エンゲージ毎に仕切り直す
                         #   (前回のオーバーテイクの平滑化値を持ち越さない、既存原則の踏襲)。
@@ -6584,13 +6597,28 @@ class MPCController(Node):
                             and self._ot_opp_lat_prev_vid == self._ot_target_vid):
                         _dt = 1.0 / self._cfg.mpc.control_rate  # type: ignore
                         _raw_lat_vel = (_opp_lat_now - self._ot_opp_lat_prev) / _dt
+                        # 2026-08-05追加(301節続報、ユーザー指摘「異常値を弾いた後の平均値で
+                        #   計算すべき」): 微分は元々ノイズを増幅する演算であり、dev3実走行で
+                        #   実際に異常値(逆算約-4.7m/sという物理的にあり得ない値)がEMAへ
+                        #   混入しOT中衝突の直接原因になったことを確認した。生の差分値を
+                        #   物理的に妥当な範囲(既定±2.0m/s)へクランプしてから平滑化する
+                        #   (外れ値そのものを弾く、EMA平滑化だけでは不十分だった)。
+                        _raw_lat_vel = max(
+                            -self._ot_min_needed_lat_vel_clamp,
+                            min(self._ot_min_needed_lat_vel_clamp, _raw_lat_vel))
                         if self._ot_opp_lat_vel_ema is None:
-                            self._ot_opp_lat_vel_ema = _raw_lat_vel
-                        else:
-                            self._ot_opp_lat_vel_ema += self._ot_ema_alpha * (
-                                _raw_lat_vel - self._ot_opp_lat_vel_ema)
+                            # 2026-08-05修正(301節続報): 従来は初回サンプルをフィルタなしで
+                            #   そのままEMA初期値としており、コールドスタート直後の1周期の
+                            #   ノイズが無平滑で採用される欠陥があった(上記クランプはあっても
+                            #   まだ±2.0m/sという大きな初期値を許してしまう)。0.0(静止と仮定、
+                            #   安全側)から開始し、以降は通常通りEMA平滑化する。
+                            self._ot_opp_lat_vel_ema = 0.0
+                        self._ot_opp_lat_vel_ema += self._ot_ema_alpha * (
+                            _raw_lat_vel - self._ot_opp_lat_vel_ema)
+                        self._ot_opp_lat_warmup_count += 1
                     else:
                         self._ot_opp_lat_vel_ema = None
+                        self._ot_opp_lat_warmup_count = 0
                     self._ot_opp_lat_prev = _opp_lat_now
                     self._ot_opp_lat_prev_vid = self._ot_target_vid
                     # 通過までの推定所要時間(t_reach): 自車-対象車間の縦方向接近速度から
@@ -6604,7 +6632,12 @@ class MPCController(Node):
                             _opp_ds_now / _closing, self._ot_min_needed_horizon_cap_s)
                     else:
                         _t_reach = 0.0
-                    if self._ot_opp_lat_vel_ema is not None:
+                    # 2026-08-05追加(301節続報): ウォームアップ周期数(既定20≈0.5s@40Hz)に
+                    #   達するまでは、EMAが十分収束していない可能性が高いため予測を使わず
+                    #   現在値のまま(=300節導入前の安全な挙動と同一)とする。
+                    if (self._ot_opp_lat_vel_ema is not None
+                            and self._ot_opp_lat_warmup_count
+                                >= self._ot_min_needed_lat_vel_warmup_cycles):
                         _opp_lat_pred = _opp_lat_now + self._ot_opp_lat_vel_ema * _t_reach
                     else:
                         _opp_lat_pred = _opp_lat_now
