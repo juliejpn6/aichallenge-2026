@@ -113,6 +113,24 @@ x-racing_kart_interface-base: &racing_kart_interface-base
     - "${HOST_GID_DIALOUT:-20}"
   working_dir: /workspace
 
+# 2026-08-05復元(291節続報): origin/mainマージ時、upstreamがこのアンカー定義を
+#   持たない構成(docs/spec/等へ再構成)だったため、3-wayマージが本ブロックの定義
+#   (非conflict扱いの箇所)を静かに削除していたことが判明(autoware-d1~d4が参照する
+#   *autoware-eval-base が未定義になりmake dev3が起動不能)。b499125時点の内容を
+#   そのまま復元する。
+x-autoware-eval-base: &autoware-eval-base
+  <<: *autoware-base
+  volumes:
+    - ./output:${OUTPUT_ROOT:-/output}
+    # /aichallenge is baked into the eval image; intentionally not mounted here
+    # - ./aichallenge:/aichallenge
+    - ./vehicle/cyclonedds.xml:/opt/autoware/cyclonedds.xml
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    # Audio (PipeWire/Pulse) socket access on the host
+    - /run/user:/run/user:rw
+    - /dev/dri:/dev/dri
+    - ${XAUTHORITY}:${XAUTHORITY}:rw
+
 services:
   # Autoware service
   autoware:
