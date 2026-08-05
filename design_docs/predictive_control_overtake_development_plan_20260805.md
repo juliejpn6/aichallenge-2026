@@ -344,11 +344,32 @@ icc_stopには一切触れていない(7-8節の最終結論通り)。既存の�
 
 回帰: 新規11件(バグ修正の再発防止テスト含む)+全体3144件PASS。
 
-## 12. engage_cooldown固定タイマー(4秒)の早期解除設計(2026-08-05、検討中)
+## 12. engage_cooldown固定タイマー(4秒)の早期解除設計・実装完了(2026-08-05、コミット4dd264c)
 
 ユーザー指摘「4秒何もしないのはロスになる場合がある」を受け、既存の
 footprint_risk専用「実測解消」パターン(148節②、`_ot_footprint_risk_clear_count`)
-を、他のgiveup理由(①相手が速すぎる・③room_exhausted)にも横展開する案を
-検討中。外部AI相談プロンプト
-(`docs/superpowers/specs/2026-08-05-engage-cooldown-early-release-consultation-prompt.md`)
-を作成、回答待ち。コード変更はまだ行っていない。
+を、①相手が速すぎる・③room_exhausted(footprint_risk起因を除く)へ横展開した。
+
+**外部AI相談で確定した設計**:
+- 値ヒステリシス必須(Gemini・別Claude両者が指摘): 同一閾値の往復はデバウンス
+  だけでは防げず、コーナー/直線で接近速度が数秒周期で振動する構造的リスクが
+  ある。①は`opp_giveup_closing`の2倍、③は`along_min_width`(既存の幅マージン
+  定数を再利用)。
+- デバウンスは「対称性の原則」(別Claude提案): giveup自体が`_ot_giveup_cycles`
+  (40周期≈1秒)継続で発火するなら、解除も同じ周期数の継続を要求する(新規
+  パラメータ0個)。
+- **①には既知のV2X速度クランプ異常への防御ガードが必須と判明**
+  (別Claudeの指摘、design_docs `v2x_anomaly_defense_gap_review_20260803.md`と
+  照合して実在する脆弱性と確認。対処機構`v2x.clamp_hold_enabled`は現状
+  `false`のため本番運用では未防御)。`fwd_vopp<=0.0`の周期は実測解消判定を
+  スキップする。
+- ③は永続変数`self._ot_prev_side`を使う(`_locked`はgiveup発生周期限りの
+  ローカル変数、別Claude指摘をコードで検証し正確と確認)。
+- ②(ロック外れ)は実測解消経路なし、固定タイマーのみ(両AI一致)。
+- `cooldown_per_side`(#265)とは独立のconfig gate(`early_release_enable`、
+  既定false)。1変更1検証の原則により、両方同時ONにした場合の相互作用
+  (③の早期解除がグローバル`_ot_engage_cooldown`のみに作用し、side別カウンタ
+  `_ot_engage_cooldown_l/r`には及ばない制約)は今回のスコープ外とし、次の
+  ステップとして残す。
+
+回帰: 新規9件+全体3153件PASS。dev3実地検証は未実施(次のステップ)。
