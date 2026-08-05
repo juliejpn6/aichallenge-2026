@@ -8704,5 +8704,45 @@ tau=160msというパラメータの効果とは無関係な汚染要因のた�
 (<code>_fwd_clear_count</code>がNORMAL復帰後もリセットされない疑い)は未調査のまま。
 </p>
 
+<h3>291. origin/main(運営公式リポジトリ)をマージ(66コミット先行×21コミット遅行)</h3>
+<p class="small">
+ユーザー確認(2026-07-29、別参加者PCで同一ソースコードのRレンジが正常動作)を受け、
+ローカル環境固有のRレンジ不具合の解消を期待して<code>./setup.bash pull image</code>→
+Dockerイメージ再ビルド→<code>git pull origin/main</code>を実施した。
+</p>
+<p class="small">
+<b>ベースイメージは既に最新(2025-12-16公開)で変化なし</b>。<code>git fetch</code>で
+upstream 21コミット分の差分を確認したところ、<b>我々の制御コード本体
+(config.yaml・mpc_controller.py・MPC.py・spatial_bicycle_models.py・reference_path.py・
+map.py・v2x_vehicle_tracker.py・path_constraints_provider.py)には一切触れられておらず、
+Rレンジ/ギア指令処理に関わる変更(vehicle_interface・awsim_adapter等)も皆無</b>と判明。
+唯一"gear"を含むコミット(teleop_manager機能追加)は人間による手動操作用のキーボード/
+ジョイスティック入力機能であり、自律走行のGearCommand発行経路とは無関係と確認した。
+<b>結論: 今回の更新はRレンジ問題を解決しない</b>(根本原因は依然不明のまま)。
+</p>
+<p class="small">
+<b>マージ作業自体で重大なリスクを検出・回避</b>: 初回の<code>git merge origin/main</code>で、
+gitのディレクトリ・リネーム検出ヒューリスティックが、upstream側で
+<code>design_docs/*.md</code>が<code>docs/spec/*.md</code>へ再編されたことを根拠に、
+<b>我々が独自に作成した17個のdesign_docsファイル(stage15_perf_20260707.html含む
+このセッション全体の記録)を「削除」候補としてマークし、実際に作業ディレクトリから
+消去した</b>。ユーザーの即座の懸念表明を受け<code>git merge --abort</code>で完全復旧
+(コミット前だったため実害なし)、原因究明後に手動で該当ファイルをHEAD側から復元・
+再追加して再度マージを実行した。<code>-X no-renames</code>オプションはこのgit
+バージョンのディレクトリ・リネーム検出を抑制できなかった点も記録しておく。
+</p>
+<p class="small">
+<b>実質的なコンフリクト6件</b>(<code>run_autoware.bash</code>・<code>dev.sh</code>・
+<code>mpc.launch.xml</code>・<code>reference.launch.xml</code>・
+<code>run_mpc_controller.bash</code>・<code>docker-compose.yml</code>)はすべて
+launch/インフラ層で、双方の変更を両立する形(例: 我々のCPU affinity機構+upstreamの
+SIGINT/TERM転送改善、我々のBLASスレッド制限+upstreamのexec化、我々の
+<code>bag-recorder</code>サービス+upstreamの新<code>rosbag</code>サービスを並存)で
+解決した。<code>use_obstacle_avoidance</code>の既定値(我々はtrue、upstreamはfalse)は
+我々の値を維持。回帰スイート3079件全PASS・design_docs全17ファイル復元確認後にコミット
+(<code>7d73e9e</code>)。新規追加として柏の葉トラック(kashiwanoha)一式が加わったが
+未使用・現行トラック(final_ver3)には影響なし。
+</p>
+
 </body>
 </html>
