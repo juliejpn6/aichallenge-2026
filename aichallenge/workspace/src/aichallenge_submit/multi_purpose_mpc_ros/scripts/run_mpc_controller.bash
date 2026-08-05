@@ -19,4 +19,4 @@ if [ "${MPC_BLAS_THREAD_LIMIT:-1}" != "0" ]; then
     export OPENBLAS_NUM_THREADS="${MPC_BLAS_THREAD_LIMIT:-1}"
     export MKL_NUM_THREADS="${MPC_BLAS_THREAD_LIMIT:-1}"
 fi
-python3 "$(ros2 pkg prefix multi_purpose_mpc_ros)/lib/multi_purpose_mpc_ros/mpc_controller" "$@"
+exec python3 "$(ros2 pkg prefix multi_purpose_mpc_ros)/lib/multi_purpose_mpc_ros/mpc_controller" "$@"

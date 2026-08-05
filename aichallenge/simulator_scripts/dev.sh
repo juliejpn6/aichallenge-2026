@@ -10,14 +10,15 @@ vehicles="${1:-1}"
 #   eval.sh(評価環境相当)も既にoffになっており、devのみon→offの不一致があった。
 #   ローカルでの挙動が独自STUCK/PUSH復帰ロジック(149〜173節)とAWSIM組み込みの
 #   自動修正(壁衝突時、速度>0.5m/sで180°/s・1秒間)を混同しないよう、実環境に揃える。
-$AWSIM_DIRECTORY/AWSIM.x86_64 \
+exec $AWSIM_DIRECTORY/AWSIM.x86_64 \
+    --venue citycircuit \
     --start-mode count \
     --start-count-seconds 5 \
     --vehicles "${vehicles}" \
     --npcs 0 \
     --boosts 2 \
     --laps unlimited \
-    --timeout unlimited \
+    --timeout 10000000.0 \
     --steer-source ackermann \
     --sound off \
     --collisions on \
