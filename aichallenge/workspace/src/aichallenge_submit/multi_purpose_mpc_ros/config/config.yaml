@@ -237,7 +237,15 @@ stuck_recovery:
   #   偶然追いついてconfirmedになっていた——AWSIM側の実際のギアシフト処理遅延が
   #   従来の待ち時間(≈0.5s)より長い可能性が高いという仮説に基づき拡大する。
   #   判断ロジック自体(confirmed OR timeout方式)は変更しない、待ち時間の数値のみ拡大。
-  gear_settle_cycles: 50 # [周期] ギア切替の確定待ち(≈1.25s@40Hz、GearReport未配信環境向けの保険)
+  # 2026-08-05再拡大(294節続報、50→200): 中間ギアをPARK(仕様外)からNEUTRAL(仕様通り)へ
+  #   修正した結果、NEUTRAL confirmed成功率は100%(24/24)まで改善したが、REVERSE自体は
+  #   引き続きconfirmed 0件のまま(run9実測)。誤った中間ギア(PARK)下で行った上記50への
+  #   拡大は前提が汚染されたデータであり無効だったため、正しいNEUTRAL前提の下で
+  #   REVERSE確認待ちを大幅に(200周期≈5秒)再拡大し、AWSIM側のREVERSE固有の遅延・
+  #   成立条件(速度ゼロの保持時間等)を再検証する。WAIT_DRIVEの確認待ちも同じ値を
+  #   共有するが、DRIVEは既に高い確認成功率のため実質的な待ち時間増加は起きない
+  #   (confirmed次第で早期に次状態へ進む設計、上限に達することは稀)。
+  gear_settle_cycles: 200 # [周期] ギア切替の確定待ち(≈5.0s@40Hz、REVERSE固有条件の再検証用)
   # 2026-08-04追加: WAIT_PARKで「gear_report==PARK」が実質0周期で即confirmed=Trueに
   #   なる(前エピソードの残存状態を拾っている可能性)実測が本日5件見つかり、
   #   P→R遷移(WAIT_REVERSE)が全件失敗する主因の疑いが強い。confirmedを信用せず、
