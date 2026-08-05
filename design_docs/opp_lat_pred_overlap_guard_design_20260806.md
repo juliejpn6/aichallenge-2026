@@ -1,10 +1,11 @@
 # opp_lat_pred根本修正 + 並走ガード + 離脱意味論 設計書(task#295/306統合対応)
 
-**ステータス**: 外部AIレビュー(Gemini・別Claude)反映済み、実装未着手。
+**ステータス**: 外部AIレビュー反映済み+段階導入計画確定、実装未着手。
 **根拠**: `predictive_control_overtake_development_plan_20260805.md` 14-19節、
 `stage15_perf_20260707.html` 306節続報3。
-**改訂**: 2026-08-06、レビュー反映(§8参照、must-fix 3点+推奨4点を本文へ
-統合済み)。
+**改訂**: 2026-08-06、レビュー反映(§8、must-fix 3点+推奨4点)+3本目の
+裏付け事例(§6.0、`0805-07`ログ)+診断ログ設計(§9)+段階導入計画
+(§10、A→B→Cの順に個別ゲート・都度オフライン→dev3→予選の3段階検証)。
 
 ## 0. 対象とする3つの不具合、および設計方針
 
@@ -178,7 +179,13 @@ def _apply_overlap_floor(self, target_mag: float, opp_ds_now: Optional[float],
       - 床は同一並走エピソード内で単調非減少(下がらない)。
       - 床適用後のtarget_magは、常に「現在のcorr_bound - マージン」以下
         (=床がコリドーの壁を突き破ることは原理的に発生しない、今周期の
-        実測corr_boundで毎回再キャップするため)。"""
+        実測corr_boundで毎回再キャップするため)。
+
+    ゲートOFF(既定)時は_update_overlap_state()の呼び出しも含め早期return
+    し、target_magを完全に無変更で返す(全ゲートOFF時のビット等価性を
+    保証、6章の検証項目)。"""
+    if not self._ot_overlap_floor_enabled:
+        return target_mag
     overlapping = self._update_overlap_state(opp_ds_now)
     if overlapping:
         self._ot_overlap_floor_mag = max(self._ot_overlap_floor_mag or 0.0, target_mag)
@@ -264,7 +271,10 @@ lat_ttc系の減速に委ねる(offsetを床(Fix B)で維持したまま自然�
 _side_blocked = _lat_dec.force_giveup or _room_exhausted
 _giveup_now = (self._ot_giveup_count >= self._ot_giveup_cycles
                or _locked == 0 or _side_blocked)
-if _giveup_now and not _lat_dec.footprint_risk_triggered:
+# ゲートOFF(既定)時は以下を一切実行しない(_giveup_nowの値をそのまま
+# 使う=現行動作とビット等価、6章の検証項目)。
+if (self._ot_pending_disengage_enabled and _giveup_now
+        and not _lat_dec.footprint_risk_triggered):
     # Fix C: 並走中の非緊急giveupは、車間が空くまで離脱を保留する。
     #   footprint_risk(緊急反応的トリガー)はここで除外し、現行どおり
     #   即座に処理する(82/83節の教訓に基づき、安全反応系の遅延は厳禁)。
@@ -356,31 +366,61 @@ STUCK進入時(推奨4)・`fwd_vid`切替経路が存在する場合(推奨7)に
 
 ## 5. config.yaml 新規パラメータ
 
-**2026-08-06改訂(外部AIレビュー、Claude)**: Fix Aと Fix B/Cを独立した
-configゲートに分離する(効果の帰属を分離して検証できるようにするため。
-両方を同時にONにすると、実地検証でどちらの寄与かが判別できなくなる)。
+**2026-08-06改訂(ユーザー指示: 段階導入)**: Fix A・Fix B・Fix Cを
+**それぞれ独立した**configゲートへ分離する(当初案はFix B+Cを1ゲートへ
+束ねていたが、task#265/early_release/候補④で「複数機構を同時にONに
+すると効果の切り分けができない」という教訓を得たばかりであり、同じ
+轍を踏まないため3つとも個別に分離する)。
 
 ```yaml
 overtake:
-  lat_vel_source_tracker: false   # false=現行の自前差分/true=Fix A(tracker.velocity()再利用)
-  overlap_guard_enabled: false    # false=現行/true=Fix B(オフセット床)+Fix C(離脱保留)を一括有効化
-  overlap_margin_m: 0.5           # 並走(縦オーバーラップ)判定のヒステリシス幅
-  overlap_corr_margin_m: 0.1      # Fix Bの床をcorr_boundで再キャップする際のマージン(must-fix 1)
-  pending_disengage_max_cycles: 80  # 離脱保留の上限周期数(既定=giveup_cycles*2目安)
+  lat_vel_source_tracker: false      # false=現行の自前差分/true=Fix A(tracker.velocity()再利用)
+  overlap_floor_enabled: false       # false=現行/true=Fix B(並走中オフセット床)
+  overlap_margin_m: 0.5              # 並走(縦オーバーラップ)判定のヒステリシス幅(Fix B/C共通)
+  overlap_corr_margin_m: 0.1         # Fix Bの床をcorr_boundで再キャップする際のマージン(must-fix 1)
+  pending_disengage_enabled: false   # false=現行/true=Fix C(並走中の離脱保留)
+  pending_disengage_max_cycles: 80   # 離脱保留の上限周期数(既定=giveup_cycles*2目安)
 ```
 
 いずれも既定`false`(現行挙動と完全に一致、新規追加は無効化状態から開始)。
+`overlap_margin_m`はFix B/C共通の並走判定(`_update_overlap_state()`)が
+使うため、どちらか一方でもONなら消費される。
 
 ---
 
 ## 6. 検証計画(CLAUDE.md §1.4準拠)
+
+### 6.0 3本目の独立した裏付け事例(2026-08-06、`autoware(0805-07).log`)
+
+ユーザーの目視報告(「並走中、車速差が小さいと相手に向かって幅寄せする」)
+を受け、ユーザー提供の`~/Downloads/autoware(0805-07).log`(qualifying環境)
+を分析した。wp62-118のOVERTAKINGエピソードで、offsetがmin_needed比
+22〜62%程度しか達成できていない**慢性的な未達**を確認した(18節の
+wp215-233事例のような単発の劇的崩壊ではなく、終始一貫した不足という
+異なる現れ方):
+
+| wp | offset | min_needed | 達成率 | opp_raw_lat_vel |
+|---|---|---|---|---|
+| 62 | 0.23 | 0.97 | 24% | 2.984(クランプ上限2.0超え) |
+| 66 | 0.64 | 1.66 | 38% | 1.08 |
+| 96 | 0.30 | 1.37 | 22% | 1.08 |
+| 109 | 1.16 | 1.86 | 62% | 0.0 |
+| 118 | -1.26 | 2.14 | 59% | 0.0 |
+
+wp68でも`opp_raw_lat_vel=-3.218`というクランプ超えを確認。3本目の独立した
+ログ(dev3の衝突事例・qualifying環境のこの慢性未達事例)で同一機構
+(opp_lat_predノイズ起因のoffset不足)が再現しており、単発ではなく
+再現性のある実害であることの追加の裏付けとなった。この事例も6.2の
+反実仮想検証対象へ追加する(名前付きフィクスチャ2件目)。
 
 1. **反実仮想リプレイ(最優先)**: 18節の衝突事例(dev3
    `output/20260805-222055`d1、wp215→233)の入力列(min_needed・
    corr_bound・opp_ds・worth・footprint_risk_triggered)へ、Fix A/B/Cを
    机上で再適用し、wp233時点でoffsetが必要クリアランス以上に保持される
    ことを確認する。**この事例を名前付きの回帰テストフィクスチャとして
-   永続化する**(再発防止)。
+   永続化する**(再発防止)。同様に本節(6.0)の`0805-07`慢性未達事例
+   (wp62-118)も2件目のフィクスチャとして追加し、offsetがmin_needed比
+   90%以上まで改善することを確認する。
 2. **全OTエピソードへの横展開**: 既存ログ全体(本日の3本のdev3+3本の
    予選ログ)の全OVERTAKINGエピソードへ同じ反実仮想を適用し、
    (a)並走ガード・離脱保留の発動頻度、(b)正常完了エピソードでの
@@ -452,5 +492,102 @@ overtake:
 - Fix C実装方式(新規カウンタ vs 既存流用)は両AIが一致して新規カウンタ
   維持を支持、当初案を確定とした。
 
-以上を全て本文へ反映済み。次のアクションは実装着手(Phase 1反実仮想
-リプレイを最優先)。
+以上を全て本文へ反映済み。
+
+---
+
+## 9. 診断ログ設計(2026-08-06、ユーザー指示: 各Fixを個別検証できるロギング)
+
+3つのFixをそれぞれ独立ゲートで段階導入する(§10)ため、各Fixの動作を
+個別に確認できる専用ログを用意する。いずれも本日確立した「ワンショット/
+イベント発火型」の既存パターン(`[FP-COOLDOWN-CLEAR]`・
+`[SPEED-COOLDOWN-CLEAR]`等)を踏襲する。
+
+### 9.1 Fix A: `[OT]`ログへの`lat_vel_src`マーカー追加
+
+既存の`opp_wp`/`opp_raw_lat_vel`診断フィールド(2026-08-05追加)は、
+Fix A適用後は「値の出処」が変わる(自前差分 or tracker.velocity()射影)。
+どちらの実装が出した値かをログから機械的に判別できるよう、`[OT]`ログへ
+1フィールド追加する:
+
+```
+f"lat_vel_src={'tracker' if self._ot_lat_vel_source_tracker else 'diff'} "
+```
+
+これにより、Fix Aのconfigゲートを切り替えた前後のログを混在させても
+(例: 同一走行中に一時的に切り替えて比較する等)、どちらの計算方式で
+出た値かを事後に判別できる。
+
+### 9.2 Fix B: `[OVERLAP-FLOOR]`ログ(床が実際にtarget_magを持ち上げた時のみ発火)
+
+```python
+if overlapping and target_mag_before_floor < floor:
+    self.get_logger().info(
+        f"[OVERLAP-FLOOR] side={self._ot_side} floor={floor:.3f} "
+        f"target_mag_before={target_mag_before_floor:.3f} "
+        f"target_mag_after={target_mag:.3f} corr_bound={corr_bound:.3f} "
+        f"wp={self._mpc.model.wp_id}")
+```
+
+エッジトリガー(床が実際に効いた周期のみ)とし、並走中毎周期のログ氾濫を
+避ける。
+
+### 9.3 Fix C: `[PENDING-DISENGAGE]`ログ(保留開始・解消の2イベント)
+
+```python
+# 保留開始時(初めて_giveup_now=Falseへ倒した周期のみ)
+self.get_logger().warn(
+    f"[PENDING-DISENGAGE] start reason={_giveup_trigger} side={_locked} "
+    f"wp={self._mpc.model.wp_id}")
+# 解消時(2種類: 並走の自然解消 / 強制フォールバック到達)
+self.get_logger().warn(
+    f"[PENDING-DISENGAGE] resolved reason="
+    f"{'natural_overlap_clear' if not forced else 'forced_fallback'} "
+    f"pending_count={self._ot_pending_disengage_count} "
+    f"wp={self._mpc.model.wp_id}")
+```
+
+`forced_fallback`(強制フォールバック)発火は6.6の反実仮想集計項目
+(残存リスクの定量)と直接対応し、実地検証でもこの発火率を主要な監視
+対象とする。
+
+---
+
+## 10. 段階的導入計画(2026-08-06、ユーザー指示)
+
+**方針**: 3つのFixを**一括導入せず、A→B→Cの順に1つずつ**導入する。
+理由は本日のtask#265/early_release/候補④で得た教訓(複数機構を同時に
+ONにすると実地での効果の切り分けができなくなる)を踏まえたもの。
+各段階は必ず「オフライン反実仮想 → dev3(ローカル) → 予選環境」の
+3段階を経てから次のFixへ進む。
+
+### 10.1 各段階のフロー(全Fix共通)
+
+1. **オフライン反実仮想(走行なし)**: §6の2フィクスチャ(18節衝突事例・
+   6.0慢性未達事例)+全OTエピソード横展開で、当該Fixのみ有効化した
+   場合の効果と偽陽性コストを机上確認する。
+2. **dev3(ローカル、走行あり)**: 当該Fixのゲートのみをtrueにし、
+   §9の専用診断ログが正しく発火するか、安全指標(衝突/STUCK/OT成功率)
+   が既存水準から悪化しないかを確認する(2本以上、n=1で確定しない)。
+   自己対戦のため状況再現・繰り返し試行がしやすく、まずここで
+   ハード制約の PASS/FAIL を確定させる。
+3. **予選環境(最終確認)**: dev3で問題なければ、他チーム車との実対戦で
+   n数を稼ぐ(§9の診断ログ・opp_wp/opp_raw_lat_vel分布・クランプ張り付き
+   率等を実地で確認)。CLAUDE.md §2ルール7(予選ログのn=1評価を過信
+   しない)に従い、複数本での確認を基本とする。
+4. 次のFixへ進む前に、この段階の結果をdesign_docsへ記録する。
+
+### 10.2 順序とその理由
+
+1. **Fix A**(根本原因、最優先): 状態機械・giveup遷移には触れず、
+   `opp_lat_pred`の計算方法のみを変える最も低リスクな変更。これ単体で
+   §6.0の慢性未達がどこまで改善するかを見ることで、Fix B/Cが実際に
+   どれだけ必要か・どうチューニングすべきかの判断材料にもなる。
+2. **Fix B**(並走中オフセット床): Fix Aだけでは解決しない残存ノイズ・
+   正当な相手の急な横移動等に対する物理的な安全網。
+3. **Fix C**(並走中の離脱保留): 最もリスクの高い変更(giveup遷移という
+   状態機械そのものに手を入れる、82/83節の教訓が直接該当する領域)の
+   ため最後に回す。Fix A/Bの実地データを見てから、実際にFix Cが必要な
+   場面がどれだけ残っているかを再確認した上で着手する。
+
+次のアクションは実装着手(Fix Aのオフライン反実仮想リプレイから開始)。
