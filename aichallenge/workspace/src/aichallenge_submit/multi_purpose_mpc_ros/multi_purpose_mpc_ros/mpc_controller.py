@@ -7576,6 +7576,9 @@ class MPCController(Node):
                         f"offset={_fwd_dbg.get('offset')} psi_bias={_fwd_dbg.get('psi_bias')} "
                         f"corr_bound={_fwd_dbg.get('corr_bound')}@{_fwd_dbg.get('corr_bound_at')}m "
                         f"min_needed={_fwd_dbg.get('min_needed_mag')} "
+                        # 2026-08-05追加(300節、task#293候補①): 対象車横位置外挿の実地検証用
+                        #   (ロジック自体は無変更、デバッグ出力のみ)。
+                        f"opp_lat_pred={_fwd_dbg.get('opp_lat_pred')} t_reach={_fwd_dbg.get('t_reach')} "
                         f"corr[ub0={_fwd_dbg.get('corr_ub0')} lb0={_fwd_dbg.get('corr_lb0')} "
                         f"xr0={_fwd_dbg.get('corr_xr0')} wmin={_fwd_dbg.get('corr_wmin')} "
                         f"src={_fwd_dbg.get('corr_src')} nseg0/1/2={_fwd_dbg.get('nseg0')}/{_fwd_dbg.get('nseg1')}/{_fwd_dbg.get('nseg2')}] "
