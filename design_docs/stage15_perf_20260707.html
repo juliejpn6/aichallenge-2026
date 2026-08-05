@@ -8772,5 +8772,78 @@ tau n=2検証(294節)のためrun6を起動しようとしたところ、
 形式では)実際にツールを起動して確認する必要がある。
 </p>
 
+<h3>292. tau n=2 run6中止 — dev3実測でOT giveup過多+衝突2件を発見、優先度をOT/リバースへ緊急転換</h3>
+<p class="small">
+run6(tau=160ms 2本目、d1=20/d2=17/d3=15km/h)をwp52付近まで走行させた時点で、
+<code>[COLLISION-SUSPECTED]</code>が2件(v drop 4.15→0.59m/s、4.40→0.69m/s)、
+かつ<code>[OT-OUTCOME]</code>の重複ログ(288節で発見済みのexit_clear連打バグ)を
+除去した実エピソード集計でgiveup 5件・success 1件という明確なgiveup過多を確認した。
+ユーザー判断により<b>tau A/B比較データとしては290節と同型の汚染とみなし、run6を破棄・
+優先度をOT調整とリバース信頼性調査へ緊急転換</b>した(tau n=2自体は完全に保留、
+task#294として再開待ち)。
+</p>
+<p class="small">
+<b>OT giveup内訳(重複除去後6件)</b>: 失敗理由は<code>lat_ttc_C2</code>×3・
+<code>lat_ttc_FOOTPRINT_RISK</code>×1・<code>lat_ttc_C2_cleared</code>×1。
+シャドー推奨側との一致は4件中2件のみ不一致——288節のn=14予備傾向
+(giveup10件中6件不一致)と方向は整合するが、n=6はさらに少なくルール1(n=1で
+確定しない)に照らし参考程度。今後task#300(giveup閾値のログベース精査)・
+task#301(シャドーミスマッチの本線反映)・task#302(ENGAGE可否判定見直し)として
+継続する。
+</p>
+
+<h3>293. リバース信頼性 root cause調査: AWSIM側のギアシフト処理遅延が濃厚、CPU負荷は主因でない</h3>
+<p class="small">
+ユーザー指示「予選環境下のログとローカル環境下のログを確認して、何が違うのかを分析」を受け、
+<code>~/Downloads</code>の予選ログ(0729-01等)とローカル<code>output/</code>配下の
+全走行ログ(2026-07-23〜08-05、130件以上)を横断比較した。
+</p>
+<p class="small">
+<b>事実確認①: gear_report=PARKはテレメトリ欠落ではない</b>。
+<code>_GEAR_LABELS = {0: "NONE", ..., 22: "PARK", ...}</code>(mpc_controller.py:1761)より
+PARK=22でありreport初期値0(NONE)とは異なる値——つまりログに繰り返し現れる
+「gear_report=PARK」はAWSIMから実際に受信した値であり、購読が機能していないという
+仮説(検討したが否定)ではなく、<b>AWSIMが実際にPARKのまま応答し続けている</b>ことを
+意味する。
+</p>
+<p class="small">
+<b>事実確認②: ローカルでの確認成功率は1%未満、dev3特有ではない</b>。
+2026-07-23〜08-05の全ローカルログ(<code>WAIT_REVERSE</code>を含む約130ファイル)を
+集計した結果、<code>gear=REVERSE confirmed</code>が出現したのはわずか3ファイル
+(0727-1件・本日08-05に2件)のみで、残り全て(solo/dev3問わず)は
+<code>gear=REVERSE 未確認だが規定周期経過</code>のタイムアウト分岐に落ちていた。
+<b>solo単独走行でも同じ失敗率であり、dev3特有のCPU負荷(179/180節で校正済みの
+cpus=4/mem=8g等)が主因という仮説は棄却される</b>。予選ログ(0729-01)では
+「STUCK detected」から「gear=REVERSE confirmed」まで一貫して約65msと極めて高速。
+</p>
+<p class="small">
+<b>決定的な手がかり: 局所的成功例(20260805-065239、confirmed=2件)の精査</b>。
+同一STUCKエピソード内で<code>[STUCK-SHUFFLE] cycle=8</code>まで
+WAIT_PARK→WAIT_REVERSE→BACKUP失敗(v=0.00固定)を7回繰り返した末に、
+8回目のWAIT_PARK突入時点で<b>直前(7回目)のWAIT_REVERSE要求への遅延応答が
+ちょうど追いつき、gear_report=REVERSEが既に立っていた</b>ため即座にconfirmedとなり、
+このサイクルのみ実際にv=-0.15〜-1.12まで後退できた。<b>現在の
+<code>gear_settle_cycles=20</code>(≈0.5秒@40Hz)・<code>gear_park_dwell_cycles=40</code>
+(≈1.0秒)というポーリング窓は、AWSIM側の実際のギアシフト処理遅延より短い可能性が
+高い</b>——短い窓で毎回「未確認のまま規定周期経過」してBACKUP/WAIT_DRIVE_PUSHへ
+進んでしまい、AWSIM側の処理完了を待たずに次のエピソードへ移ってしまう(または
+連続再パブリッシュ[毎周期40Hzでの再送]がAWSIM側のシフト完了処理と干渉している
+可能性も未排除)。
+</p>
+<p class="small">
+<b>未検証・残課題として記録</b>: (a)AWSIM.zip自体は2026-07-26ダウンロードのまま
+未更新——今回のDocker基盤更新(291節)はAutowareベースイメージのみでAWSIM本体は
+対象外だった。TIER4提供のSharePoint URLからの再ダウンロードは今回未実施(認証・
+サイズの問題で自動化未検証)。(b)mpc_controller.pyはWAIT_REVERSE/BACKUP中、
+GearCommand.REVERSEを毎周期(40Hz)連続再パブリッシュしているが、参照実装
+(autoware_practice_course/backward.cpp)や自作teleop_manager_node.cpp
+(publish_gearはボタン押下のエッジトリガーのみ、タイマーコールバックでは送らない)との
+パターン差異が干渉源になっていないか未検証。(c)最も直接的でリスクの低い次の一手は
+<code>gear_settle_cycles</code>/<code>gear_park_dwell_cycles</code>を2〜3倍へ拡大し
+単発試行の成功率が上がるか実測することだが、CLAUDE.md §1.3の慎重対象
+(<code>_handle_stuck_recovery</code>)のため、本節時点ではコード変更は未実施。
+ユーザーへ次の一手を確認してから着手する。
+</p>
+
 </body>
 </html>
