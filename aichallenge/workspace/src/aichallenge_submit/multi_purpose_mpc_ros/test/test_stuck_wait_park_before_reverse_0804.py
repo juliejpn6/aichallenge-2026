@@ -94,7 +94,9 @@ def test_wait_park_block_precedes_wait_reverse_block_and_requests_park():
     idx_reverse = _SRC.index('elif self._stuck_state == "WAIT_REVERSE":')
     assert idx_park < idx_reverse
     snippet = _SRC[idx_park:idx_reverse]
-    assert "gear_cmd.command = GearCommand.PARK" in snippet
+    # 2026-08-05更新(293節続報): GearCommandパブリッシュがエッジトリガー化ヘルパー
+    #   (_publish_gear_cmd_throttled)経由になったため、直接代入ではなく呼び出しを確認する。
+    assert "self._publish_gear_cmd_throttled(now, GearCommand.PARK)" in snippet
     assert "self._gear_report.report == GearReport.PARK" in snippet
     assert 'self._stuck_state = "WAIT_REVERSE"' in snippet
     # 退行防止: WAIT_PARK内でBACKUPへ直接進む旧経路を誤って残していないこと

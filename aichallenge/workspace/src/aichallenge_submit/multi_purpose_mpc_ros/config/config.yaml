@@ -243,8 +243,19 @@ stuck_recovery:
   #   P→R遷移(WAIT_REVERSE)が全件失敗する主因の疑いが強い。confirmedを信用せず、
   #   WAIT_PARKは常にこの周期数だけ滞留してからWAIT_REVERSEへ進む(ローカルAWSIM
   #   限定の既知問題への対策、詳細は[[stuck-normal-handoff-infinite-loop-wall-pin-0804]])。
-  # 2026-08-05拡大(293節、40→80): gear_settle_cyclesと同じ根拠・同じ倍率(2倍)で拡大。
-  gear_park_dwell_cycles: 80 # [周期] WAIT_PARKの固定滞留(≈2.0s@40Hz、gear_settle_cyclesの2倍から開始)
+  # 2026-08-05拡大(293節、40→80→50): 当初はgear_settle_cyclesの2倍(80)へ拡大したが、
+  #   「2倍」という倍率自体が2026-07-10時点の暫定値(実証的根拠なし、コメント原文
+  #   「gear_settle_cyclesの2倍から開始する」)だったため、ユーザー指摘を受け
+  #   gear_settle_cyclesと同値(50)へ統一した。役割は異なる(WAIT_PARKはconfirmedを
+  #   信用せず常に無条件でこの周期数だけ滞留、WAIT_REVERSE/DRIVEはconfirmedなら
+  #   早期終了)ため待ち時間の意味自体は残るが、数値を分ける根拠が無いため揃えた。
+  gear_park_dwell_cycles: 50 # [周期] WAIT_PARKの固定滞留(≈1.25s@40Hz、gear_settle_cyclesと同値)
+  # 2026-08-05追加(293節続報): dev3実測で待ち時間拡大単独では改善が確認できなかったため、
+  #   毎周期(40Hz)連続でGearCommandを再パブリッシュし続ける動作がAWSIM側のシフト処理と
+  #   干渉している疑いに基づき、状態遷移時(エッジ)は即座に送信・以後は指令値が変わらない
+  #   間この周期数ごとに間引いて再送する方式へ変更した(完全な単発publishは配信ロス時に
+  #   永久に届かなくなるリスクがあるため、低頻度のハートビート再送は残す設計)。
+  gear_cmd_heartbeat_cycles: 8 # [周期] エッジトリガー後の再送間隔(≈0.2s@40Hz)
   backup_dist: 2.0       # [m] 後退距離
   backup_speed: -3.0     # [m/s] サンプル準拠
   backup_accel: 1.5      # [m/s^2] サンプル準拠

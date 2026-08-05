@@ -1119,6 +1119,8 @@ class MPCController(Node):
                 "gear_settle_cycles", int(_stkget("gear_settle_cycles", 20)))  # [周期] ギア確定待ち(≈0.5s)
             self._stuck_gear_park_dwell_cycles = self._rate_scaled_cycles(
                 "gear_park_dwell_cycles", int(_stkget("gear_park_dwell_cycles", 40)))  # [周期] WAIT_PARK固定滞留(≈1.0s、confirmedを信用しない)
+            self._stuck_gear_cmd_heartbeat_cycles = self._rate_scaled_cycles(
+                "gear_cmd_heartbeat_cycles", int(_stkget("gear_cmd_heartbeat_cycles", 8)))  # [周期] エッジトリガー後の再送間隔(≈0.2s)
             self._stuck_backup_dist = float(_stkget("backup_dist", 2.0))  # [m] 後退距離
             self._stuck_backup_speed = float(_stkget("backup_speed", -3.0))  # [m/s] サンプル準拠
             self._stuck_backup_accel = float(_stkget("backup_accel", 1.5))   # [m/s^2] サンプル準拠
@@ -1227,6 +1229,8 @@ class MPCController(Node):
             self._stuck_stall_count = 0    # 実速度ほぼ0の連続周期数(経路3)
             self._stuck_u0_last = 0.0      # 前周期の最終指令速度(次周期のスタック判定に使用)
             self._stuck_gear_wait_count = 0
+            self._stuck_gear_cmd_last = None  # 293節続報: 直近パブリッシュ済みのgear command値(エッジ検出用)
+            self._stuck_gear_cmd_heartbeat_count = 0  # 293節続報: 未変化時の間引き再送カウンタ
             self._stuck_backup_log_count = 0    # [STUCK-BACKUP]ログの間引き用(2026-07-11)
             self._stuck_backup_start = None  # (x, y) 後退開始位置
             self._stuck_backup_start_time = None  # BACKUP開始時刻(ウォッチドッグ判定用、2026-07-13)
@@ -1890,6 +1894,11 @@ class MPCController(Node):
         self._stuck_count = 0
         self._stuck_stall_count = 0
         self._stuck_gear_wait_count = 0
+        # 293節続報: 新しいエピソード突入時は、前エピソードのgear command値を
+        #   覚えたままだと「変化なし」判定でハートビート周期まで送信が遅れてしまう
+        #   ため、即座に1回目のpublishが行われるようリセットする。
+        self._stuck_gear_cmd_last = None
+        self._stuck_gear_cmd_heartbeat_count = 0
         self._ghost_block_logged = False
         self._handle_stuck_recovery(now, pose)
 
@@ -2100,6 +2109,29 @@ class MPCController(Node):
         _mag = np.deg2rad(self._stuck_push_steer_max_deg) * _scale
         return float(_mag if _plan_side > 0 else -_mag)
 
+    def _publish_gear_cmd_throttled(self, now, command: int) -> None:
+        """293節続報(2026-08-05): _handle_stuck_recovery内のGearCommandパブリッシュを
+        エッジトリガー化する。従来は状態(WAIT_PARK/WAIT_REVERSE/BACKUP/...)の間、毎周期
+        (40Hz)無条件で同一のGearCommandを送り続けていたが、ローカル環境でのREVERSE確認
+        成功率が1%未満という実測(293節)を受け、gear_settle_cycles/gear_park_dwell_cycles
+        拡大(20→50、40→80→50)を試したが改善が確認できなかった。次の仮説として、
+        「毎周期の連続再送そのものがAWSIM側のギアシフト処理と干渉している」を検証するため、
+        指令値が変化した瞬間(エッジ)に即座に送信し、変化が無い間は
+        gear_cmd_heartbeat_cycles周期ごとに間引いて再送する方式へ変更する。完全な単発
+        publish(一度きり)は、その1回が配信ロスした場合に永久に届かなくなるリスクがある
+        ため採用せず、低頻度のハートビート再送は残す。"""
+        self._stuck_gear_cmd_heartbeat_count += 1
+        _changed = (command != self._stuck_gear_cmd_last)
+        if not (_changed or self._stuck_gear_cmd_heartbeat_count
+                >= self._stuck_gear_cmd_heartbeat_cycles):
+            return
+        gear_cmd = GearCommand()
+        gear_cmd.stamp = now.to_msg()
+        gear_cmd.command = command
+        self._gear_cmd_pub.publish(gear_cmd)
+        self._stuck_gear_cmd_last = command
+        self._stuck_gear_cmd_heartbeat_count = 0
+
     def _handle_stuck_recovery(self, now, pose) -> None:
         """スタック復帰の状態機械(WAIT_PARK/WAIT_REVERSE/BACKUP/WAIT_DRIVE/WAIT_DRIVE_PUSH/PUSH)。
         2026-07-09追加、2026-07-10改修(起動猶予/infeasibility経路/ギア確認/経路3+PUSH)。
@@ -2116,10 +2148,9 @@ class MPCController(Node):
         必ずWAIT_DRIVE_PUSH→PUSHを経由するよう統一する。PUSH自体も低速・最大舵角
         (delta_max_deg上限、_compute_stuck_push_steer参照)で回避走行を続け、実際に前方が
         クリアになったこと(_corr_bound_ahead再評価)を検知したらNORMALへ復帰する
-        (固定距離/タイムアウトは実際に避けられなかった場合の安全側バックストップとして残す)。"""
-        gear_cmd = GearCommand()
-        gear_cmd.stamp = now.to_msg()
-
+        (固定距離/タイムアウトは実際に避けられなかった場合の安全側バックストップとして残す)。
+        2026-08-05追加(293節続報): GearCommandのパブリッシュは_publish_gear_cmd_throttled
+        経由(エッジトリガー+間引き再送)へ統一した。詳細は同メソッドのdocstring参照。"""
         if self._stuck_state == "WAIT_PARK":
             # 2026-08-04追加(ユーザー確認: D→Rへ直接シフトできず、D→P→Rの順でのみ
             #   Rレンジが入る仕様): WAIT_REVERSEの前段として必ずPARKを経由する。
@@ -2132,8 +2163,7 @@ class MPCController(Node):
             #   gear_park_dwell_cycles周期は無条件で滞留してからWAIT_REVERSEへ進む
             #   (ローカルAWSIM限定の既知問題への対策、詳細は
             #   [[stuck-normal-handoff-infinite-loop-wall-pin-0804]]。実地未検証)。
-            gear_cmd.command = GearCommand.PARK
-            self._gear_cmd_pub.publish(gear_cmd)
+            self._publish_gear_cmd_throttled(now, GearCommand.PARK)
             self._stuck_gear_wait_count += 1
             _confirmed = (self._gear_report.report == GearReport.PARK)
             if self._stuck_gear_wait_count >= self._stuck_gear_park_dwell_cycles:
@@ -2146,8 +2176,7 @@ class MPCController(Node):
             acc = self._stuck_hold_accel
 
         elif self._stuck_state == "WAIT_REVERSE":
-            gear_cmd.command = GearCommand.REVERSE
-            self._gear_cmd_pub.publish(gear_cmd)
+            self._publish_gear_cmd_throttled(now, GearCommand.REVERSE)
             self._stuck_gear_wait_count += 1
             _confirmed = (self._gear_report.report == GearReport.REVERSE)
             if _confirmed or self._stuck_gear_wait_count >= self._stuck_gear_settle_cycles:
@@ -2184,8 +2213,7 @@ class MPCController(Node):
                 acc = self._stuck_hold_accel
 
         elif self._stuck_state == "BACKUP":
-            gear_cmd.command = GearCommand.REVERSE
-            self._gear_cmd_pub.publish(gear_cmd)
+            self._publish_gear_cmd_throttled(now, GearCommand.REVERSE)
             dist = float(np.hypot(pose.x - self._stuck_backup_start[0],
                                    pose.y - self._stuck_backup_start[1]))
             # 2026-07-11診断追加: BACKUP中、実際にREVERSEへ入っているか・実車速はどうかを
@@ -2378,8 +2406,7 @@ class MPCController(Node):
                 acc = self._stuck_backup_accel
 
         elif self._stuck_state == "WAIT_DRIVE_PUSH":
-            gear_cmd.command = GearCommand.DRIVE
-            self._gear_cmd_pub.publish(gear_cmd)
+            self._publish_gear_cmd_throttled(now, GearCommand.DRIVE)
             self._stuck_gear_wait_count += 1
             _confirmed = (self._gear_report.report == GearReport.DRIVE)
             if _confirmed or self._stuck_gear_wait_count >= self._stuck_gear_settle_cycles:
@@ -2413,8 +2440,7 @@ class MPCController(Node):
                 acc = self._stuck_hold_accel
 
         elif self._stuck_state == "PUSH":
-            gear_cmd.command = GearCommand.DRIVE
-            self._gear_cmd_pub.publish(gear_cmd)
+            self._publish_gear_cmd_throttled(now, GearCommand.DRIVE)
             dist = float(np.hypot(pose.x - self._stuck_push_start[0],
                                    pose.y - self._stuck_push_start[1]))
             elapsed = (now - self._stuck_push_start_time).nanoseconds / 1e9
