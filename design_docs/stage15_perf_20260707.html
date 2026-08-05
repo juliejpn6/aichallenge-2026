@@ -9092,5 +9092,43 @@ OT計画自体を却下)、<code>offset=0.0</code>だった。この時点の蛇
 (task#306として追跡)。
 </p>
 
+<h3>300. task#293候補①実装 — OT必要最小オフセット(min_needed_mag)に対象車の横方向速度を短期外挿</h3>
+<p class="small">
+task#293(PartC予測制御開発計画書)の候補①「OT必要最小オフセットの速度考慮」を
+実装した。ユーザー指摘「相手も走行しているので次の瞬間にかわそうとしていた
+相手はもうそこにはいないのです」「車速を意識したオーバーテイク処理」への対応。
+</p>
+<p class="small">
+<b>設計変更(草案からの訂正)</b>: 開発計画書草案では「既存の<code>_c_dlat</code>
+(<code>_scan["cars"]</code>タプル)を使えば新規計算なしで対象車の横方向速度が
+得られる」と想定していたが、実装前のコード精査で誤りと判明した。
+<code>_scan_traffic()</code>の実装(<code>dlat = abs(lat - ego_lat)</code>)を
+確認したところ、<code>dlat</code>は対象車自身の横方向速度ではなく「自車と
+対象車の横距離の絶対値」であり、対象車の絶対的な横方向速度を直接得るデータは
+既存に存在しなかった。ユーザーに実態を報告した上で、対象車の横位置
+(<code>_opp_lat_now</code>)を周期ごとに自前で差分微分し、既存の
+<code>self._ot_ema_alpha</code>(0.05、≈1秒@40Hz、他のEMA平滑化と同一時定数、
+新規チューニング値は追加しない)で平滑化する方式を採用した。
+</p>
+<p class="small">
+<b>実装内容</b>: 対象車の横方向速度EMA推定値(<code>self._ot_opp_lat_vel_ema</code>)
+と、自車-対象車間の縦方向接近速度から算出した通過所要時間(<code>t_reach</code>、
+Part A(283節)実測の予測精度限界に合わせ<code>overtake.min_needed_horizon_cap_s</code>
+(既定1.5秒)でキャップ)を使い、「通過する瞬間」の対象車横位置を予測してから
+必要最小オフセットを計算するよう変更した(<code>float(self._ot_side) *
+_opp_lat_pred + _clear_needed</code>、旧実装は<code>_opp_lat_now</code>=現在値
+のみ)。対象車が切り替わった直後・接近速度が
+<code>overtake.min_needed_closing_floor</code>(既定0.5m/s)未満の場合は
+外挿しない(安全側、現在値のまま)。新規state変数
+(<code>_ot_opp_lat_prev</code>/<code>_ot_opp_lat_prev_vid</code>/
+<code>_ot_opp_lat_vel_ema</code>)は既存の<code>_ot_last_valid_min_needed_mag</code>
+と同じ5箇所(__init__+4リセット箇所)で仕切り直す。
+</p>
+<p class="small">
+<b>回帰</b>: 新規テスト・既存テストの窓拡大を含め全3113件PASS。
+コリドー等価性回帰・状態機械には触れていない。dev3実地検証は未実施
+(次のステップ)。
+</p>
+
 </body>
 </html>
