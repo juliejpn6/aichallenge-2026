@@ -9011,5 +9011,41 @@ NEUTRAL(仕様通り)へ修正[293節続報]、(2)GearCommandパブリッシュ�
 真に解決済みとして完了する。296節の「凍結」判断は本節により上書きされる。
 </p>
 
+<h3>298. ENGAGE直後のgiveup率70.1%を実測 — 早期giveupが支配的(task#302継続)</h3>
+<p class="small">
+task#302(ENGAGE可否判定の見直し)の第一歩として、2026-08-05の本日分dev3ログ
+(22ファイル、d1/d2/d3横断)から<code>[ENGAGE]</code>ログと
+<code>[OT-OUTCOME]</code>のgiveup/successを突き合わせ、ENGAGE直後の結果を
+定量化した。
+</p>
+<p class="small">
+<b>実測結果</b>: 全ENGAGE試行388件中、giveupは272件——<b>giveup率70.1%</b>
+という高い値だった。giveup理由の内訳は<code>lat_ttc_C2</code>131件(48%)・
+<code>lat_ttc_FOOTPRINT_RISK</code>90件(33%)・<code>lat_ttc_C2_cleared</code>
+34件(12.5%)・<code>room_exhausted</code>15件・その他2件。ENGAGEからgiveupまでの
+時間差分布(n=272、0〜60秒の妥当な範囲でペアリング)は、中央値3.21秒に対し
+<b>2秒以内のgiveupが37.1%、5秒以内が70.2%</b>を占めた。
+</p>
+<p class="small">
+<b>解釈</b>: giveup理由の8割超(C2+FOOTPRINT_RISK)が295節で「物理下限であり
+緩和不可」と結論した閾値由来であり、かつその大半がENGAGEからごく短時間
+(2〜5秒)で発火している。これは「giveup判定自体が過敏」なのではなく、
+<b>そもそも物理的な安全マージンに迫るほど近い状況でENGAGEしてしまっている
+ケースが多数</b>であることを示唆する。295節の暫定結論(ENGAGE側が本丸)を
+定量的に裏付けるデータが得られた。
+</p>
+<p class="small">
+<b>次の一手</b>: <code>_evaluate_engage_readiness</code>は148/190-4/190-5/
+190-6節等、複数回にわたり慎重にチューニングされてきた多因子判定
+(<code>_cheap_ok</code>・<code>_plan_pass</code>・<code>_dlat_ttc_veto</code>の
+組み合わせ)であり、CLAUDE.md §1.3の慎重対象ではないが投機的な変更は避ける
+べきという原則(§2)には該当する。<code>_dlat_ttc_veto</code>(closing trend
+判定)は既にENGAGE時点でチェックされているが、トレンド検知には一定の
+立ち上がり時間が必要な設計のため、ENGAGE直後の急速な状況変化を後追いで
+しか捕捉できていない可能性がある——次回はこの立ち上がり時間(トレンド確立
+までの周期数)を実測し、ENGAGE時点で既に危険域に近い場合の閾値強化を
+検討する。
+</p>
+
 </body>
 </html>
