@@ -372,4 +372,29 @@ footprint_risk専用「実測解消」パターン(148節②、`_ot_footprint_ri
   `_ot_engage_cooldown_l/r`には及ばない制約)は今回のスコープ外とし、次の
   ステップとして残す。
 
-回帰: 新規9件+全体3153件PASS。dev3実地検証は未実施(次のステップ)。
+回帰: 新規9件+全体3153件PASS。
+
+## 13. dev3実地検証(n=1)+予選環境検証への移行判断(2026-08-05)
+
+3機能(候補④・#265・early_release)を同時に有効化しdev3実地検証を実施
+(`output/20260805-191702`)。診断ログ`[SPEED-COOLDOWN-CLEAR]`/
+`[ROOM-COOLDOWN-CLEAR]`を追加(コミット`8123296`)し、事後の効果切り分けに
+備えた。
+
+**結果**: STUCK・COLLISION-SUSPECTEDとも既存水準で健全に推移(重大な
+リグレッションなし)。既存のfootprint_risk早期解除(`[FP-COOLDOWN-CLEAR]`)は
+32件発火し正常動作を確認。一方、**新規実装した①(speed)・③(room_exhausted)
+の早期解除は一度も発火機会を得られなかった**——giveup理由の内訳が
+`lat_ttc_FOOTPRINT_RISK`(16件)・`lat_ttc_C2`(1件)にほぼ占められ、
+room_exhausted起因のgiveup自体が0件だった。
+
+**原因(ユーザー指摘で判明)**: ローカルdev3のOT誘発設定(d1=ego v_max=20km/h、
+d2/d3=15-17km/hへ意図的に落として追い越し機会を作る)では、egoが常に
+対戦車より速いため、①(相手が速すぎてgiveup)がほぼ発生しない構造的限界が
+あった。ローカル環境では①③の早期解除機構を十分に検証できない。
+
+**判断**: ユーザー承認の上、3機能を有効化したままconfig.yamlをコミット
+(`8ccbbea`)し、対戦相手の速度が動的に変化する予選環境での実地検証へ
+移行する。CLAUDE.md §1.2の提出前チェック(`debug_extra_actuator_delay_s=0.0`・
+`enable_diag_log=false`)は確認済み。CLAUDE.md §1.1により実験後は必ず
+`false`へ復元すること(3箇所ともコメントで明記済み)。
