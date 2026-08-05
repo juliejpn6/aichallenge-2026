@@ -66,7 +66,10 @@ def test_called_from_giveup_family_exit():
     """giveup系離脱(force_giveup/room_exhausted/側消失、4935行目付近)で
     呼ばれていることを確認する。"""
     idx = _SRC.index('self._ot_footprint_risk_gated = _lat_dec.footprint_risk_triggered')
-    idx_end = idx + 400
+    # 2026-08-05追加(engage_cooldown早期解除①③): speed_gated/room_gated設定+
+    #   説明コメントが間に挿入されたため、窓を400→1400へ拡大(検証対象そのものは
+    #   無変更)。
+    idx_end = idx + 1400
     snippet = _SRC[idx:idx_end]
     assert 'self._ot_state = "STOPPING"' not in snippet  # 直前の代入なので後方にはもう無いはず
     assert "self._reset_ot_offset_state()" in snippet

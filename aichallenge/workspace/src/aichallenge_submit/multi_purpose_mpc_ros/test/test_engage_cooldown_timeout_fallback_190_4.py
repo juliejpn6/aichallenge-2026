@@ -129,7 +129,11 @@ def test_retroactive_icc_stop_following_deadlock_now_bounded():
 
 def test_source_cd_clear_has_timer_fallback():
     idx = _SRC.index("_cd_clear = (")
-    snippet = _SRC[idx:idx + 300]
+    # 2026-08-05追加(engage_cooldown早期解除①③): footprint_riskと同型の
+    #   speed_gated/room_gated分岐が間に挿入されたため、窓を300→700へ拡大
+    #   (検証対象そのものは無変更、末端のelse節が唯一のフォールバックである
+    #   構造は保たれている)。
+    snippet = _SRC[idx:idx + 700]
     assert "self._ot_footprint_risk_clear_count >= self._ot_engage_debounce" in snippet
     assert "or self._ot_engage_cooldown == 0" in snippet
     assert "if self._ot_footprint_risk_gated" in snippet

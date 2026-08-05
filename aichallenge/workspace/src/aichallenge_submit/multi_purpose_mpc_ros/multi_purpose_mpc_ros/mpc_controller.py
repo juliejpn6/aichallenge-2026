@@ -911,6 +911,38 @@ class MPCController(Node):
             self._ot_engage_cooldown_r = 0   # [周期] 右側専用クールダウン(cooldown_per_side時のみ使用)
             self._ot_cooldown_per_side = bool(
                 _otget("cooldown_per_side", False))  # side別クールダウンを有効化するか(既定OFF)
+            # 2026-08-05追加(engage_cooldown早期解除、ユーザー指摘「4秒何もしないのは
+            #   ロスになる」): 148節②で確立済みのfootprint_risk専用「実測解消」パターン
+            #   (固定タイマーではなくfootprint_risk条件自体が解消したかで判定)を、
+            #   ①相手が速すぎる・③room_exhausted(footprint_risk起因を除く)へ横展開する。
+            #   外部AI(Gemini・別Claude)相談の結論を反映:
+            #   - 値ヒステリシス必須(同一閾値の往復はデバウンスだけでは防げない、
+            #     コーナー/直線で接近速度が数秒周期で振動する構造的リスクを指摘)。
+            #     ①解除条件はopp_giveup_closingの2倍(対称的マージン)、③は
+            #     along_min_width(既存の幅マージン定数、二重管理を避け再利用)。
+            #   - デバウンスは「対称性の原則」: giveup自体がself._ot_giveup_cycles
+            #     (40周期≈1秒)悪い状態の継続で発火するなら、解除も同じ周期数の
+            #     良い状態の継続を要求する(新規パラメータ0個、既存値を再利用)。
+            #   - ①には既知のV2X速度クランプ異常(fwd_vopp=0誤認、
+            #     v2x_anomaly_defense_gap_review_20260803.md、対処機構
+            #     v2x.clamp_hold_enabledは現状既定OFF)への防御ガードが必須。
+            #     fwd_vopp<=0.0(クランプの典型的な兆候)の周期は実測解消判定を
+            #     スキップする(カウントを進めない、固定タイマーへ安全側フォールバック)。
+            #   - ③はcorr_bound_ahead(self._ot_prev_side)を使う。giveup後は
+            #     _ot_side_lockedが既に0へ解除されているため、giveup時点で記録済みの
+            #     永続変数self._ot_prev_side(既存、案B側反転ヒステリシス用)を使う
+            #     必要がある(_lockedはgiveup発生周期のローカル変数のため、その後の
+            #     周期では参照できない)。
+            #   - #265(side別cooldown)との組み合わせ: ③の早期解除はcooldown_per_side
+            #     有効時のみ該当側の専用カウンタを0へリセットし、無効時はグローバルを
+            #     0へリセットする(footprint_riskパターンと同型)。
+            #   1変更1検証の原則により、本機構は#265とは独立のconfig gate(既定OFF)を持つ。
+            self._ot_early_release_enable = bool(
+                _otget("early_release_enable", False))  # 早期解除機構全体を有効化するか(既定OFF)
+            self._ot_speed_gated = False       # 今回のcooldownが①(相手が速すぎる)起因か
+            self._ot_speed_recover_count = 0   # 接近速度が回復条件を満たした連続周期数
+            self._ot_room_gated = False        # 今回のcooldownが③(room_exhausted)起因か
+            self._ot_room_recover_count = 0    # room_exhaustedの回復条件を満たした連続周期数
             # 2026-07-21追加(148節②、実測に基づく再設計): 0721-01以降のローカルログ実測
             # (giveup後のfwd_dlat推移をwaypoint単位で追跡)で、footprint_risk起因のgiveup
             # 8件中3件は間隔がわずか1.3〜5.0秒で回復していたにもかかわらず、固定8秒
@@ -3152,11 +3184,25 @@ class MPCController(Node):
         #   済み)、単に本判定式が参照していなかっただけだった。デバウンスカウント方式
         #   (148節②、高速解除)はそのまま残し、それが機能しない場合の上限としてこの
         #   既存タイマーをORで追加する(新規パラメータ0個、新規状態変数0個)。
+        # 2026-08-05追加(engage_cooldown早期解除、①③への横展開): footprint_riskと
+        #   同型の「実測解消 or 固定タイマー」ORパターンを追加する。gate
+        #   (early_release_enable)OFF時はspeed_recover_count/room_recover_countが
+        #   常に0のまま(上記の毎周期更新箇所でガード済み)のため、この分岐に入っても
+        #   実質的に`self._ot_engage_cooldown == 0`(固定タイマーのみ)へ収束し、
+        #   既存動作とビット等価になる(退行防止)。
         _cd_clear = (
             (self._ot_footprint_risk_clear_count >= self._ot_engage_debounce
              or self._ot_engage_cooldown == 0)
             if self._ot_footprint_risk_gated
-            else self._ot_engage_cooldown == 0)
+            else (
+                (self._ot_speed_recover_count >= self._ot_giveup_cycles
+                 or self._ot_engage_cooldown == 0)
+                if self._ot_speed_gated
+                else (
+                    (self._ot_room_recover_count >= self._ot_giveup_cycles
+                     or self._ot_engage_cooldown == 0)
+                    if self._ot_room_gated
+                    else self._ot_engage_cooldown == 0)))
         # 検証ロギング(148節②): footprint_risk起因のcooldownが「実測解消」経路で
         # 解除された瞬間を1回だけ記録する。従来の固定8秒より早く/遅く解除されたかを
         # 次回ログのengage_cooldown残り周期数(cd_timer_remain)から確認できる。
@@ -6192,6 +6238,31 @@ class MPCController(Node):
             if self._ot_footprint_risk_gated:
                 self._ot_footprint_risk_clear_count = (
                     0 if _fp_near_zone else self._ot_footprint_risk_clear_count + 1)
+            # 2026-08-05追加(engage_cooldown早期解除、①③への横展開): 上記
+            #   footprint_riskパターンと同じ考え方で、cooldown中のみ毎周期回復条件を
+            #   監視する。config gate(early_release_enable、既定OFF)時のみ計算し、
+            #   OFF時はrecover_countが0のまま(_cd_clear計算側でもgateがない限り
+            #   参照されないため実害なし、退行防止)。
+            if self._ot_early_release_enable:
+                if self._ot_speed_gated:
+                    # ①のvopp有効性ガード: fwd_vopp<=0.0(V2X速度クランプ異常の
+                    #   典型的な兆候、v2x_anomaly_defense_gap_review_20260803.md)の
+                    #   周期はカウントを進めない(固定タイマーへ安全側フォールバック)。
+                    _speed_recovered = (
+                        _fwd_vopp is not None and _fwd_vopp > 0.0
+                        and (self._v_pot - _fwd_vopp) >= self._opp_giveup_closing * 2.0)
+                    self._ot_speed_recover_count = (
+                        self._ot_speed_recover_count + 1 if _speed_recovered else 0)
+                if self._ot_room_gated:
+                    # ③はgiveup時点で記録済みの永続変数self._ot_prev_sideを使う
+                    #   (_lockedはgiveup発生周期のローカル変数、以降の周期では
+                    #   参照できない)。0(未記録)の場合は判定不能のためカウントしない。
+                    _room_bound = (self._corr_bound_ahead(self._ot_prev_side)
+                                    if self._ot_prev_side != 0 else float('-inf'))
+                    _room_recovered = (
+                        np.isfinite(_room_bound) and _room_bound >= self._along_min_width)
+                    self._ot_room_recover_count = (
+                        self._ot_room_recover_count + 1 if _room_recovered else 0)
 
             # 攻めの価値判定(2026-07-04 純化): worth =「closingで追いつける相手か」のみ。
             #   closing は「自分が出せる速度(v_pot)」基準(C1: 現在速度だと追従減速で0になり
@@ -6517,6 +6588,23 @@ class MPCController(Node):
                         self._ot_footprint_risk_gated = _lat_dec.footprint_risk_triggered
                         self._ot_footprint_risk_clear_count = 0
                         self._ot_fp_clear_logged = False
+                        # 2026-08-05追加(engage_cooldown早期解除): 今回のgiveup理由が
+                        #   ①(相手が速すぎる)か③(room_exhausted、footprint_risk起因を
+                        #   除く)かを判定し、対応するgatedフラグをセットする(優先順位:
+                        #   footprint_risk > room_exhausted > 速度、複数のOR条件が同時に
+                        #   真になりうるための明示的な優先度)。②(ロック外れ)はどちらの
+                        #   フラグも立たず、固定タイマーのみで待つ(外部AI相談で妥当と
+                        #   評価済み)。force_giveup起因(room_exhausted以外のlat_ttc
+                        #   branch)も対象外(corr_bound_aheadの回復が必ずしも解消を
+                        #   意味しない、安全側)。
+                        self._ot_speed_gated = (
+                            not _lat_dec.footprint_risk_triggered
+                            and not _room_exhausted
+                            and self._ot_giveup_count >= self._ot_giveup_cycles)
+                        self._ot_room_gated = (
+                            not _lat_dec.footprint_risk_triggered and _room_exhausted)
+                        self._ot_speed_recover_count = 0
+                        self._ot_room_recover_count = 0
                         self._ot_cleared = False
                         self._reset_ot_offset_state()
                     else:

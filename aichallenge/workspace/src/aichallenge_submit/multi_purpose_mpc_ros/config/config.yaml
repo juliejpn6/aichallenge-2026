@@ -356,6 +356,14 @@ overtake:
   #   速すぎる等は従来通り両側グローバルブロックのまま維持する。既定OFF:
   #   実地dev3検証(n≥2)未実施のため、有効化は今後の検証を経てから判断する。
   cooldown_per_side: false   # side別クールダウンを有効化するか
+  # 2026-08-05追加(engage_cooldown早期解除、ユーザー指摘「4秒何もしないのはロスになる」):
+  #   148節②のfootprint_risk専用「実測解消」パターンを①相手が速すぎる・③room_exhausted
+  #   (footprint_risk起因を除く)へ横展開。外部AI相談(Gemini・別Claude)の結論を反映し、
+  #   値ヒステリシス(①はopp_giveup_closingの2倍、③はalong_min_width)+対称デバウンス
+  #   (giveup_cycles、既存値の再利用)で往復ループを防ぐ。既定OFF: 実地dev3検証(n≥2)
+  #   未実施のため、有効化は今後の検証を経てから。cooldown_per_side(#265)とは独立の
+  #   config gate(1変更1検証、両方同時ONの相互作用は未検証)。
+  early_release_enable: false   # engage_cooldownの早期解除機構を有効化するか
   t_lateral: 3.0          # [s] 横移動フェーズの所要時間(完遂距離チェックに使用)
   pass_block_kappa: 0.10  # [1/m] きついコーナー閾値(R≤10m、この内側は選ばない)
   pass_clear: 3.0         # [m] 抜き切り=相手の前にこれだけ出る
