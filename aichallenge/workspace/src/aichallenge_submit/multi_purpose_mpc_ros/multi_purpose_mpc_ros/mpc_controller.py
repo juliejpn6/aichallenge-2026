@@ -893,6 +893,24 @@ class MPCController(Node):
             self._ot_engage_cooldown_cycles = self._rate_scaled_cycles(
                 "engage_cooldown", int(_otget("engage_cooldown", 80)))  # [周期] 失敗離脱後の再エンゲージ抑制
             self._ot_engage_cooldown = 0
+            # 2026-08-05追加(task#265、side別engage_cooldown解除): wp211-224実測
+            #   (2026-08-04)で、右側からのOTがgiveupした直後、相手が左側を大きく
+            #   開けたにもかかわらず、左側への即座の再エンゲージがグローバル
+            #   クールダウン(約4秒)の間ブロックされ続ける事象を確認した。外部AI
+            #   (Gemini・別Claude)相談の結論: giveup原因のうち空間的失敗
+            #   (_side_blockedかつfootprint_risk起因でない、主にroom_exhausted)
+            #   のみ該当側だけをブロックし、footprint_risk・相手が速すぎる等
+            #   「側と無関係な相手の属性」による断念は従来通り両側グローバル
+            #   ブロック(self._ot_engage_cooldown)のまま維持する。既存の
+            #   グローバルクールダウン・_cd_clear(footprint_risk専用の実測解除
+            #   経路)には一切触れず、left_ok/right_okへ個別にANDする形で追加する
+            #   (config gate既定OFF時は現行とビット等価)。対象車ID別(vid)への
+            #   拡張は見送り(近傍3台密集時にsideブロックが誤爆でなく保護として
+            #   働いている可能性があるため、A/B検証で機会損失を実測してから再検討)。
+            self._ot_engage_cooldown_l = 0   # [周期] 左側専用クールダウン(cooldown_per_side時のみ使用)
+            self._ot_engage_cooldown_r = 0   # [周期] 右側専用クールダウン(cooldown_per_side時のみ使用)
+            self._ot_cooldown_per_side = bool(
+                _otget("cooldown_per_side", False))  # side別クールダウンを有効化するか(既定OFF)
             # 2026-07-21追加(148節②、実測に基づく再設計): 0721-01以降のローカルログ実測
             # (giveup後のfwd_dlat推移をwaypoint単位で追跡)で、footprint_risk起因のgiveup
             # 8件中3件は間隔がわずか1.3〜5.0秒で回復していたにもかかわらず、固定8秒
@@ -3164,6 +3182,18 @@ class MPCController(Node):
                 if _elapsed <= self._ot_side_flip_hyst_s:
                     _prefer_side = self._ot_prev_side
             _plan_ok, _plan_side, _plan_req = self._plan_pass(scan, _prefer_side)
+            # 2026-08-05追加(task#265、side別engage_cooldown): _plan_passは
+            #   scan由来の独自の地形判定でsideを選ぶため、呼び出し元でleft_ok/
+            #   right_okへ既に折り込んだ側別クールダウンを知らない。選ばれた側が
+            #   許可範囲外(クールダウン中)であれば、cheap_okの(left_ok or
+            #   right_ok)項が本来意図した「その側はまだ使えない」を貫徹するため
+            #   ここでplan_okを打ち消す(cooldown_per_side無効時はleft_ok/right_ok
+            #   がそのまま渡ってくるためこの分岐は実質発火しない、退行なし)。
+            if _plan_ok and _plan_side != 0:
+                if ((_plan_side > 0 and not left_ok)
+                        or (_plan_side < 0 and not right_ok)):
+                    _plan_ok = False
+                    self._dbg_plan_reason = "side_cooldown_blocked"
         else:
             _plan_ok, _plan_side = False, 0
             self._dbg_plan_reason = "cheap_ok_fail"
@@ -6140,6 +6170,13 @@ class MPCController(Node):
             # 失敗離脱クールダウン消化(>0の間は再エンゲージしない=追従で仕切り直す)
             if self._ot_engage_cooldown > 0:
                 self._ot_engage_cooldown -= 1
+            # 2026-08-05追加(task#265、side別engage_cooldown): gate値に関わらず
+            #   常にデクリメントする(判定側でcooldown_per_sideにより有効/無効を
+            #   切替、gate OFF時は単に未参照のまま減り続けるだけで実害なし)。
+            if self._ot_engage_cooldown_l > 0:
+                self._ot_engage_cooldown_l -= 1
+            if self._ot_engage_cooldown_r > 0:
+                self._ot_engage_cooldown_r -= 1
             # 2026-07-21追加(148節②): footprint_risk起因のcooldown中は、実際にfootprint_risk
             # 条件(_footprint_risk、上記で毎周期計算済み)が連続で不成立になった周期数を数える。
             # 既存の_ot_engage_debounce(フリッカー防止、8周期≈0.2秒)をそのまま再利用し、
@@ -6453,6 +6490,27 @@ class MPCController(Node):
                             self._ot_engage_cooldown_cycles * 2
                             if _lat_dec.footprint_risk_triggered
                             else self._ot_engage_cooldown_cycles)
+                        # 2026-08-05追加(task#265、side別engage_cooldown): gate ON時、
+                        #   空間的失敗(_side_blockedかつfootprint_risk起因でない、
+                        #   主にroom_exhausted)のみ該当側の専用クールダウンをセットし、
+                        #   グローバルself._ot_engage_cooldownは0へ戻す(=逆側は即座に
+                        #   再エンゲージ可能)。footprint_risk起因・相手が速すぎる等は
+                        #   上記のグローバル値のまま(両側ブロック、無変更)。
+                        #   2026-08-05訂正: 当初はグローバル値をそのまま残して側別値を
+                        #   追加するだけの実装だったが、_cd_clear(_evaluate_engage_
+                        #   readiness内、無変更)はグローバル値のみを見るため、グローバル
+                        #   クールダウンが残っている間は側別クールダウンの値に関わらず
+                        #   _cheap_ok全体がブロックされ続け、side別分離の効果が事実上
+                        #   ゼロになる欠陥に気づいた(同一値・同一タイミングでセットして
+                        #   いたため、グローバルが切れる瞬間には側別も同時に切れていた)。
+                        if (self._ot_cooldown_per_side and _side_blocked
+                                and not _lat_dec.footprint_risk_triggered
+                                and _locked != 0):
+                            self._ot_engage_cooldown = 0
+                            if _locked > 0:
+                                self._ot_engage_cooldown_l = self._ot_engage_cooldown_cycles
+                            else:
+                                self._ot_engage_cooldown_r = self._ot_engage_cooldown_cycles
                         # 2026-07-21追加(148節②): footprint_risk起因の場合、以降の再エンゲージ
                         #   判定は上記の固定タイマーではなく、footprint_risk条件自体が実際に
                         #   解消したか(_ot_footprint_risk_clear_count)で決める。
@@ -6467,8 +6525,19 @@ class MPCController(Node):
                     # エンゲージ判定(2026-07-21、148節でヘルパー_evaluate_engage_readinessへ
                     #   抽出。cheap_ok9条件+_plan_pass+dlat_ttc_vetoの計算内容・呼び出し順序は
                     #   一切変えていない、純粋スリム化)。
+                    # 2026-08-05追加(task#265、side別engage_cooldown): gate ON時のみ、
+                    #   left_ok/right_okへ側別クールダウンをANDしてから渡す。既存の
+                    #   グローバル_cd_clear(_evaluate_engage_readiness内、無変更)とは
+                    #   別レイヤで効くAND条件のため、どちらか一方でもブロック中なら
+                    #   その側は不可(両側ブロック+側別ブロックの併存を安全側に扱う)。
+                    #   gate OFF時は_left_ok/_right_okそのまま(現行とビット等価)。
+                    _left_ok_cd = _left_ok
+                    _right_ok_cd = _right_ok
+                    if self._ot_cooldown_per_side:
+                        _left_ok_cd = _left_ok and self._ot_engage_cooldown_l == 0
+                        _right_ok_cd = _right_ok and self._ot_engage_cooldown_r == 0
                     _eval = self._evaluate_engage_readiness(
-                        _scan, _pass_worth, _v_odom, _left_ok, _right_ok,
+                        _scan, _pass_worth, _v_odom, _left_ok_cd, _right_ok_cd,
                         _being_overtaken, _lat_dec, _opp_sit, now, _footprint_risk)
                     _fwd_dbg["gate"] = _eval.gate
                     if _eval.can_engage:

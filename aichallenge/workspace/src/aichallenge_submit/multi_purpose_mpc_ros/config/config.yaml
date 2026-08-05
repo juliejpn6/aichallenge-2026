@@ -349,6 +349,13 @@ overtake:
   # ema_alpha: 側コミットのEMA時定数(≈1秒@40Hz)。side_block/along_lat共通
   ema_alpha: 0.05
   engage_cooldown: 160    # [周期] ≈4秒@40Hz。失敗離脱後この間は再エンゲージしない
+  # 2026-08-05追加(task#265、side別engage_cooldown解除): wp211-224実測で、右側
+  #   giveup直後に相手が左側を開けても左側への再エンゲージがグローバルクール
+  #   ダウンでブロックされ続ける事象を確認。外部AI相談の結論通り、空間的失敗
+  #   (room_exhausted等)のみ該当側だけをブロックし、footprint_risk・相手が
+  #   速すぎる等は従来通り両側グローバルブロックのまま維持する。既定OFF:
+  #   実地dev3検証(n≥2)未実施のため、有効化は今後の検証を経てから判断する。
+  cooldown_per_side: false   # side別クールダウンを有効化するか
   t_lateral: 3.0          # [s] 横移動フェーズの所要時間(完遂距離チェックに使用)
   pass_block_kappa: 0.10  # [1/m] きついコーナー閾値(R≤10m、この内側は選ばない)
   pass_clear: 3.0         # [m] 抜き切り=相手の前にこれだけ出る
