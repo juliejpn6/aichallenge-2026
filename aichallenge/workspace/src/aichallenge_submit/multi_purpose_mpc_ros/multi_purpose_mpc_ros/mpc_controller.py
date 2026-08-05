@@ -921,6 +921,11 @@ class MPCController(Node):
             # 非正転落から実際にgiveupが合流するまでの間、オフセット目標をmax(0,...)で
             #   即座に0(直進)へ落とさず、直近の有効(正マージン)時の値を凍結保持するための値。
             self._ot_last_valid_target_mag = None
+            # 2026-08-05追加(298節続報、ユーザー指摘「コーナーアウトからの追い越しで
+            #   大回りしないようにしたい」): 対象車が_scan["cars"]候補から一時的に外れた
+            #   周期に、必要最小オフセット(min_needed_mag)の直近有効値を凍結保持するための値。
+            #   上の_ot_last_valid_target_mag(corr_bound用)とは別軸の値のため独立管理する。
+            self._ot_last_valid_min_needed_mag = None
             # 2026-07-17追加(94節、トークン整合性監査): scan_traffic の fwd_vid は
             #   毎周期「その時点で最も近い車」を選び直す実装であり、ロック中の対象車に
             #   固定されない。93節で修正したLAT-TTCのcritical_curvature_runと同じ理由で、
@@ -1818,6 +1823,7 @@ class MPCController(Node):
         #   room_exhausted計数・凍結オフセットも持ち越さない(次の側選択と無関係な値)。
         self._ot_room_exhausted_count = 0
         self._ot_last_valid_target_mag = None
+        self._ot_last_valid_min_needed_mag = None
         self._reset_ot_offset_state()
 
     def _reset_ot_offset_state(self) -> None:
@@ -6087,6 +6093,7 @@ class MPCController(Node):
                         #   凍結オフセットは新側と無関係なので持ち越さない。
                         self._ot_room_exhausted_count = 0
                         self._ot_last_valid_target_mag = None
+                        self._ot_last_valid_min_needed_mag = None
                         # 2026-07-14追加: 側が入れ替わったので_ot_clearedもリセットする。
                         #   他の側変更点(STOPPING遷移・NORMAL復帰・infeasible-stop)は全て
                         #   _ot_cleared=Falseを伴っており、ここだけ漏れていた。本節で
@@ -6228,6 +6235,7 @@ class MPCController(Node):
                                 self._ot_alpha = 0.0
                                 self._ot_room_exhausted_count = 0
                                 self._ot_last_valid_target_mag = None
+                                self._ot_last_valid_min_needed_mag = None
                                 self._ot_cleared = False
                                 self._ot_reacquire_count = 0
                                 self.get_logger().warn(
@@ -6358,6 +6366,7 @@ class MPCController(Node):
                         #   (別側/別相手)のroom_exhausted計数・凍結オフセットは持ち越さない。
                         self._ot_room_exhausted_count = 0
                         self._ot_last_valid_target_mag = None
+                        self._ot_last_valid_min_needed_mag = None
                         self._lat_ttc.reset_episode()  # シャドウ検証(2026-07-11): 新規エンゲージ毎にリセット
                         # 2026-07-17追加(97節): line_cap EMAも新規エンゲージ毎に仕切り直す
                         #   (前回のオーバーテイクの平滑化値を持ち越さない、既存原則の踏襲)。
@@ -6519,6 +6528,17 @@ class MPCController(Node):
                     _target_mag = max(0.0, min(
                         self._ot_d_off,
                         float(self._ot_side) * _opp_lat_now + _clear_needed))
+                    self._ot_last_valid_min_needed_mag = _target_mag
+                elif self._ot_last_valid_min_needed_mag is not None:
+                    # 2026-08-05修正(298節続報、ユーザー指摘「コーナーアウトからの追い越しで
+                    #   大回りしないようにしたい」): 対象車が今周期だけ_scan["cars"]候補から
+                    #   外れた場合(コーナーでの視野角変化・一時的な視認ロス等)、従来は
+                    #   即座に固定値self._ot_d_off(3.0m、コリドーが許す限りの最大幅寄せ)へ
+                    #   切り替わっていた。すぐ下のcorr_bound凍結ロジック(168節)と同じ考え方で、
+                    #   直前に計算できていた必要最小オフセットを1周期だけ凍結保持し、
+                    #   不要な大回りを避ける(対象車が本当に見えなくなった場合はgiveup系の
+                    #   判定が別途OVERTAKINGを離脱させるため、ここで安全側に倒す必要はない)。
+                    _target_mag = self._ot_last_valid_min_needed_mag
                 else:
                     _target_mag = self._ot_d_off
                 _fwd_dbg["min_needed_mag"] = (
