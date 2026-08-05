@@ -849,6 +849,14 @@ class MPCController(Node):
             self._ot_enable = bool(_otget("enable", True))
             self._ot_min_gap = float(_otget("min_gap", 2.5))        # [m] 片側の空き幅しきい値
             self._ot_block_half = float(_otget("block_half", 0.9))  # [m] 他車1台の横半幅
+            # 2026-08-05追加(299節続報、task#293候補①): min_needed_mag計算で対象車の
+            #   横方向速度を短期外挿する際のホライズン上限とゼロ割回避floor。ホライズンは
+            #   Part A(283節)実測の予測精度限界(1〜1.5秒までは実用的、2秒超で劣化)に
+            #   合わせる。
+            self._ot_min_needed_horizon_cap_s = float(
+                _otget("min_needed_horizon_cap_s", 1.5))    # [s] 対象車横位置外挿のホライズン上限
+            self._ot_min_needed_closing_floor = float(
+                _otget("min_needed_closing_floor", 0.5))    # [m/s] t_reach計算のゼロ割回避floor
             self._ot_max_consider = float(_otget("max_consider", 40.0))  # [m] 前方弧長の上限
             self._ot_v_cap = float(_otget("v_cap", 6.0))            # [m/s] 追い越し中の速度上限
             self._ot_exit_clear = int(_otget("exit_clear", 3))
@@ -926,6 +934,18 @@ class MPCController(Node):
             #   周期に、必要最小オフセット(min_needed_mag)の直近有効値を凍結保持するための値。
             #   上の_ot_last_valid_target_mag(corr_bound用)とは別軸の値のため独立管理する。
             self._ot_last_valid_min_needed_mag = None
+            # 2026-08-05追加(299節続報、task#293候補①: ユーザー指摘「相手も走行しているので
+            #   次の瞬間にかわそうとしていた相手はもうそこにはいない」「車速を意識した
+            #   オーバーテイク処理」): min_needed_mag計算(対象車の現在横位置ベース)は
+            #   対象車が幅寄せ中(横方向に移動中)であることを一切考慮していなかった。
+            #   _scan["cars"]のdlatフィールドは対象車自身の横方向速度ではなく自車との
+            #   横距離の絶対値(dlat=abs(lat-ego_lat))であり、対象車の絶対的な横方向速度を
+            #   直接得るデータは既存に無いため、自前でEMA微分推定する。周期ごとの
+            #   対象車横位置(_opp_lat_now)の差分をalpha=self._ot_ema_alpha
+            #   (既存、0.05・≈1秒@40Hz、他のEMA平滑化と同一時定数)で平滑化する。
+            self._ot_opp_lat_prev = None       # [m] 前回周期の対象車横位置(同一対象車のときのみ有効)
+            self._ot_opp_lat_prev_vid = None   # 前回周期の対象車ID(切替検知用)
+            self._ot_opp_lat_vel_ema = None    # [m/s] 対象車横方向速度のEMA推定値
             # 2026-07-17追加(94節、トークン整合性監査): scan_traffic の fwd_vid は
             #   毎周期「その時点で最も近い車」を選び直す実装であり、ロック中の対象車に
             #   固定されない。93節で修正したLAT-TTCのcritical_curvature_runと同じ理由で、
@@ -1824,6 +1844,11 @@ class MPCController(Node):
         self._ot_room_exhausted_count = 0
         self._ot_last_valid_target_mag = None
         self._ot_last_valid_min_needed_mag = None
+        # 2026-08-05追加(299節続報、task#293候補①): 側を仕切り直すので対象車の
+        #   横方向速度推定も持ち越さない(新しい対象車について仕切り直す)。
+        self._ot_opp_lat_prev = None
+        self._ot_opp_lat_prev_vid = None
+        self._ot_opp_lat_vel_ema = None
         self._reset_ot_offset_state()
 
     def _reset_ot_offset_state(self) -> None:
@@ -6094,6 +6119,11 @@ class MPCController(Node):
                         self._ot_room_exhausted_count = 0
                         self._ot_last_valid_target_mag = None
                         self._ot_last_valid_min_needed_mag = None
+                        # 2026-08-05追加(299節続報、task#293候補①): 側反転につき対象車の
+                        #   横方向速度推定も持ち越さない。
+                        self._ot_opp_lat_prev = None
+                        self._ot_opp_lat_prev_vid = None
+                        self._ot_opp_lat_vel_ema = None
                         # 2026-07-14追加: 側が入れ替わったので_ot_clearedもリセットする。
                         #   他の側変更点(STOPPING遷移・NORMAL復帰・infeasible-stop)は全て
                         #   _ot_cleared=Falseを伴っており、ここだけ漏れていた。本節で
@@ -6236,6 +6266,11 @@ class MPCController(Node):
                                 self._ot_room_exhausted_count = 0
                                 self._ot_last_valid_target_mag = None
                                 self._ot_last_valid_min_needed_mag = None
+                                # 2026-08-05追加(299節続報、task#293候補①): rescue側反転につき
+                                #   対象車の横方向速度推定も持ち越さない。
+                                self._ot_opp_lat_prev = None
+                                self._ot_opp_lat_prev_vid = None
+                                self._ot_opp_lat_vel_ema = None
                                 self._ot_cleared = False
                                 self._ot_reacquire_count = 0
                                 self.get_logger().warn(
@@ -6367,6 +6402,12 @@ class MPCController(Node):
                         self._ot_room_exhausted_count = 0
                         self._ot_last_valid_target_mag = None
                         self._ot_last_valid_min_needed_mag = None
+                        # 2026-08-05追加(299節続報、task#293候補①): 新規エンゲージにつき
+                        #   対象車の横方向速度推定も持ち越さない(前回の対象車の値を
+                        #   引きずらない)。
+                        self._ot_opp_lat_prev = None
+                        self._ot_opp_lat_prev_vid = None
+                        self._ot_opp_lat_vel_ema = None
                         self._lat_ttc.reset_episode()  # シャドウ検証(2026-07-11): 新規エンゲージ毎にリセット
                         # 2026-07-17追加(97節): line_cap EMAも新規エンゲージ毎に仕切り直す
                         #   (前回のオーバーテイクの平滑化値を持ち越さない、既存原則の踏襲)。
@@ -6519,15 +6560,60 @@ class MPCController(Node):
                 #   ここでは二重に足さない。対象車が今周期のcars候補から外れている場合
                 #   (視野外・ds<0化等)は旧来通りd_off固定へフォールバックし退行を防ぐ。
                 _opp_lat_now = None
+                _opp_vlong_now = None
+                _opp_ds_now = None
                 for _c_ds, _c_lat, _c_vlong, _c_dlat, _c_vid, _c_wp in _scan["cars"]:
                     if _c_vid == self._ot_target_vid:
                         _opp_lat_now = _c_lat
+                        _opp_vlong_now = _c_vlong
+                        _opp_ds_now = _c_ds
                         break
                 if _opp_lat_now is not None:
+                    # 2026-08-05追加(299節続報、task#293候補①、ユーザー指摘「相手も
+                    #   走行しているので次の瞬間にかわそうとしていた相手はもうそこには
+                    #   いない」「車速を意識したオーバーテイク処理」): 対象車の現在の
+                    #   横位置だけでなく、自車が対象車の横に到達するまでの推定所要時間
+                    #   (t_reach)だけ対象車の横方向速度で外挿してから必要最小オフセットを
+                    #   計算する。対象車自身の絶対横方向速度を直接得るデータは既存に無い
+                    #   ため(_scan["cars"]のdlatは自車との横距離の絶対値であり速度では
+                    #   ない)、周期ごとの横位置差分をEMA平滑化(self._ot_ema_alpha、既存の
+                    #   0.05・≈1秒@40Hzを流用、新規チューニング値は増やさない)して自前で
+                    #   推定する。対象車が切り替わった直後は推定をリセットし外挿しない
+                    #   (安全側、前の相手の値を引きずらない)。
+                    if (self._ot_opp_lat_prev is not None
+                            and self._ot_opp_lat_prev_vid == self._ot_target_vid):
+                        _dt = 1.0 / self._cfg.mpc.control_rate  # type: ignore
+                        _raw_lat_vel = (_opp_lat_now - self._ot_opp_lat_prev) / _dt
+                        if self._ot_opp_lat_vel_ema is None:
+                            self._ot_opp_lat_vel_ema = _raw_lat_vel
+                        else:
+                            self._ot_opp_lat_vel_ema += self._ot_ema_alpha * (
+                                _raw_lat_vel - self._ot_opp_lat_vel_ema)
+                    else:
+                        self._ot_opp_lat_vel_ema = None
+                    self._ot_opp_lat_prev = _opp_lat_now
+                    self._ot_opp_lat_prev_vid = self._ot_target_vid
+                    # 通過までの推定所要時間(t_reach): 自車-対象車間の縦方向接近速度から
+                    #   算出。Part A(283節)実測の予測精度限界(1〜1.5秒までは実用的)に
+                    #   合わせてホライズンをキャップし、接近速度が小さい(並走・引き離され)
+                    #   場合は外挿しない(t_reach=0、現在値のまま)。
+                    _closing = _v_odom - (_opp_vlong_now or 0.0)
+                    if (_opp_ds_now is not None
+                            and _closing > self._ot_min_needed_closing_floor):
+                        _t_reach = min(
+                            _opp_ds_now / _closing, self._ot_min_needed_horizon_cap_s)
+                    else:
+                        _t_reach = 0.0
+                    if self._ot_opp_lat_vel_ema is not None:
+                        _opp_lat_pred = _opp_lat_now + self._ot_opp_lat_vel_ema * _t_reach
+                    else:
+                        _opp_lat_pred = _opp_lat_now
+                    _fwd_dbg["opp_lat_pred"] = round(_opp_lat_pred, 3)
+                    _fwd_dbg["t_reach"] = round(_t_reach, 3)
                     _clear_needed = self._mpc.model.width / 2.0 + self._ot_block_half
                     _target_mag = max(0.0, min(
                         self._ot_d_off,
-                        float(self._ot_side) * _opp_lat_now + _clear_needed))
+                        float(self._ot_side) * _opp_lat_pred + _clear_needed))
                     self._ot_last_valid_min_needed_mag = _target_mag
                 elif self._ot_last_valid_min_needed_mag is not None:
                     # 2026-08-05修正(298節続報、ユーザー指摘「コーナーアウトからの追い越しで

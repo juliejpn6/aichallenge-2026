@@ -91,7 +91,11 @@ def test_target_mag_computed_from_target_vid_lookup_before_corr_bound_clamp():
     assert 'if _c_vid == self._ot_target_vid:' in snippet
     assert "_opp_lat_now = _c_lat" in snippet
     # 必要量計算式: side*lat + クリアランス、d_offとの小さい方、0でfloor
-    assert "float(self._ot_side) * _opp_lat_now + _clear_needed" in snippet
+    # 2026-08-05修正(299節続報、task#293候補①): 対象車横方向速度の短期外挿を
+    #   追加したことで、計算式が_opp_lat_now(現在値)から_opp_lat_pred
+    #   (t_reach秒後の予測値。速度推定が無い/対象車が切り替わった直後は
+    #   _opp_lat_now==_opp_lat_predなので数値的な退行はない)へ置き換わった。
+    assert "float(self._ot_side) * _opp_lat_pred + _clear_needed" in snippet
     assert "_target_mag = max(0.0, min(" in snippet
     # 対象車が見つからない場合は旧来のd_off固定へフォールバック
     assert "else:" in snippet

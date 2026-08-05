@@ -324,6 +324,11 @@ overtake:
   enable: true            # false にすると gate1 と同じ「前方車検知=即停止」に戻る
   min_gap: 2.5            # [m] 片側にこの空き幅があれば追い越し可能側とみなす
   block_half: 0.9         # [m] 他車1台が塞ぐ横半幅 = vehicle_radius + クリアランス
+  # 2026-08-05追加(300節、task#293候補①): min_needed_mag計算で対象車の横方向速度を
+  #   短期外挿する際のホライズン上限とゼロ割回避floor。ホライズンはPart A(283節)実測の
+  #   予測精度限界(1〜1.5秒までは実用的、2秒超で劣化)に合わせる。
+  min_needed_horizon_cap_s: 1.5   # [s] 対象車横位置外挿のホライズン上限
+  min_needed_closing_floor: 0.5   # [m/s] t_reach計算のゼロ割回避floor(これ未満は外挿しない)
   max_consider: 20.0      # [m] この弧長より遠い前方他車は判断に使わない
   v_cap: 6.0              # [m/s] 追い越し中の速度上限
   exit_clear: 3           # 前方クリアがこの回数連続で OVERTAKING→NORMAL 復帰(ヒステリシス)

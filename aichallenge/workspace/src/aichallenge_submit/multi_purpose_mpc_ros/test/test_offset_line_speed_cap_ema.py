@@ -119,5 +119,7 @@ def test_line_cap_ema_reset_on_new_engage():
     idx = _SRC.index('self._ot_state = "OVERTAKING"\n                        self._ot_giveup_count = 0')
     # 2026-07-24追加(168節): room_exhausted状態のリセット代入2行が
     #   間に挿入されたため、窓を500→750へ拡大(検証対象そのものは無変更)。
-    snippet = _SRC[idx:idx + 750]
+    # 2026-08-05追加(299節続報、task#293候補①): 対象車横方向速度推定のリセット代入
+    #   3行が間に挿入されたため、窓を750→1400へ再拡大(検証対象そのものは無変更)。
+    snippet = _SRC[idx:idx + 1400]
     assert "self._line_cap_ema = None" in snippet

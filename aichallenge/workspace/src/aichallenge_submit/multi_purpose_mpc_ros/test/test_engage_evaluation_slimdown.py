@@ -165,7 +165,9 @@ def test_engage_log_line_uses_eval_fields():
     idx = _SRC.index('f"[ENGAGE] side={_eval.plan_side}')
     # 2026-07-24追加(168節): room_exhausted状態のリセット代入2行が
     #   間に挿入されたため、窓を2200→2500へ拡大(検証対象そのものは無変更)。
-    idx_end = idx + 2500
+    # 2026-08-05追加(299節続報、task#293候補①): 対象車横方向速度推定のリセット代入
+    #   3行が間に挿入されたため、窓を2500→3200へ再拡大(検証対象そのものは無変更)。
+    idx_end = idx + 3200
     snippet = _SRC[idx:idx_end]
     assert "closing_est={_eval.closing_est:.2f}" in snippet
     assert "engage_dist_dynamic={_eval.engage_dist_dynamic:.2f}" in snippet
