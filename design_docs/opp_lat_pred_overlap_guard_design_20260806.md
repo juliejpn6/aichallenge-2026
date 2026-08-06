@@ -1068,3 +1068,40 @@ wp340-40帯の根本原因調査)で追跡中の課題、wp252帯はstock-q-qn-s
 correlation等で言及される既知の`wp78/wp257`定常的ステアリング振動と
 同一地点の疑いがある。Fix A'を疑う理由にはならず、両課題は既存の
 別スレッド(task#295等)で引き続き対応する。
+
+## 16. Fix C実装完了(2026-08-07、コミット`4b02b52`)
+
+Fix Bのdev3ローカル検証(Phase 2)と並行し、§3の設計(外部AIレビュー
+must-fix 2反映済み)通り実装した:
+
+- `overtake.pending_disengage_enabled`(既定false)ゲート追加
+- giveup条件を`_giveup_now`変数へリファクタ(ブール式自体は無変更、
+  Fix Cが並走中のみこれをFalseへ上書きできるようにする構造変更)
+- 並走中(Fix Cが§14.6で温存したdsベース`_update_overlap_state()`を再利用)
+  の非緊急giveup(room_exhausted・opponent_too_fast由来)は、離脱を
+  有限時間(既定80周期≈2秒、既存`giveup_cycles`の2倍)だけ保留する。
+  `footprint_risk`(緊急反応系トリガー)は対象外、現行どおり即座に処理
+  (82/83節の教訓、CLAUDE.md §1.3の慎重領域=cleared判定周りへの安易な
+  ガード追加は厳禁、安全反応系の遅延は厳禁)
+- 安全弁(必須): 保留カウントが上限へ達したら並走が解消していなくても
+  強制的に通常のgiveup処理へ合流(無期限保留を禁止)
+- must-fix 2: giveup条件自体が不成立の周期は保留カウントを必ず0へ戻す
+- `[PENDING-DISENGAGE] start`/`resolved(natural_overlap_clear/
+  forced_fallback)`診断ログ追加
+- リセット統合: STUCK突入時(`_stuck_enter_wait_reverse`、**CLAUDE.md §1.3
+  の慎重領域**)にも`_reset_ot_episode_tracking_state()`を追加(外部AI
+  レビュー推奨4)。STUCK固有の状態機械ロジック(`_stuck_state`/
+  `_stuck_count`等)には一切触れず、OT追跡状態のリセット呼び出し1行のみを
+  純粋に追加した。回帰スイート全件PASSで既存挙動への影響がないことを
+  確認済み(CLAUDE.md §1.4準拠)
+- 推奨7(fwd_vid単独切替経路の有無)を確認: `_ot_target_vid`の代入箇所は
+  `__init__`+新規エンゲージ時の2箇所のみで、該当経路は存在しないと
+  ソースコード上で確認した
+
+新規単体テスト25件+既存2件のアンカー更新、回帰スイート3234件PASS。
+ゲートOFF(既定)時は`_giveup_now`の値をそのまま使う=現行動作と完全に
+ビット等価。
+
+**次のアクション**: §10のFlowに従い、Fix Cのオフライン反実仮想検証→
+dev3ローカル検証(Phase 2)へ進む。Fix A'(Phase 3完了)・Fix B(Phase 2
+進行中)の結果と合わせて、3つのFixの統合判断を行う。
