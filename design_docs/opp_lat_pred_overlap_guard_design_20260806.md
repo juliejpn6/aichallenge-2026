@@ -1203,3 +1203,87 @@ Phase 2の十分なデータ量とみなした。
 
 **判定**: Fix B dev3ローカル検証(Phase 2)PASS。§10のFlowに従い次は
 Phase 3(予選環境検証)。
+
+## 19. Fix A'/B/C統合整合性レビューで重大な発見・修正(2026-08-07、コミット`83de4b1`)
+
+Fix Cのdev3投入前に、3つのFixを俯瞰する統合整合性レビューを外部AI
+(Gemini・別Claude)へ依頼した(`docs/superpowers/specs/2026-08-07-fix-abc-
+integrated-consistency-review-prompt.md`)。
+
+### 19.1 レビュー結果の要約
+
+両AIとも「周期内実行順序の理解は正しい」「多重リセットは健全」
+「致命的な矛盾はない」という点で一致した。Geminiは全体的に肯定的な
+評価(状態遷移図への準状態注記・`_update_overlap_state()`のリネームを
+推奨するに留まる)。別Claudeは同様に肯定的な評価をしつつ、**1件の
+安全に関わる重大な懸念**を発見した。
+
+### 19.2 発見: Fix Cのゲートがforce_giveupを免除していない
+
+別Claudeの指摘: design_docs §3.2は当初から「緊急系(footprint_risk・
+force_giveup由来)なら現行どおり即座に実行する」と明記していたが、実装
+(コミット`4b02b52`)のゲート条件は`not _lat_dec.footprint_risk_triggered`
+のみで、`force_giveup`を見ていなかった。もし`force_giveup`がLAT-TTC系の
+緊急離脱を意味するなら、Fix Cがそれを最大2秒保留してしまう重大な欠陥。
+Geminiは逆に「緊急系ロジックは100%維持されている」と楽観的に評価して
+おり、両者の主張が食い違ったため、実コードで確定させた。
+
+**実コード確認結果(lateral_ttc_monitor.py)**: `force_giveup=True`は
+2箇所で発火する——(a) line 482、`footprint_risk`分岐(この時
+`footprint_risk_triggered=True`も同時にセットされる)、(b) line 862、
+LAT-TTC C2/C2_cleared分岐(「cleared中でも最終防波堤として残す」との
+コメントがある通り、まさに緊急回避のラストライン)。**(b)は
+`footprint_risk_triggered`をセットしない**(デフォルトFalseのまま)ため、
+別Claudeの懸念が正確に的中していた——Fix Cは既存の`not footprint_risk_
+triggered`だけでは、LAT-TTC C2/C2_cleared由来の緊急giveupを誤って保留
+しうる欠陥を持ったまま実装されていた。
+
+### 19.3 修正
+
+ゲート条件へ`and not _lat_dec.force_giveup`を追加(コミット`83de4b1`)。
+`footprint_risk_triggered=True`は常に`force_giveup=True`を伴うため、
+この1条件追加で両方の緊急経路を正しく除外できる。単体テスト2件追加
+(ソーステキスト検証`test_force_giveup_excluded_emergency_path_
+untouched`+ミラー数値検証`test_mirror_force_giveup_bypasses_hold_
+immediate_giveup`)、回帰スイート3236件PASS。`pending_disengage_enabled`
+は既定falseのまま(実害はまだ発生していないが、ON化前の必須修正だった)。
+
+### 19.4 §17の横展開結果の訂正
+
+§17.2の集計は`footprint_risk`のみを緊急系として除外しており、
+`force_giveup`(LAT-TTC C2/C2_cleared)を「非footprint_risk」として
+誤ってFix C対象候補に含めていた。19.2の修正を踏まえ再集計した:
+
+| 指標 | §17.2(訂正前) | 訂正後 |
+|---|---|---|
+| footprint_risk起因(緊急、対象外) | 58件 | 58件 |
+| force_giveup(LAT-TTC系、緊急、対象外) | (計上漏れ) | **255件(新規計上)** |
+| 真に非緊急(Fix C対象候補) | 270件 | **15件** |
+| overlapping成立(Fix C実際に介入) | 5件(1.9%) | **3件(20.0%)** |
+
+真の対象候補プールは328件中わずか15件(4.6%)まで絞られたが、その中での
+Fix C実効介入率は**20.0%**(訂正前の1.9%より大幅に高い)。§17.3で発見した
+COLLISION-SUSPECTEDと直接時間的に一致した事例(`0805-04`ログ、
+`trigger=room_exhausted`)は`force_giveup`ではないため、この訂正の
+影響を受けず引き続き有効な決定的証拠のまま。**訂正後の数字は、Fix Cの
+設計妥当性をむしろ強く裏付ける結果になった**(稀な状況ではあるが、
+真に対象となる状況の5件に1件が実際の衝突と直結していたという計算)。
+
+### 19.5 レビューで指摘されたその他の項目(TODO、優先度順)
+
+1. **(完了)** force_giveup免除の追加(本節、最優先事項として対応済み)。
+2. **(要確認)** 対象車ID(`fwd_vid`)がOVERTAKING継続中に切り替わる経路の
+   有無(推奨7、Fix B実装時に「該当なし」と確認済みだが、Fix C文脈でも
+   再確認が望ましいと両AIから指摘)。
+3. **(未解決、Phase 0残課題)** 168節フリーズが元事故(18節)で機能
+   しなかった理由の解明——床がタイムアウト後に委譲する最後の砦である
+   ため、本番ON前に理解が必要(別Claude指摘)。
+4. **(先送り可)** `_update_overlap_state()`/`_ot_overlapping`のリネーム
+   (Fix C専用になった実態を反映)。両AIとも「機能上のバグではない」
+   「凍結明けの整理タスクへ先送りで良い」との評価で一致。
+5. **(推奨)** 状態遷移図への「OVERTAKING (pending-disengage)」準状態の
+   注記、保留カウントの状態遷移表の設計書転記(両AIとも推奨)。
+
+**次のアクション**: 項目1(最優先)は完了。項目2の再確認(数分)を行った
+上でdev3ローカル検証(Phase 2)へ進む。項目3・4・5は本番ON前または
+凍結明け整理タスクとして別途対応する。
