@@ -798,3 +798,32 @@ STOPPING→NORMAL復帰経路(_n_fwd==0が毎周期真になり続けるケー�
 非悪化確認を行う(CLAUDE.md §2 rule 6「予選投入前提の検証はdev3を基本と
 し、予選提出前の最終確認はdev3で行う」は既に満たしているため、Phase 3は
 実際の予選投入による最終確認の位置づけ)。
+
+## 13. Fix B実装完了(2026-08-07、コミット`3706a14`)
+
+Fix A'のPhase 3(予選環境検証)を実際に予選走行させている待ち時間を利用し、
+§2の設計(外部AIレビューmust-fix 1反映済み)通りFix Bを実装した:
+
+- `overtake.overlap_floor_enabled`(既定false)ゲート追加
+- `_update_overlap_state()`新設(縦オーバーラップ判定、ヒステリシス付き、
+  footprint_riskと同じ`along_min_length`を再利用、新規距離定数0個)
+- `_apply_overlap_floor()`新設(並走中はtarget_magを縮小させない、床は
+  専用の新規状態`_ot_overlap_floor_mag`を使い168節の既存フリーズ値
+  `_ot_last_valid_target_mag`とは分離、適用時に必ず現在のcorr_boundで
+  再キャップ)
+- 呼び出し2箇所(OVERTAKING分岐・STOPPING/proactive-bias分岐)
+- `[OVERLAP-FLOOR]`診断ログ(エッジトリガー)
+- リセット処理統合: 4箇所(側反転/rescue反転/新規エンゲージ/STUCK復帰)の
+  重複実装を`_reset_ot_episode_tracking_state()`へ統合(§4の設計は
+  Fix A採用による変数削除を前提としていたが、実際のFix A'実装は
+  `_ot_opp_lat_prev`等4変数を削除せず名称再利用する形になったため、
+  統合ヘルパーは当初想定の2行ではなく6行+Fix Bの2行を扱う形へ適応した)
+- 新規単体テスト22件(`test_fix_b_overlap_floor_20260807.py`)+既存5件の
+  アンカー更新(統合ヘルパー呼び出しへの置換に伴う)、回帰3199件PASS
+
+ゲートOFF(既定)のため現行挙動とビット等価、`config.yaml`は
+`overlap_floor_enabled: false`のまま。
+
+**次のアクション**: §10のFlowに従い、Fix A'のPhase 3(予選環境検証)完了・
+判定を待ってから、Fix Bのオフライン反実仮想検証→dev3ローカル検証
+(Phase 2)へ進む(Fix Aと同時進行させない、§10の方針通り)。
