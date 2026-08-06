@@ -105,6 +105,23 @@ def test_footprint_risk_excluded_emergency_path_untouched():
     assert "footprint_risk_triggered" in snippet[idx:idx_end]
 
 
+def test_force_giveup_excluded_emergency_path_untouched():
+    """2026-08-07修正(統合整合性レビュー、外部AI[別Claude]指摘): force_giveup
+    (lateral_ttc_monitor.pyのLAT-TTC C2/C2_cleared分岐、「最終防波堤」)も
+    footprint_risk_triggeredと同様に緊急系であり、保留ロジックの対象外と
+    すること。設計書§3.2は当初から「緊急系=footprint_risk・force_giveup
+    由来」と明記していたが、実装がfootprint_risk_triggeredのみを見ていた
+    欠陥の再発防止テスト。C2/C2_cleared分岐はforce_giveup=Trueを返す際
+    footprint_risk_triggeredを伴わない(lateral_ttc_monitor.py:861-862、
+    デフォルトのFalseのまま)ため、force_giveupの除外がなければ緊急giveup
+    が誤って保留されうる。"""
+    snippet = _giveup_block()
+    idx = snippet.index("if (self._ot_pending_disengage_enabled and _giveup_now")
+    idx_end = snippet.index("):", idx)
+    cond = snippet[idx:idx_end]
+    assert "not _lat_dec.force_giveup" in cond
+
+
 def test_overlap_check_reuses_update_overlap_state_and_fwd_ds():
     snippet = _giveup_block()
     assert "self._update_overlap_state(_opp_sit.fwd_ds)" in snippet
@@ -207,10 +224,12 @@ def test_no_fwd_vid_switch_path_without_reengage():
 # ---------------------------------------------------------------------------
 
 def _pending_disengage_mirror(giveup_now, enabled, footprint_risk, overlapping,
-                               count, max_cycles=80):
+                               count, max_cycles=80, force_giveup=False):
     """giveup分岐冒頭に挿入したFix Cロジックの1:1ミラー(数値検証用)。
-    戻り値: (giveup_now_after, count_after)"""
-    if enabled and giveup_now and not footprint_risk:
+    2026-08-07改訂(統合整合性レビュー、外部AI[別Claude]指摘): force_giveup
+    (LAT-TTC C2/C2_cleared「最終防波堤」)もfootprint_riskと同様に緊急系
+    として除外する。戻り値: (giveup_now_after, count_after)"""
+    if enabled and giveup_now and not footprint_risk and not force_giveup:
         if overlapping:
             count += 1
             if count < max_cycles:
@@ -246,6 +265,17 @@ def test_mirror_footprint_risk_bypasses_hold_immediate_giveup():
         True, enabled=True, footprint_risk=True, overlapping=True, count=0, max_cycles=80)
     assert g_after is True
     assert count_after == 0  # if _giveup_now: の最終リセットが効く
+
+
+def test_mirror_force_giveup_bypasses_hold_immediate_giveup():
+    """2026-08-07修正(統合整合性レビュー、外部AI[別Claude]指摘): force_giveup
+    (LAT-TTC C2/C2_cleared「最終防波堤」、footprint_risk_triggeredを伴わない)
+    起因のgiveupも保留の対象外、即座に処理されることを確認する。"""
+    g_after, count_after = _pending_disengage_mirror(
+        True, enabled=True, footprint_risk=False, force_giveup=True,
+        overlapping=True, count=0, max_cycles=80)
+    assert g_after is True
+    assert count_after == 0
 
 
 def test_mirror_natural_clear_resets_count_and_proceeds_with_giveup():

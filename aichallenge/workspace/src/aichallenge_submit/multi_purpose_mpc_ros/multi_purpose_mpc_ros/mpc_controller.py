@@ -6707,12 +6707,22 @@ class MPCController(Node):
                     #   giveup(room_exhausted・opponent_too_fast由来)は、離脱その
                     #   ものを有限時間だけ保留し、並走が解消してから通常のgiveup
                     #   処理(状態遷移・オフセットゼロ化を含め無変更)を実行する。
-                    #   footprint_risk(緊急反応系トリガー)はここで除外し、現行どおり
-                    #   即座に処理する(82/83節の教訓、安全反応系の遅延は厳禁)。
+                    #   緊急系(footprint_risk・force_giveup由来、§3.2の設計どおり
+                    #   両方)はここで除外し、現行どおり即座に処理する(82/83節の
+                    #   教訓、安全反応系の遅延は厳禁)。
+                    #   2026-08-07修正(統合整合性レビュー、外部AI[別Claude]指摘):
+                    #   実装当初はfootprint_risk_triggeredのみを除外しており、
+                    #   force_giveupが立つ別の緊急経路(lateral_ttc_monitor.py
+                    #   のLAT-TTC C2/C2_cleared分岐、「最終防波堤」、
+                    #   footprint_risk_triggeredを伴わずforce_giveupのみTrueに
+                    #   なる)がFix Cの保留対象に紛れ込む欠陥があった(§3.2の設計
+                    #   文書自体は当初から「緊急系=footprint_risk・force_giveup
+                    #   由来」と明記しており、実装だけがこれを取りこぼしていた)。
                     #   ゲートOFF(既定)時は_giveup_nowの値をそのまま使う=現行動作と
                     #   ビット等価。
                     if (self._ot_pending_disengage_enabled and _giveup_now
-                            and not _lat_dec.footprint_risk_triggered):
+                            and not _lat_dec.footprint_risk_triggered
+                            and not _lat_dec.force_giveup):
                         if self._update_overlap_state(_opp_sit.fwd_ds):
                             self._ot_pending_disengage_count += 1
                             if self._ot_pending_disengage_count == 1:
