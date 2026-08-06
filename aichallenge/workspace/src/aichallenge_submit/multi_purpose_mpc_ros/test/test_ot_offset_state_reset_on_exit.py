@@ -77,10 +77,12 @@ def test_called_from_giveup_family_exit():
 
 def test_called_from_ordinary_exit_clear():
     """通常のexit_clear離脱(前方クリア連続、5033行目付近)で呼ばれていることを
-    確認する。"""
-    idx = _SRC.index("if self._fwd_clear_count >= self._ot_exit_clear:")
-    idx_end = idx + 500
+    確認する。2026-08-06修正(重複ログバグ修正)でアンカーを
+    `self._fwd_clear_count += 1`直後の状態ガード付きifへ更新。"""
+    idx = _SRC.index("self._fwd_clear_count += 1")
+    idx_end = idx + 1300
     snippet = _SRC[idx:idx_end]
+    assert 'self._ot_state != "NORMAL"' in snippet
     assert 'self._ot_state = "NORMAL"' in snippet
     assert "self._reset_ot_offset_state()" in snippet
 

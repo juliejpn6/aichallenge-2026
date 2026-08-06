@@ -6750,7 +6750,18 @@ class MPCController(Node):
             else:
                 # 前方クリアが連続したら NORMAL 復帰（ハンチング防止）
                 self._fwd_clear_count += 1
-                if self._fwd_clear_count >= self._ot_exit_clear:
+                # 2026-08-06修正(Fix A' dev3検証中に発見、独立バグ): 従来はこの
+                #   ifが状態非依存だったため、前方に相手がいない全周期(=大半の
+                #   巡航区間)でself._ot_state=="NORMAL"へ遷移済み後もこの分岐へ
+                #   毎周期入り続け、[OT-OUTCOME] success/exit_clearを無意味に
+                #   再ログし続けていた(30分dev3走行で133338件、実質ノイズで
+                #   集計不能)。「まだNORMALへ遷移していないか」をガードに追加し、
+                #   実際のOVERTAKING/STOPPING→NORMAL遷移が起きるその1周期だけで
+                #   発火するようにする(遷移そのものの意味・タイミングは無変更。
+                #   254節の後方車バグ修正で確立したSTOPPING→NORMAL復帰経路も
+                #   そのまま維持)。
+                if (self._ot_state != "NORMAL"
+                        and self._fwd_clear_count >= self._ot_exit_clear):
                     self._log_ot_outcome("success", self._ot_side, reason="exit_clear")
                     self._ot_state = "NORMAL"
                     self._ot_side = 0
