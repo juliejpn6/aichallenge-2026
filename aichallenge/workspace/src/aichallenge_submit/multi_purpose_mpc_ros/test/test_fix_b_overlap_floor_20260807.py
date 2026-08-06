@@ -302,6 +302,12 @@ def test_reset_helper_does_not_touch_side_commit_state():
     assert "self._ot_room_exhausted_count" not in snippet
 
 
+def test_reset_helper_resets_invalid_corr_count():
+    """§14.3追加分: corr_bound無効連続カウンタもリセットされること。"""
+    snippet = _reset_helper_body()
+    assert "self._ot_overlap_floor_invalid_corr_count = 0" in snippet
+
+
 def test_reset_helper_called_from_four_known_sites():
     """側反転・rescue側反転・新規エンゲージ・STUCK復帰(_reset_ot_side_for_
     fresh_replan経由)の計4箇所から呼ばれていることを確認する。"""
@@ -309,3 +315,106 @@ def test_reset_helper_called_from_four_known_sites():
     assert n_calls == 4, (
         f"想定していた4箇所から数が変わっている(現在{n_calls}箇所)。"
         "新しい離脱経路が追加/削除された場合はこのテスト自体の更新も必要。")
+
+
+# ---------------------------------------------------------------------------
+# ⑦corr_bound無効タイムアウト(2026-08-07、§14.3、外部AI[別Claude]レビュー):
+#   corr_bound無効(負転落/非有限)が既存のunlock_inf_cycles(H4-lite、
+#   80周期≈2秒)を超えて連続したら床の適用自体を止める
+# ---------------------------------------------------------------------------
+
+def test_invalid_corr_count_state_declared_with_safe_default():
+    assert "self._ot_overlap_floor_invalid_corr_count = 0" in _SRC
+
+
+def test_timeout_reuses_existing_unlock_after_no_new_magic_number():
+    """新規マジックナンバーを増やさず、既存のH4-lite上限(self._unlock_after
+    = unlock_inf_cycles由来)を流用していることを確認する。"""
+    snippet = _apply_overlap_floor_block()
+    assert "self._ot_overlap_floor_invalid_corr_count > self._unlock_after" in snippet
+
+
+def test_invalid_count_resets_to_zero_when_corr_becomes_valid():
+    snippet = _apply_overlap_floor_block()
+    idx_valid = snippet.index("if _corr_valid:")
+    idx_else = snippet.index("else:", idx_valid)
+    body = snippet[idx_valid:idx_else]
+    assert "self._ot_overlap_floor_invalid_corr_count = 0" in body
+
+
+def test_invalid_count_increments_only_in_invalid_branch():
+    snippet = _apply_overlap_floor_block()
+    idx_else = snippet.index("else:\n            self._ot_overlap_floor_invalid_corr_count += 1")
+    assert idx_else >= 0  # インデックスが見つかること自体がアサーション
+
+
+def test_floor_application_skipped_after_timeout():
+    """タイムアウト超過時、床の適用(target_mag = max(target_mag, floor))を
+    経由せずtarget_magをそのまま返すことを確認する。"""
+    snippet = _apply_overlap_floor_block()
+    idx_over = snippet.index(
+        "if self._ot_overlap_floor_invalid_corr_count > self._unlock_after:")
+    idx_return = snippet.index("return target_mag", idx_over)
+    idx_next_target_mag_max = snippet.find("target_mag = max(target_mag, floor)", idx_over)
+    # target_mag = max(target_mag, floor)より前でreturnしていること
+    assert idx_return < idx_next_target_mag_max
+
+
+def test_timeout_log_is_one_shot():
+    """[OVERLAP-FLOOR-TIMEOUT]ログが発火した最初の周期だけの
+    ワンショットであること(境界値+1での等価比較)。"""
+    snippet = _apply_overlap_floor_block()
+    assert (
+        "if self._ot_overlap_floor_invalid_corr_count == self._unlock_after + 1:"
+        in snippet)
+    assert '"[OVERLAP-FLOOR-TIMEOUT]' in snippet
+
+
+def _apply_overlap_floor_v3_mirror(target_mag, ot_state, corr_bound, floor_mag,
+                                    invalid_count, unlock_after=80, corr_margin=0.1):
+    """§14.3改訂後の_apply_overlap_floor()の1:1ミラー(数値検証用)。
+    戻り値: (target_mag_after, floor_mag_after, invalid_count_after)"""
+    if ot_state != "OVERTAKING":
+        return target_mag, None, 0
+    floor_mag = max(floor_mag or 0.0, target_mag)
+    floor = floor_mag
+    corr_valid = corr_bound == corr_bound and corr_bound is not None and corr_bound > 0.0
+    if corr_valid:
+        floor = min(floor, corr_bound - corr_margin)
+        invalid_count = 0
+    else:
+        invalid_count += 1
+        if invalid_count > unlock_after:
+            return target_mag, floor_mag, invalid_count
+    return max(target_mag, floor), floor_mag, invalid_count
+
+
+def test_mirror_floor_disabled_after_prolonged_invalid_corr_bound():
+    """corr_bound無効がunlock_after周期を超えて続くと、床の適用が止まる
+    (target_magが持ち上げられなくなる)ことを数値的に確認する。"""
+    floor_mag = 3.0  # 高いピークが既に記録されている
+    invalid_count = 0
+    target_mag = 0.1
+    unlock_after = 80
+    # unlock_after周期ちょうどまでは床が適用され続ける(target_mag=floor_mag)
+    for _ in range(unlock_after):
+        target_mag_out, floor_mag, invalid_count = _apply_overlap_floor_v3_mirror(
+            target_mag, "OVERTAKING", -1.0, floor_mag, invalid_count,
+            unlock_after=unlock_after)
+        assert target_mag_out == floor_mag
+    # unlock_afterを超えた次の周期からは床が外れ、target_magがそのまま返る
+    target_mag_out, floor_mag, invalid_count = _apply_overlap_floor_v3_mirror(
+        target_mag, "OVERTAKING", -1.0, floor_mag, invalid_count,
+        unlock_after=unlock_after)
+    assert target_mag_out == target_mag
+
+
+def test_mirror_invalid_count_resets_and_floor_resumes_when_corr_recovers():
+    """corr_boundが有効な値へ戻れば、カウンタが即座に0へ戻り床の適用が
+    再開することを確認する(床のピーク値自体はリセットされない)。"""
+    floor_mag = 3.0
+    invalid_count = 90  # 既にタイムアウト超過している状態
+    target_mag_out, floor_mag_out, invalid_count_out = _apply_overlap_floor_v3_mirror(
+        0.1, "OVERTAKING", 5.0, floor_mag, invalid_count)
+    assert invalid_count_out == 0
+    assert target_mag_out == min(floor_mag, 5.0 - 0.1)  # 床が再適用される

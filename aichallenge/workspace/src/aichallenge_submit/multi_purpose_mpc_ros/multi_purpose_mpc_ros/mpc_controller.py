@@ -1026,6 +1026,13 @@ class MPCController(Node):
             #   (design_docs opp_lat_pred_overlap_guard_design_20260806.md §2)。
             self._ot_overlapping = False
             self._ot_overlap_floor_mag = None
+            # 2026-08-07追加(§14.3、外部AI[別Claude]レビュー): corr_bound無効
+            #   (負転落/非有限)が続いた連続周期数。既存のunlock_inf_cycles
+            #   (H4-lite、80周期≈2秒)を上限として流用し、これを超えたら床の
+            #   適用自体を止める(「短時間のアーティファクトは床が守り、
+            #   それ以上続く空間消失は緊急系[freeze/giveup]の管轄」という
+            #   境界線、新規マジックナンバー0個)。
+            self._ot_overlap_floor_invalid_corr_count = 0
             # 2026-08-05追加(299節続報、task#293候補①: ユーザー指摘「相手も走行しているので
             #   次の瞬間にかわそうとしていた相手はもうそこにはいない」「車速を意識した
             #   オーバーテイク処理」): min_needed_mag計算(対象車の現在横位置ベース)は
@@ -1977,6 +1984,7 @@ class MPCController(Node):
         self._ot_opp_lat_warmup_count = 0
         self._ot_overlapping = False
         self._ot_overlap_floor_mag = None
+        self._ot_overlap_floor_invalid_corr_count = 0
 
     def _update_overlap_state(self, opp_ds_now) -> bool:
         """対象車と縦方向にオーバーラップ中(=真横に近接、footprint_riskと
@@ -2039,6 +2047,13 @@ class MPCController(Node):
             実測corr_boundで毎回再キャップするため)。
           - OVERTAKING以外の状態(NORMAL/STOPPING等)では床を保持しない
             (次回エンゲージ時に前回エピソードの高い床値を持ち越さない)。
+          - corr_boundが無効(負転落/非有限)な状態が
+            unlock_inf_cycles(既定80周期≈2秒)を超えて連続した場合、床の
+            適用自体を止める(2026-08-07追加、§14.3、外部AI[別Claude]
+            レビュー: 「短時間のアーティファクトは床が守り、それ以上続く
+            空間消失は緊急系[168節フリーズ・giveup等]の管轄」という境界線。
+            corr_boundが有効な値へ戻れば即座に再開する、床のピーク値
+            self._ot_overlap_floor_mag自体はリセットしない)。
 
         ゲートOFF(既定)時は状態チェックも含め早期returnし、target_magを
         完全に無変更で返す(全ゲートOFF時のビット等価性を保証)。"""
@@ -2046,13 +2061,29 @@ class MPCController(Node):
             return target_mag
         if self._ot_state != "OVERTAKING":
             self._ot_overlap_floor_mag = None
+            self._ot_overlap_floor_invalid_corr_count = 0
             return target_mag
         _before = target_mag
         self._ot_overlap_floor_mag = max(
             self._ot_overlap_floor_mag or 0.0, target_mag)
         floor = self._ot_overlap_floor_mag
-        if np.isfinite(corr_bound) and corr_bound > 0.0:
+        _corr_valid = np.isfinite(corr_bound) and corr_bound > 0.0
+        if _corr_valid:
             floor = min(floor, corr_bound - self._ot_overlap_corr_margin_m)
+            self._ot_overlap_floor_invalid_corr_count = 0
+        else:
+            self._ot_overlap_floor_invalid_corr_count += 1
+            if self._ot_overlap_floor_invalid_corr_count > self._unlock_after:
+                # corr_bound無効が既存のH4-lite上限(unlock_inf_cycles)を
+                #   超えて続いている。床の適用を止め、既に計算済みの
+                #   target_mag(168節フリーズ等の既存機構の結果)をそのまま
+                #   返す(ワンショットログで発火を記録)。
+                if self._ot_overlap_floor_invalid_corr_count == self._unlock_after + 1:
+                    self.get_logger().warn(
+                        f"[OVERLAP-FLOOR-TIMEOUT] side={self._ot_side} "
+                        f"invalid_corr_count={self._ot_overlap_floor_invalid_corr_count} "
+                        f"corr_bound={corr_bound} wp={self._mpc.model.wp_id}")
+                return target_mag
         target_mag = max(target_mag, floor)
         if target_mag > _before:
             # エッジトリガー(床が実際に効いた周期のみ)、OVERTAKING中
