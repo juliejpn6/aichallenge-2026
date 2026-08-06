@@ -883,6 +883,14 @@ class MPCController(Node):
             self._ot_overlap_margin_m = float(_otget("overlap_margin_m", 0.5))
             self._ot_overlap_corr_margin_m = float(
                 _otget("overlap_corr_margin_m", 0.1))
+            # 2026-08-07追加(Fix C、design_docs opp_lat_pred_overlap_guard_design_
+            #   20260806.md §3): 並走中の非緊急giveupを有限時間だけ保留する。
+            #   既定false=現行のままビット等価(Fix A/Bとは独立ゲート)。
+            self._ot_pending_disengage_enabled = bool(
+                _otget("pending_disengage_enabled", False))
+            self._ot_pending_disengage_max_cycles = self._rate_scaled_cycles(
+                "pending_disengage_max_cycles",
+                int(_otget("pending_disengage_max_cycles", 80)))
             self._ot_max_consider = float(_otget("max_consider", 40.0))  # [m] 前方弧長の上限
             self._ot_v_cap = float(_otget("v_cap", 6.0))            # [m/s] 追い越し中の速度上限
             self._ot_exit_clear = int(_otget("exit_clear", 3))
@@ -1033,6 +1041,9 @@ class MPCController(Node):
             #   それ以上続く空間消失は緊急系[freeze/giveup]の管轄」という
             #   境界線、新規マジックナンバー0個)。
             self._ot_overlap_floor_invalid_corr_count = 0
+            # 2026-08-07追加(Fix C): 並走中の非緊急giveup保留の連続周期数
+            #   (design_docs opp_lat_pred_overlap_guard_design_20260806.md §3)。
+            self._ot_pending_disengage_count = 0
             # 2026-08-05追加(299節続報、task#293候補①: ユーザー指摘「相手も走行しているので
             #   次の瞬間にかわそうとしていた相手はもうそこにはいない」「車速を意識した
             #   オーバーテイク処理」): min_needed_mag計算(対象車の現在横位置ベース)は
@@ -1972,10 +1983,10 @@ class MPCController(Node):
         共通に呼ぶ、エピソード単位の追跡状態リセット(design_docs
         opp_lat_pred_overlap_guard_design_20260806.md §4、4箇所の重複実装を
         統合)。Fix Bの専用床変数(_ot_overlap_floor_mag、外部AIレビュー
-        must-fix 1)もここでリセットする。_ot_side/_ot_side_locked/
-        _ot_giveup_count/_ot_room_exhausted_count等(呼び出し元で個別に
-        正しくリセット済み)には一切触れない(責務の分離、_reset_ot_offset_state
-        と同じ原則)。"""
+        must-fix 1)・Fix Cの保留カウント(_ot_pending_disengage_count)も
+        ここでリセットする。_ot_side/_ot_side_locked/_ot_giveup_count/
+        _ot_room_exhausted_count等(呼び出し元で個別に正しくリセット済み)
+        には一切触れない(責務の分離、_reset_ot_offset_stateと同じ原則)。"""
         self._ot_last_valid_target_mag = None
         self._ot_last_valid_min_needed_mag = None
         self._ot_opp_lat_prev = None
@@ -1985,6 +1996,7 @@ class MPCController(Node):
         self._ot_overlapping = False
         self._ot_overlap_floor_mag = None
         self._ot_overlap_floor_invalid_corr_count = 0
+        self._ot_pending_disengage_count = 0
 
     def _update_overlap_state(self, opp_ds_now) -> bool:
         """対象車と縦方向にオーバーラップ中(=真横に近接、footprint_riskと
@@ -2162,6 +2174,13 @@ class MPCController(Node):
         self._stuck_gear_cmd_last = None
         self._stuck_gear_cmd_heartbeat_count = 0
         self._ghost_block_logged = False
+        # 2026-08-07追加(Fix C、design_docs opp_lat_pred_overlap_guard_design_
+        #   20260806.md §3.4、外部AIレビュー推奨4): STUCK突入時にも既存の
+        #   OVERTAKINGエピソード追跡状態(Fix B/Cの並走判定・床・保留カウント
+        #   含む)をリセットし、復帰後に古い状態を持ち越さない
+        #   (_stuck_state/_stuck_count等のSTUCK固有状態には一切触れない、
+        #   純粋な追加のみ)。
+        self._reset_ot_episode_tracking_state()
         self._handle_stuck_recovery(now, pose)
 
     def _stuck_recovery_complete(self, reset_backup_state: bool, reset_corridor: bool,
@@ -6681,8 +6700,49 @@ class MPCController(Node):
                                 f"count={self._ot_room_exhausted_count} -> giveup合流 "
                                 f"wp={self._mpc.model.wp_id}")
                     _side_blocked = _lat_dec.force_giveup or _room_exhausted
-                    if (self._ot_giveup_count >= self._ot_giveup_cycles
-                            or _locked == 0 or _side_blocked):
+                    _giveup_now = (self._ot_giveup_count >= self._ot_giveup_cycles
+                                    or _locked == 0 or _side_blocked)
+                    # 2026-08-07追加(Fix C、design_docs opp_lat_pred_overlap_guard_
+                    #   design_20260806.md §3): 並走中(縦オーバーラップ中)の非緊急
+                    #   giveup(room_exhausted・opponent_too_fast由来)は、離脱その
+                    #   ものを有限時間だけ保留し、並走が解消してから通常のgiveup
+                    #   処理(状態遷移・オフセットゼロ化を含め無変更)を実行する。
+                    #   footprint_risk(緊急反応系トリガー)はここで除外し、現行どおり
+                    #   即座に処理する(82/83節の教訓、安全反応系の遅延は厳禁)。
+                    #   ゲートOFF(既定)時は_giveup_nowの値をそのまま使う=現行動作と
+                    #   ビット等価。
+                    if (self._ot_pending_disengage_enabled and _giveup_now
+                            and not _lat_dec.footprint_risk_triggered):
+                        if self._update_overlap_state(_opp_sit.fwd_ds):
+                            self._ot_pending_disengage_count += 1
+                            if self._ot_pending_disengage_count == 1:
+                                self.get_logger().warn(
+                                    f"[PENDING-DISENGAGE] start side={_locked} "
+                                    f"wp={self._mpc.model.wp_id}")
+                            if (self._ot_pending_disengage_count
+                                    < self._ot_pending_disengage_max_cycles):
+                                _giveup_now = False  # 今回は保留、OVERTAKING継続
+                            else:
+                                # 安全弁(必須): 無期限保留を禁止する。並走が解消して
+                                #   いなくても強制的に通常のgiveup処理へ合流する。
+                                self.get_logger().warn(
+                                    f"[PENDING-DISENGAGE] resolved reason=forced_fallback "
+                                    f"pending_count={self._ot_pending_disengage_count} "
+                                    f"wp={self._mpc.model.wp_id}")
+                        else:
+                            if self._ot_pending_disengage_count > 0:
+                                self.get_logger().warn(
+                                    f"[PENDING-DISENGAGE] resolved reason=natural_overlap_clear "
+                                    f"pending_count={self._ot_pending_disengage_count} "
+                                    f"wp={self._mpc.model.wp_id}")
+                            self._ot_pending_disengage_count = 0
+                    else:
+                        # 2026-08-06追加(must-fix 2、外部AIレビュー): giveup条件自体が
+                        #   不成立の周期は、以前の保留エピソードの残存カウントを必ず
+                        #   0へ戻す(次の[無関係な理由による]giveupへ引き継がない)。
+                        self._ot_pending_disengage_count = 0
+                    if _giveup_now:
+                        self._ot_pending_disengage_count = 0
                         # 案B(2026-07-11): 「側消失」による離脱のみ、次回再エンゲージでの
                         #   反転抑制ヒステリシス用に側・対象車・時刻を記録する。giveup(相手が
                         #   速すぎる)は側と無関係の理由のため対象外(再選択して問題ない)。

@@ -308,12 +308,14 @@ def test_reset_helper_resets_invalid_corr_count():
     assert "self._ot_overlap_floor_invalid_corr_count = 0" in snippet
 
 
-def test_reset_helper_called_from_four_known_sites():
+def test_reset_helper_called_from_five_known_sites():
     """側反転・rescue側反転・新規エンゲージ・STUCK復帰(_reset_ot_side_for_
-    fresh_replan経由)の計4箇所から呼ばれていることを確認する。"""
+    fresh_replan経由)・STUCK突入時(_stuck_enter_wait_reverse、Fix C §3.4
+    外部AIレビュー推奨4、2026-08-07追加)の計5箇所から呼ばれていることを
+    確認する。"""
     n_calls = _SRC.count("self._reset_ot_episode_tracking_state()")
-    assert n_calls == 4, (
-        f"想定していた4箇所から数が変わっている(現在{n_calls}箇所)。"
+    assert n_calls == 5, (
+        f"想定していた5箇所から数が変わっている(現在{n_calls}箇所)。"
         "新しい離脱経路が追加/削除された場合はこのテスト自体の更新も必要。")
 
 

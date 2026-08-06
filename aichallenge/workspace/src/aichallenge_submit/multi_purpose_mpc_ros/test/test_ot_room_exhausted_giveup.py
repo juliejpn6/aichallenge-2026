@@ -173,9 +173,15 @@ def test_room_exhausted_does_not_introduce_a_new_state_transition_path():
     """_room_exhaustedはブール値として_side_blockedへ折り込まれるだけで、
     その後のSTOPPING遷移・cooldown設定・prev_side記録等は既存の
     if (giveup_count>=cycles or locked==0 or side_blocked) 分岐を
-    無変更のまま通ることを確認する(新しい状態遷移コードパスを増やしていない)。"""
+    無変更のまま通ることを確認する(新しい状態遷移コードパスを増やしていない)。
+
+    2026-08-07改訂(Fix C、design_docs opp_lat_pred_overlap_guard_design_
+    20260806.md §3): 元の条件式はそのまま_giveup_now変数へ代入されるよう
+    リファクタされた(Fix Cが並走中のみ_giveup_nowをFalseへ上書きできる
+    ようにするための構造変更)。ブール式自体(3条件のOR)は一切変更していない
+    ことを確認する。"""
     idx = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
     idx_end = idx + 400
     snippet = _SRC[idx:idx_end]
-    assert ("if (self._ot_giveup_count >= self._ot_giveup_cycles\n"
-            "                            or _locked == 0 or _side_blocked):") in snippet
+    assert ("_giveup_now = (self._ot_giveup_count >= self._ot_giveup_cycles\n"
+            "                                    or _locked == 0 or _side_blocked)") in snippet

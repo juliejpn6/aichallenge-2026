@@ -348,9 +348,17 @@ overtake:
   #   判定だったが、オフライン反実仮想検証で動機事例に一度も到達しないと
   #   判明し、self._ot_state=="OVERTAKING"全体をスコープにする方式へ変更した
   #   (§14)。
-  overlap_floor_enabled: false
-  overlap_margin_m: 0.5           # [m] 並走判定のヒステリシス幅。Fix B(オフセット床)は§14の再設計で不使用、Fix C(未実装、離脱保留)専用として温存
+  overlap_floor_enabled: true  # 2026-08-07: §14.6 dev3ローカル検証(Phase 2)開始、Fix A' ON土台+Fix B ON側n=1本目
+  overlap_margin_m: 0.5           # [m] 並走判定のヒステリシス幅。Fix B(オフセット床)は§14の再設計で不使用、Fix C(離脱保留)専用
   overlap_corr_margin_m: 0.1      # [m] Fix Bの床をcorr_boundで再キャップする際のマージン
+  # 2026-08-07追加(Fix C、design_docs opp_lat_pred_overlap_guard_design_20260806.md
+  #   §3): 並走中(縦オーバーラップ中)の非緊急giveup(room_exhausted・
+  #   opponent_too_fast由来)は、離脱そのものを有限時間だけ保留し、並走が
+  #   解消してから通常のgiveup処理を実行する。footprint_risk等の緊急系は
+  #   対象外(現行どおり即座に処理)。既定false=現行のままビット等価
+  #   (Fix A/Bとは独立ゲート、段階導入)。
+  pending_disengage_enabled: false
+  pending_disengage_max_cycles: 80  # [周期] giveup_cycles(40)*2≈2秒。無期限保留を禁止する必須の安全弁
   max_consider: 20.0      # [m] この弧長より遠い前方他車は判断に使わない
   v_cap: 6.0              # [m/s] 追い越し中の速度上限
   exit_clear: 3           # 前方クリアがこの回数連続で OVERTAKING→NORMAL 復帰(ヒステリシス)
