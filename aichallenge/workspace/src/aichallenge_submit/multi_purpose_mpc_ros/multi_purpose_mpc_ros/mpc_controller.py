@@ -874,6 +874,15 @@ class MPCController(Node):
             #   差分のままビット等価(段階導入、実験後false復元必須)。
             self._ot_lat_vel_source_tracker = bool(
                 _otget("lat_vel_source_tracker", False))
+            # 2026-08-07追加(Fix B、design_docs opp_lat_pred_overlap_guard_design_
+            #   20260806.md §2): 並走中(縦オーバーラップ中)はtarget_magを
+            #   opp_lat_predのノイズで縮小させないオフセット床。既定false=現行の
+            #   ままビット等価(段階導入、Fix Aとは独立ゲート)。
+            self._ot_overlap_floor_enabled = bool(
+                _otget("overlap_floor_enabled", False))
+            self._ot_overlap_margin_m = float(_otget("overlap_margin_m", 0.5))
+            self._ot_overlap_corr_margin_m = float(
+                _otget("overlap_corr_margin_m", 0.1))
             self._ot_max_consider = float(_otget("max_consider", 40.0))  # [m] 前方弧長の上限
             self._ot_v_cap = float(_otget("v_cap", 6.0))            # [m/s] 追い越し中の速度上限
             self._ot_exit_clear = int(_otget("exit_clear", 3))
@@ -1013,6 +1022,10 @@ class MPCController(Node):
             #   周期に、必要最小オフセット(min_needed_mag)の直近有効値を凍結保持するための値。
             #   上の_ot_last_valid_target_mag(corr_bound用)とは別軸の値のため独立管理する。
             self._ot_last_valid_min_needed_mag = None
+            # 2026-08-07追加(Fix B): 並走判定・オフセット床の専用状態
+            #   (design_docs opp_lat_pred_overlap_guard_design_20260806.md §2)。
+            self._ot_overlapping = False
+            self._ot_overlap_floor_mag = None
             # 2026-08-05追加(299節続報、task#293候補①: ユーザー指摘「相手も走行しているので
             #   次の瞬間にかわそうとしていた相手はもうそこにはいない」「車速を意識した
             #   オーバーテイク処理」): min_needed_mag計算(対象車の現在横位置ベース)は
@@ -1922,14 +1935,9 @@ class MPCController(Node):
         # 2026-07-24追加(168節): 側を仕切り直す以上、旧側で積み上がっていた
         #   room_exhausted計数・凍結オフセットも持ち越さない(次の側選択と無関係な値)。
         self._ot_room_exhausted_count = 0
-        self._ot_last_valid_target_mag = None
-        self._ot_last_valid_min_needed_mag = None
-        # 2026-08-05追加(299節続報、task#293候補①): 側を仕切り直すので対象車の
-        #   横方向速度推定も持ち越さない(新しい対象車について仕切り直す)。
-        self._ot_opp_lat_prev = None
-        self._ot_opp_lat_prev_vid = None
-        self._ot_opp_lat_vel_ema = None
-        self._ot_opp_lat_warmup_count = 0
+        # 2026-08-07追加(Fix B、design_docs...20260806.md §4): 側を仕切り直す
+        #   ので対象車の横方向速度推定・並走床も持ち越さない(統合ヘルパー)。
+        self._reset_ot_episode_tracking_state()
         self._reset_ot_offset_state()
 
     def _reset_ot_offset_state(self) -> None:
@@ -1951,6 +1959,83 @@ class MPCController(Node):
         self._ot_alpha = 0.0
         self._mpc.lateral_target = 0.0
         self._mpc.lateral_blend = 0.0
+
+    def _reset_ot_episode_tracking_state(self) -> None:
+        """側変更・新規エンゲージ・OVERTAKING離脱(STUCK復帰含む)の全ての契機で
+        共通に呼ぶ、エピソード単位の追跡状態リセット(design_docs
+        opp_lat_pred_overlap_guard_design_20260806.md §4、4箇所の重複実装を
+        統合)。Fix Bの専用床変数(_ot_overlap_floor_mag、外部AIレビュー
+        must-fix 1)もここでリセットする。_ot_side/_ot_side_locked/
+        _ot_giveup_count/_ot_room_exhausted_count等(呼び出し元で個別に
+        正しくリセット済み)には一切触れない(責務の分離、_reset_ot_offset_state
+        と同じ原則)。"""
+        self._ot_last_valid_target_mag = None
+        self._ot_last_valid_min_needed_mag = None
+        self._ot_opp_lat_prev = None
+        self._ot_opp_lat_prev_vid = None
+        self._ot_opp_lat_vel_ema = None
+        self._ot_opp_lat_warmup_count = 0
+        self._ot_overlapping = False
+        self._ot_overlap_floor_mag = None
+
+    def _update_overlap_state(self, opp_ds_now) -> bool:
+        """対象車と縦方向にオーバーラップ中(=並走中)かをヒステリシス付きで
+        判定する(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+        §2.1)。Fix B(オフセット床)・将来のFix C(離脱保留)の両方から呼ばれる
+        想定の共通判定(同一動作を複数箇所に重複実装しない)。footprint_risk
+        判定(_footprint_risk、abs(fwd_ds)<along_min_length)と同じ物理的下限
+        (along_min_length=カート全長)を再利用し、新規の距離定数は導入しない。
+        侵入判定(enter)より解除判定(exit)を広く取り、境界での毎周期
+        チャタリングを防ぐ。データ欠損時(opp_ds_now is None、対象車が一時的に
+        視野外)は、直前の状態を維持する(保守側)。"""
+        if opp_ds_now is None:
+            return self._ot_overlapping
+        enter_thr = self._along_min_length + self._ot_overlap_margin_m
+        exit_thr = self._along_min_length + self._ot_overlap_margin_m * 2.0
+        d = abs(opp_ds_now)
+        self._ot_overlapping = (
+            d < exit_thr if self._ot_overlapping else d < enter_thr)
+        return self._ot_overlapping
+
+    def _apply_overlap_floor(self, target_mag: float, opp_ds_now,
+                              corr_bound: float) -> float:
+        """Fix B(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+        §2.2): 並走中はtarget_magを縮小させない。床は並走エピソード専用の
+        新規状態(self._ot_overlap_floor_mag、ピーク保持=単調非減少)を使う
+        ——168節のcorr_bound崩壊対策フリーズ値(_ot_last_valid_target_mag)
+        とは別変数にし、意味論の衝突(同一変数が「コリドー崩壊対策」と
+        「並走ガード」の二重の意味を持つことによるバグ)を避ける(外部AI
+        レビューmust-fix 1)。
+
+        不変条件:
+          - 床は同一並走エピソード内で単調非減少(下がらない)。
+          - 床適用後のtarget_magは、常に「現在のcorr_bound - マージン」以下
+            (=床がコリドーの壁を突き破ることは原理的に発生しない、今周期の
+            実測corr_boundで毎回再キャップするため)。
+
+        ゲートOFF(既定)時は_update_overlap_state()の呼び出しも含め早期
+        returnし、target_magを完全に無変更で返す(全ゲートOFF時のビット
+        等価性を保証)。"""
+        if not self._ot_overlap_floor_enabled:
+            return target_mag
+        overlapping = self._update_overlap_state(opp_ds_now)
+        if not overlapping:
+            return target_mag
+        _before = target_mag
+        self._ot_overlap_floor_mag = max(
+            self._ot_overlap_floor_mag or 0.0, target_mag)
+        floor = self._ot_overlap_floor_mag
+        if np.isfinite(corr_bound) and corr_bound > 0.0:
+            floor = min(floor, corr_bound - self._ot_overlap_corr_margin_m)
+        target_mag = max(target_mag, floor)
+        if target_mag > _before:
+            # エッジトリガー(床が実際に効いた周期のみ)、並走中毎周期の
+            #   ログ氾濫を避ける(design_docs §9.2)。
+            self.get_logger().info(
+                f"[OVERLAP-FLOOR] side={self._ot_side} floor={floor:.3f} "
+                f"target_mag_before={_before:.3f} target_mag_after={target_mag:.3f} "
+                f"corr_bound={corr_bound:.3f} wp={self._mpc.model.wp_id}")
+        return target_mag
 
     def _stuck_update_shuffle_cycle(self, now, pose) -> None:
         """184節追加(2026-07-26): 新規STUCK検知(WAIT_REVERSE突入)が、直前の
@@ -6376,14 +6461,9 @@ class MPCController(Node):
                         # 2026-07-24追加(168節): 側反転につき、旧側のroom_exhausted計数・
                         #   凍結オフセットは新側と無関係なので持ち越さない。
                         self._ot_room_exhausted_count = 0
-                        self._ot_last_valid_target_mag = None
-                        self._ot_last_valid_min_needed_mag = None
-                        # 2026-08-05追加(299節続報、task#293候補①): 側反転につき対象車の
-                        #   横方向速度推定も持ち越さない。
-                        self._ot_opp_lat_prev = None
-                        self._ot_opp_lat_prev_vid = None
-                        self._ot_opp_lat_vel_ema = None
-                        self._ot_opp_lat_warmup_count = 0
+                        # 2026-08-07追加(Fix B、design_docs...20260806.md §4): 側反転に
+                        #   つき対象車の横方向速度推定・並走床も持ち越さない(統合ヘルパー)。
+                        self._reset_ot_episode_tracking_state()
                         # 2026-07-14追加: 側が入れ替わったので_ot_clearedもリセットする。
                         #   他の側変更点(STOPPING遷移・NORMAL復帰・infeasible-stop)は全て
                         #   _ot_cleared=Falseを伴っており、ここだけ漏れていた。本節で
@@ -6524,14 +6604,10 @@ class MPCController(Node):
                                 self._ot_side_locked = _locked
                                 self._ot_alpha = 0.0
                                 self._ot_room_exhausted_count = 0
-                                self._ot_last_valid_target_mag = None
-                                self._ot_last_valid_min_needed_mag = None
-                                # 2026-08-05追加(299節続報、task#293候補①): rescue側反転につき
-                                #   対象車の横方向速度推定も持ち越さない。
-                                self._ot_opp_lat_prev = None
-                                self._ot_opp_lat_prev_vid = None
-                                self._ot_opp_lat_vel_ema = None
-                                self._ot_opp_lat_warmup_count = 0
+                                # 2026-08-07追加(Fix B、design_docs...20260806.md §4):
+                                #   rescue側反転につき対象車の横方向速度推定・並走床も
+                                #   持ち越さない(統合ヘルパー)。
+                                self._reset_ot_episode_tracking_state()
                                 self._ot_cleared = False
                                 self._ot_reacquire_count = 0
                                 self.get_logger().warn(
@@ -6712,15 +6788,10 @@ class MPCController(Node):
                         # 2026-07-24追加(168節): 新規エンゲージにつき、前回エピソード
                         #   (別側/別相手)のroom_exhausted計数・凍結オフセットは持ち越さない。
                         self._ot_room_exhausted_count = 0
-                        self._ot_last_valid_target_mag = None
-                        self._ot_last_valid_min_needed_mag = None
-                        # 2026-08-05追加(299節続報、task#293候補①): 新規エンゲージにつき
-                        #   対象車の横方向速度推定も持ち越さない(前回の対象車の値を
-                        #   引きずらない)。
-                        self._ot_opp_lat_prev = None
-                        self._ot_opp_lat_prev_vid = None
-                        self._ot_opp_lat_vel_ema = None
-                        self._ot_opp_lat_warmup_count = 0
+                        # 2026-08-07追加(Fix B、design_docs...20260806.md §4): 新規
+                        #   エンゲージにつき対象車の横方向速度推定・並走床も持ち越さ
+                        #   ない(前回の対象車の値を引きずらない、統合ヘルパー)。
+                        self._reset_ot_episode_tracking_state()
                         self._lat_ttc.reset_episode()  # シャドウ検証(2026-07-11): 新規エンゲージ毎にリセット
                         # 2026-07-17追加(97節): line_cap EMAも新規エンゲージ毎に仕切り直す
                         #   (前回のオーバーテイクの平滑化値を持ち越さない、既存原則の踏襲)。
@@ -7062,6 +7133,13 @@ class MPCController(Node):
                         _target_mag = self._ot_last_valid_target_mag
                     else:
                         _target_mag = 0.0
+                # 2026-08-07追加(Fix B、design_docs...20260806.md §2.3-1): 並走中
+                #   (縦オーバーラップ中)はtarget_magをopp_lat_predのノイズで縮小
+                #   させない。既存のコリドー崩壊フリーズ処理(直前)より後、
+                #   lateral_target確定(直後)より前で呼ぶ(今周期のcorr_bound値を
+                #   利用するため)。
+                _target_mag = self._apply_overlap_floor(
+                    _target_mag, _opp_ds_now, _corr_bound)
                 self._mpc.lateral_target = float(self._ot_side) * _target_mag
                 _lat_active_side = self._ot_side
             # 2026-07-22追加(160節続報、issue⑤①: STOPPING中の能動的空き確保、issue⑤
@@ -7083,6 +7161,11 @@ class MPCController(Node):
                 _target_mag = self._ot_proactive_bias_max
                 if np.isfinite(_corr_bound):
                     _target_mag = min(_target_mag, max(0.0, _corr_bound))
+                # 2026-08-07追加(Fix B、design_docs...20260806.md §2.3-2): STOPPING/
+                #   proactive-bias分岐でも同様に適用。対象車のds値は既存の
+                #   _scan["fwd_ds"](_fwd_ds、新規計算なし)を再利用する。
+                _target_mag = self._apply_overlap_floor(
+                    _target_mag, _fwd_ds, _corr_bound)
                 self._mpc.lateral_target = float(_eval.plan_side) * _target_mag
                 _a_target = 1.0
                 _lat_active_side = _eval.plan_side

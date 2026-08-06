@@ -64,24 +64,30 @@ def test_reset_helper_also_clears_room_exhausted_state():
 
 def test_switchback_side_flip_resets_room_exhausted_state():
     """side_override(電撃switchback)で側が反転した際も、旧側の計数・凍結値を
-    新側へ持ち越さないことを確認する(alpha=0.0の再ランプと同一箇所)。"""
+    新側へ持ち越さないことを確認する(alpha=0.0の再ランプと同一箇所)。
+    2026-08-07改訂(Fix B、design_docs...20260806.md §4): 個別の
+    self._ot_last_valid_target_mag = None行は共通ヘルパー
+    _reset_ot_episode_tracking_state()呼び出しへ統合された。"""
     idx = _SRC.index("_locked = _lat_dec.side_override")
     idx_end = idx + 700
     snippet = _SRC[idx:idx_end]
     assert 'self._ot_alpha = 0.0' in snippet
     assert "self._ot_room_exhausted_count = 0" in snippet
-    assert "self._ot_last_valid_target_mag = None" in snippet
+    assert "self._reset_ot_episode_tracking_state()" in snippet
 
 
 def test_fresh_engage_resets_room_exhausted_state():
     """新規エンゲージ(state=OVERTAKINGへの遷移)でも、前回エピソード
-    (別側・別相手)の計数・凍結値を持ち越さないことを確認する。"""
+    (別側・別相手)の計数・凍結値を持ち越さないことを確認する。
+    2026-08-07改訂(Fix B、design_docs...20260806.md §4): 個別の
+    self._ot_last_valid_target_mag = None行は共通ヘルパー
+    _reset_ot_episode_tracking_state()呼び出しへ統合された。"""
     idx = _SRC.index('self._ot_state = "OVERTAKING"')
-    idx_end = idx + 500
+    idx_end = idx + 700
     snippet = _SRC[idx:idx_end]
     assert "self._ot_giveup_count = 0" in snippet
     assert "self._ot_room_exhausted_count = 0" in snippet
-    assert "self._ot_last_valid_target_mag = None" in snippet
+    assert "self._reset_ot_episode_tracking_state()" in snippet
 
 
 # ---------------------------------------------------------------------------

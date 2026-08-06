@@ -78,9 +78,14 @@ def test_new_freeze_variable_is_independent_from_corr_bound_freeze_variable():
 def test_reset_site_count_matches_sibling_variable():
     """新変数のリセット箇所数が、既存のきょうだい変数(_ot_last_valid_target_mag)の
     リセット箇所数と一致すること(新規エピソード開始点を漏れなく網羅しているかの
-    網羅性チェック、将来どちらかだけ増減した際の検知用)。"""
+    網羅性チェック、将来どちらかだけ増減した際の検知用)。
+
+    2026-08-07改訂(Fix B、design_docs opp_lat_pred_overlap_guard_design_
+    20260806.md §4): 従来個別に4リセット箇所に重複実装されていたブロックを
+    共通ヘルパー_reset_ot_episode_tracking_state()へ統合したため、実際の
+    ソース上の出現数は「__init__(1) + ヘルパー定義内(1)」の2箇所に減る。"""
     n_new = _SRC.count("self._ot_last_valid_min_needed_mag = None")
     n_sibling = _SRC.count("self._ot_last_valid_target_mag = None")
-    assert n_new == n_sibling == 5, (
-        f"想定は両方5箇所(__init__+4リセット箇所)だが "
+    assert n_new == n_sibling == 2, (
+        f"想定は両方2箇所(__init__+ヘルパー定義)だが "
         f"min_needed_mag={n_new}, target_mag={n_sibling}")

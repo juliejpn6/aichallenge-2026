@@ -168,10 +168,14 @@ def test_rescue_uses_corr_bound_ahead_for_opposite_side():
 def test_rescue_success_resets_same_state_as_normal_switchback_side_flip():
     """救済成立時のmpc_controller.py側リセットが、通常のswitchback側反転
     (side_override成立時)と同一の状態変数集合であることを確認する
-    (①非矛盾性: 側が変わったという事実への後始末は1種類のみ)。"""
+    (①非矛盾性: 側が変わったという事実への後始末は1種類のみ)。
+    2026-08-07改訂(Fix B、design_docs...20260806.md §4): 個別の
+    self._ot_last_valid_target_mag = None行は共通ヘルパー
+    _reset_ot_episode_tracking_state()呼び出しへ統合された。"""
     snippet = _rescue_block_snippet()
     for field in ("self._ot_side_locked = _locked", "self._ot_alpha = 0.0",
-                  "self._ot_room_exhausted_count = 0", "self._ot_last_valid_target_mag = None",
+                  "self._ot_room_exhausted_count = 0",
+                  "self._reset_ot_episode_tracking_state()",
                   "self._ot_cleared = False", "self._ot_reacquire_count = 0"):
         assert field in snippet
 

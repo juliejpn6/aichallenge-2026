@@ -108,15 +108,18 @@ def test_warmup_config_key_exists_with_default():
 # ---------------------------------------------------------------------------
 
 def test_warmup_count_reset_site_count_matches_sibling_variable():
-    """_ot_opp_lat_warmup_countのリセット箇所数(__init__+4リセット箇所=5)が、
-    既存のきょうだい変数_ot_opp_lat_vel_emaのリセット箇所数と一致すること
-    (本体ロジック内のコールドスタートリセット1箇所は両方に共通して存在するため
-    カウント対象外、__init__+4エピソードリセット箇所のみを比較する)。"""
+    """_ot_opp_lat_warmup_countのリセット箇所数が、既存のきょうだい変数
+    _ot_opp_lat_vel_emaのリセット箇所数と一致すること。
+
+    2026-08-07改訂(Fix B、design_docs opp_lat_pred_overlap_guard_design_
+    20260806.md §4): 従来個別に4リセット箇所(側反転/rescue反転/新規
+    エンゲージ/STUCK復帰)に重複実装されていたブロックを、共通ヘルパー
+    _reset_ot_episode_tracking_state()へ統合した。そのため実際のソース上の
+    出現数は「__init__(1) + ヘルパー定義内(1) + 本体ロジック内の
+    コールドスタートリセット1箇所」の3箇所に減る(4リセット箇所は
+    ヘルパー呼び出し1行に置き換わったため、個別カウントには現れない)。"""
     n_new = _SRC.count("self._ot_opp_lat_warmup_count = 0")
     n_sibling = _SRC.count("self._ot_opp_lat_vel_ema = None")
-    # _ot_opp_lat_vel_ema=Noneは5箇所(__init__+4リセット)+本体ロジック内の
-    #   コールドスタートリセット1箇所=6箇所。_ot_opp_lat_warmup_count=0は
-    #   同じ6箇所(本体ロジックのコールドスタート時も0へ戻す)に存在するはず。
-    assert n_new == n_sibling == 6, (
-        f"想定は両方6箇所(__init__+4リセット箇所+本体コールドスタート1箇所)だが "
+    assert n_new == n_sibling == 3, (
+        f"想定は両方3箇所(__init__+ヘルパー定義+本体コールドスタート)だが "
         f"warmup_count={n_new}, vel_ema={n_sibling}")
