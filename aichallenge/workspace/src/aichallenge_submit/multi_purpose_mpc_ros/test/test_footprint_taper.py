@@ -278,7 +278,7 @@ def test_source_taper_logs_footprint_taper_debug_field():
     snippet = _taper_block_snippet()
     assert '_fwd_dbg["footprint_taper"]' in snippet
     idx = _SRC.index('f"[OT] state=')
-    idx_end = idx + 2500
+    idx_end = idx + 2700  # 2026-08-06(Fix A'診断lat_vel_src追加): 2500->2700再拡大(検証対象は無変更)
     ot_log_snippet = _SRC[idx:idx_end]
     assert "fp_taper={_fwd_dbg.get('footprint_taper')}" in ot_log_snippet
 

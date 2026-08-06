@@ -107,7 +107,10 @@ def test_lateral_target_uses_corr_bound_ahead_helper():
     # 2026-08-05追加(診断ログ、opp_lat_predクランプ張り付き問題調査): opp_wp/
     #   opp_raw_lat_velの診断フィールド代入が間に挿入されたため、窓を8000→8600へ
     #   再拡大(検証対象そのものは無変更)。
-    snippet = _SRC[max(0, idx - 8600):idx]
+    # 2026-08-06追加(Fix A'、design_docs opp_lat_pred_overlap_guard_design_
+    #   20260806.md): 対象車横速度推定のtracker.velocity()経路+片側利用+変位物理
+    #   拘束のブロックが間に挿入されたため、窓を8600→12500へ再拡大(検証対象は無変更)。
+    snippet = _SRC[max(0, idx - 12500):idx]
     assert "self._corr_bound_ahead(self._ot_side)" in snippet
 
 

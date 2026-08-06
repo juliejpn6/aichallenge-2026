@@ -285,7 +285,7 @@ def test_source_ot_log_includes_proactive_bias_side_field():
     idx = _SRC.index('_fwd_dbg["proactive_bias_side"]')
     assert idx > 0
     idx_log = _SRC.index('f"[OT] state=')
-    log_snippet = _SRC[idx_log:idx_log + 2500]
+    log_snippet = _SRC[idx_log:idx_log + 2900]  # 2026-08-06(Fix A'診断lat_vel_src追加): 2500->2900再拡大(検証対象は無変更)
     assert "proactive_bias_side={_fwd_dbg.get('proactive_bias_side')}" in log_snippet
 
 

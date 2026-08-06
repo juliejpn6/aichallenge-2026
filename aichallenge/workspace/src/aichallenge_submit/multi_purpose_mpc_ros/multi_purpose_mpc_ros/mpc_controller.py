@@ -865,6 +865,15 @@ class MPCController(Node):
             self._ot_min_needed_lat_vel_warmup_cycles = self._rate_scaled_cycles(
                 "min_needed_lat_vel_warmup_cycles",
                 int(_otget("min_needed_lat_vel_warmup_cycles", 20)))  # [周期] これ未満は予測を使わない(≈0.5s@40Hz)
+            # 2026-08-06追加(Fix A'、design_docs opp_lat_pred_overlap_guard_design_
+            #   20260806.md): 対象車横方向速度の自前差分(40Hz固定dtで13Hz階段状の
+            #   V2X位置を割る、19節で確定したエイリアシング誤差)を、既存のV2X
+            #   トラッカー速度推定(窓端点差分、v2x_vehicle_tracker.py)の再利用へ
+            #   置き換える。あわせて予測の片側利用(投機的なクリアランス縮小を
+            #   許さない、6.9節)も同一ゲートで有効化する。既定false=現行の自前
+            #   差分のままビット等価(段階導入、実験後false復元必須)。
+            self._ot_lat_vel_source_tracker = bool(
+                _otget("lat_vel_source_tracker", False))
             self._ot_max_consider = float(_otget("max_consider", 40.0))  # [m] 前方弧長の上限
             self._ot_v_cap = float(_otget("v_cap", 6.0))            # [m/s] 追い越し中の速度上限
             self._ot_exit_clear = int(_otget("exit_clear", 3))
@@ -3344,6 +3353,28 @@ class MPCController(Node):
         changed = current_vid != getattr(self, prev_attr)
         setattr(self, prev_attr, current_vid)
         return changed
+
+    def _estimate_opp_lateral_velocity(self, vid, wp) -> Optional[float]:
+        """Fix A'(2026-08-06、design_docs opp_lat_pred_overlap_guard_design_
+        20260806.md 1.3節): 対象車の横方向速度を、自前の位置差分ではなく
+        V2Xトラッカーの既存の速度推定(窓端点差分、v2x_vehicle_tracker.py、
+        13Hzエイリアシング耐性を持つ既存資産)から、対象車自身の最近傍
+        waypoint方位角基準で横方向へ射影して求める。_scan_traffic()の
+        v_long計算(同ファイル内、cos(wp.psi)*vx+sin(wp.psi)*vy)と対になる
+        直交成分(-sin(wp.psi)*vx+cos(wp.psi)*vy)であり、新規の速度源は
+        追加しない。
+
+        未観測vid・速度窓未充足時、tracker.velocity()は(0.0, 0.0)を返す
+        実装(v2x_vehicle_tracker.py:116-117)だが、「相手速度0」と
+        「データなし」を混同しないよう、is_settled()で窓充足を確認できない
+        場合はNoneを返し、呼び出し側は外挿なし(pred=lat_now)へ安全側
+        フォールバックする(must-fix 3、外部AIレビュー2026-08-06)。"""
+        import math as _math
+        tracker = getattr(self, "_v2x_tracker", None)
+        if tracker is None or not tracker.is_settled(vid):
+            return None
+        vx, vy = tracker.velocity(vid)
+        return -_math.sin(wp.psi) * vx + _math.cos(wp.psi) * vy
 
     def _scan_traffic(self, v_ego: float, ego_lat: float):
         """統一検知: トラッカー全車(現在位置+平滑速度)を1回だけ走査し、追い越し判断・ICC追従・
@@ -6873,7 +6904,32 @@ class MPCController(Node):
                     #   0.05・≈1秒@40Hzを流用、新規チューニング値は増やさない)して自前で
                     #   推定する。対象車が切り替わった直後は推定をリセットし外挿しない
                     #   (安全側、前の相手の値を引きずらない)。
-                    if (self._ot_opp_lat_prev is not None
+                    # 2026-08-06追加(Fix A'、design_docs opp_lat_pred_overlap_guard_
+                    #   design_20260806.md 1.4節): ゲートONなら自前差分をやめ、
+                    #   V2Xトラッカーの既存速度推定(13Hzエイリアシング耐性あり)を
+                    #   再利用する。ゲートOFF(既定)時は以下のelse節で旧実装を
+                    #   一切変更せず実行し、現行とビット等価を保つ(段階導入)。
+                    if self._ot_lat_vel_source_tracker:
+                        _opp_wp_obj = (
+                            self._reference_path.waypoints[_opp_wp_now]
+                            if _opp_wp_now is not None else None)
+                        _lat_vel_est = (
+                            self._estimate_opp_lateral_velocity(
+                                self._ot_target_vid, _opp_wp_obj)
+                            if _opp_wp_obj is not None else None)
+                        _fwd_dbg["opp_raw_lat_vel"] = (
+                            round(_lat_vel_est, 3) if _lat_vel_est is not None else None)
+                        if _lat_vel_est is not None:
+                            _lat_vel_est = max(
+                                -self._ot_min_needed_lat_vel_clamp,
+                                min(self._ot_min_needed_lat_vel_clamp, _lat_vel_est))
+                        # フィールド名は旧実装(EMA)のまま再利用する(意味は「対象車の
+                        #   現在の横速度推定値」で共通のため、新規状態変数は増やさない)。
+                        self._ot_opp_lat_vel_ema = _lat_vel_est
+                        self._ot_opp_lat_warmup_count = (
+                            self._ot_min_needed_lat_vel_warmup_cycles
+                            if _lat_vel_est is not None else 0)
+                    elif (self._ot_opp_lat_prev is not None
                             and self._ot_opp_lat_prev_vid == self._ot_target_vid):
                         _dt = 1.0 / self._cfg.mpc.control_rate  # type: ignore
                         _raw_lat_vel = (_opp_lat_now - self._ot_opp_lat_prev) / _dt
@@ -6924,14 +6980,44 @@ class MPCController(Node):
                             and self._ot_opp_lat_warmup_count
                                 >= self._ot_min_needed_lat_vel_warmup_cycles):
                         _opp_lat_pred = _opp_lat_now + self._ot_opp_lat_vel_ema * _t_reach
+                        if self._ot_lat_vel_source_tracker:
+                            # 2026-08-06追加(Fix A'、6.9節): 変位の物理拘束。速度クランプ
+                            #   (既定±2.0m/s)×t_reach上限(既定1.5s)から導く既存定数の
+                            #   積であり、新規マジックナンバーを増やさない。速度クランプが
+                            #   既に上流で効いていれば通常は自明に満たされるが、外挿の
+                            #   合計変位量そのものにも明示的な上限を設けることで、計算経路の
+                            #   変更に対しても不変条件を保証する(単体テストで検証)。
+                            _max_disp = (self._ot_min_needed_lat_vel_clamp
+                                         * self._ot_min_needed_horizon_cap_s)
+                            _disp = max(-_max_disp, min(
+                                _max_disp, _opp_lat_pred - _opp_lat_now))
+                            _opp_lat_pred = _opp_lat_now + _disp
                     else:
                         _opp_lat_pred = _opp_lat_now
                     _fwd_dbg["opp_lat_pred"] = round(_opp_lat_pred, 3)
                     _fwd_dbg["t_reach"] = round(_t_reach, 3)
+                    _fwd_dbg["lat_vel_src"] = (
+                        "tracker" if self._ot_lat_vel_source_tracker else "diff")
                     _clear_needed = self._mpc.model.width / 2.0 + self._ot_block_half
-                    _target_mag = max(0.0, min(
-                        self._ot_d_off,
-                        float(self._ot_side) * _opp_lat_pred + _clear_needed))
+                    if self._ot_lat_vel_source_tracker:
+                        # 2026-08-06追加(Fix A'、6.9節、外部AIレビュー「片側利用」):
+                        #   予測(_opp_lat_pred)は相手が接近してくる方向(必要クリアランス
+                        #   増加)にのみ使い、相手が離れていくという投機的な予測で必要
+                        #   クリアランスを縮めない。現在位置ベースの必要量を常に下限として
+                        #   保証する(Phase 1実データ検証で確認した「t_reach外挿の無効な
+                        #   モデルにより必要クリアランスが過小評価され衝突を招く」故障
+                        #   モードを構造的に排除する)。
+                        _need_from_pred = max(0.0, min(
+                            self._ot_d_off,
+                            float(self._ot_side) * _opp_lat_pred + _clear_needed))
+                        _need_from_now = max(0.0, min(
+                            self._ot_d_off,
+                            float(self._ot_side) * _opp_lat_now + _clear_needed))
+                        _target_mag = max(_need_from_pred, _need_from_now)
+                    else:
+                        _target_mag = max(0.0, min(
+                            self._ot_d_off,
+                            float(self._ot_side) * _opp_lat_pred + _clear_needed))
                     self._ot_last_valid_min_needed_mag = _target_mag
                 elif self._ot_last_valid_min_needed_mag is not None:
                     # 2026-08-05修正(298節続報、ユーザー指摘「コーナーアウトからの追い越しで
@@ -7904,6 +7990,9 @@ class MPCController(Node):
                         #   一切なし、外部AI相談で最有力とされた仮説(waypoint切り替えに
                         #   よるフレーム回転混入)を実測データで検証するためのログのみ。
                         f"opp_wp={_fwd_dbg.get('opp_wp')} opp_raw_lat_vel={_fwd_dbg.get('opp_raw_lat_vel')} "
+                        # 2026-08-06追加(Fix A'、opp_raw_lat_velの出処[旧自前差分/新
+                        #   tracker.velocity()射影]を事後に判別するためのマーカー)。
+                        f"lat_vel_src={_fwd_dbg.get('lat_vel_src')} "
                         f"corr[ub0={_fwd_dbg.get('corr_ub0')} lb0={_fwd_dbg.get('corr_lb0')} "
                         f"xr0={_fwd_dbg.get('corr_xr0')} wmin={_fwd_dbg.get('corr_wmin')} "
                         f"src={_fwd_dbg.get('corr_src')} nseg0/1/2={_fwd_dbg.get('nseg0')}/{_fwd_dbg.get('nseg1')}/{_fwd_dbg.get('nseg2')}] "
