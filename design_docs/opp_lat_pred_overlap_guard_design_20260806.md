@@ -704,3 +704,21 @@ self.get_logger().warn(
    場面がどれだけ残っているかを再確認した上で着手する。
 
 次のアクションは実装着手(Fix Aのオフライン反実仮想リプレイから開始)。
+
+## 11. Fix A'実装完了(2026-08-06、コミット`eaaa27e`)
+
+1.3-1.4節・6.9節の設計どおり実装した:
+- `overtake.lat_vel_source_tracker`(既定false)ゲート追加
+- `_estimate_opp_lateral_velocity()`新設(tracker.velocity()再利用、
+  is_settled()でNone/データなしを区別)
+- 呼び出し側をelif化(ゲートOFF時は旧実装コード無変更、ビット等価)
+- 片側利用(`need_from_pred`/`need_from_now`のmax)+変位物理拘束
+  (既存クランプ×horizon_cap導出値)をゲートON時のみ適用
+- `[OT]`ログへ`lat_vel_src`マーカー追加
+- 新規単体テスト15件(wp85の名前付き回帰含む)+既存3件の窓拡大、
+  回帰3171件PASS
+
+**次のアクション(§10のFlow、10.1節)**: dev3ローカル検証(Phase 2)。
+`lat_vel_source_tracker: true`のみを有効化し、`lat_vel_src`診断ログの
+発火確認、`opp_lat_pred`分布のクランプ張り付き率が14節の24%基準から
+改善するかを実測する。安全指標(衝突/STUCK/OT成功率)の非悪化も確認。
