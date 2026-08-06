@@ -338,7 +338,9 @@ overtake:
   #   対象車横方向速度の自前差分(13Hzエイリアシング誤差)をV2Xトラッカーの既存速度
   #   推定へ置き換え、予測の片側利用+変位物理拘束も併せて有効化する。既定false=現行
   #   の自前差分のままビット等価(段階導入、実験後false復元必須)。
-  lat_vel_source_tracker: false
+  lat_vel_source_tracker: true  # 2026-08-06/07: §10 Phase 2 (dev3ローカル) PASS判定
+    # (ON側n=3・OFF側n=5窓比較でハード制約に明確な悪化なし、クランプ飽和率
+    # 6.3% vs 旧方式24%で改善確認)、Phase 3(予選環境検証)へ進行中
   max_consider: 20.0      # [m] この弧長より遠い前方他車は判断に使わない
   v_cap: 6.0              # [m/s] 追い越し中の速度上限
   exit_clear: 3           # 前方クリアがこの回数連続で OVERTAKING→NORMAL 復帰(ヒステリシス)
