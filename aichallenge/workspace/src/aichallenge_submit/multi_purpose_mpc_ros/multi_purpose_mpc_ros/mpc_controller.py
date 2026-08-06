@@ -1979,15 +1979,29 @@ class MPCController(Node):
         self._ot_overlap_floor_mag = None
 
     def _update_overlap_state(self, opp_ds_now) -> bool:
-        """対象車と縦方向にオーバーラップ中(=並走中)かをヒステリシス付きで
-        判定する(design_docs opp_lat_pred_overlap_guard_design_20260806.md
-        §2.1)。Fix B(オフセット床)・将来のFix C(離脱保留)の両方から呼ばれる
-        想定の共通判定(同一動作を複数箇所に重複実装しない)。footprint_risk
-        判定(_footprint_risk、abs(fwd_ds)<along_min_length)と同じ物理的下限
-        (along_min_length=カート全長)を再利用し、新規の距離定数は導入しない。
-        侵入判定(enter)より解除判定(exit)を広く取り、境界での毎周期
-        チャタリングを防ぐ。データ欠損時(opp_ds_now is None、対象車が一時的に
-        視野外)は、直前の状態を維持する(保守側)。"""
+        """対象車と縦方向にオーバーラップ中(=真横に近接、footprint_riskと
+        同じ物理スケール)かをヒステリシス付きで判定する(design_docs
+        opp_lat_pred_overlap_guard_design_20260806.md §2.1)。
+
+        2026-08-07改訂(§14、外部AIレビュー): 当初はFix B(オフセット床)・
+        Fix C(離脱保留)の共通判定として設計したが、Fix Bのオフライン反実
+        仮想検証で「動機事例(18節衝突・0805-07慢性未達)ではds(対象車との
+        縦距離)が終始3〜13m台で、この閾値(along_min_length由来、
+        2.5〜3.0m)には一度も到達しない」ことが判明し、Fix Bはこの判定を
+        使わないよう再設計した(state=="OVERTAKING"全体をスコープにする
+        方式、_apply_overlap_floor参照)。本メソッドはFix C専用として温存
+        する——Fix Cの目的(並走中の離脱保留=相手へ急に戻って衝突するのを
+        防ぐ)はFix Bと異なり「本当に真横にいる」という物理的近接性が本質
+        のため、狭いdsベースの定義がFix Cには引き続き適切と判断した
+        (Fix B/Cで「並走中」の定義を分離、両者を1つのヘルパーに統合した
+        ことがスコープ取り違えの一因だったとの分析による)。
+
+        footprint_risk判定(_footprint_risk、abs(fwd_ds)<along_min_length)
+        と同じ物理的下限(along_min_length=カート全長)を再利用し、新規の
+        距離定数は導入しない。侵入判定(enter)より解除判定(exit)を広く
+        取り、境界での毎周期チャタリングを防ぐ。データ欠損時
+        (opp_ds_now is None、対象車が一時的に視野外)は、直前の状態を
+        維持する(保守側)。"""
         if opp_ds_now is None:
             return self._ot_overlapping
         enter_thr = self._along_min_length + self._ot_overlap_margin_m
@@ -1997,29 +2011,41 @@ class MPCController(Node):
             d < exit_thr if self._ot_overlapping else d < enter_thr)
         return self._ot_overlapping
 
-    def _apply_overlap_floor(self, target_mag: float, opp_ds_now,
-                              corr_bound: float) -> float:
+    def _apply_overlap_floor(self, target_mag: float, corr_bound: float) -> float:
         """Fix B(design_docs opp_lat_pred_overlap_guard_design_20260806.md
-        §2.2): 並走中はtarget_magを縮小させない。床は並走エピソード専用の
-        新規状態(self._ot_overlap_floor_mag、ピーク保持=単調非減少)を使う
-        ——168節のcorr_bound崩壊対策フリーズ値(_ot_last_valid_target_mag)
-        とは別変数にし、意味論の衝突(同一変数が「コリドー崩壊対策」と
-        「並走ガード」の二重の意味を持つことによるバグ)を避ける(外部AI
-        レビューmust-fix 1)。
+        §2.2、§14で再設計): OVERTAKING状態中(側が確定してアタックしている
+        全期間)、target_magをopp_lat_predのノイズで縮小させない。床は
+        並走エピソード専用の新規状態(self._ot_overlap_floor_mag、ピーク
+        保持=単調非減少)を使う——168節のcorr_bound崩壊対策フリーズ値
+        (_ot_last_valid_target_mag)とは別変数にし、意味論の衝突(同一変数
+        が「コリドー崩壊対策」と「並走ガード」の二重の意味を持つことに
+        よるバグ)を避ける(外部AIレビューmust-fix 1)。
+
+        2026-08-07改訂(§14): 当初はds(対象車との縦距離)ベースのヒステリシス
+        (_update_overlap_state())で「並走中」を判定していたが、オフライン
+        反実仮想検証(§14)で、動機事例(18節衝突・0805-07慢性未達)では
+        dsが終始3〜13m台に分布し、footprint_risk由来の閾値(2.5〜3.0m)
+        には一度も到達しないと判明した(スコープ取り違え、外部AI
+        [Gemini]レビューで確認済み)。実際の不具合はENGAGE直後の「接近
+        しながらオフセットを広げている」段階全体で起きていたため、判定を
+        self._ot_state=="OVERTAKING"全体(=側が確定してから離脱するまでの
+        全期間)へ広げた。dsベース判定(_update_overlap_state())は撤去せず
+        Fix C専用として残す(§2.1のdocstring参照)。
 
         不変条件:
-          - 床は同一並走エピソード内で単調非減少(下がらない)。
+          - 床は同一OVERTAKINGエピソード内で単調非減少(下がらない)。
           - 床適用後のtarget_magは、常に「現在のcorr_bound - マージン」以下
             (=床がコリドーの壁を突き破ることは原理的に発生しない、今周期の
             実測corr_boundで毎回再キャップするため)。
+          - OVERTAKING以外の状態(NORMAL/STOPPING等)では床を保持しない
+            (次回エンゲージ時に前回エピソードの高い床値を持ち越さない)。
 
-        ゲートOFF(既定)時は_update_overlap_state()の呼び出しも含め早期
-        returnし、target_magを完全に無変更で返す(全ゲートOFF時のビット
-        等価性を保証)。"""
+        ゲートOFF(既定)時は状態チェックも含め早期returnし、target_magを
+        完全に無変更で返す(全ゲートOFF時のビット等価性を保証)。"""
         if not self._ot_overlap_floor_enabled:
             return target_mag
-        overlapping = self._update_overlap_state(opp_ds_now)
-        if not overlapping:
+        if self._ot_state != "OVERTAKING":
+            self._ot_overlap_floor_mag = None
             return target_mag
         _before = target_mag
         self._ot_overlap_floor_mag = max(
@@ -2029,8 +2055,8 @@ class MPCController(Node):
             floor = min(floor, corr_bound - self._ot_overlap_corr_margin_m)
         target_mag = max(target_mag, floor)
         if target_mag > _before:
-            # エッジトリガー(床が実際に効いた周期のみ)、並走中毎周期の
-            #   ログ氾濫を避ける(design_docs §9.2)。
+            # エッジトリガー(床が実際に効いた周期のみ)、OVERTAKING中
+            #   毎周期のログ氾濫を避ける(design_docs §9.2)。
             self.get_logger().info(
                 f"[OVERLAP-FLOOR] side={self._ot_side} floor={floor:.3f} "
                 f"target_mag_before={_before:.3f} target_mag_after={target_mag:.3f} "
@@ -7133,13 +7159,14 @@ class MPCController(Node):
                         _target_mag = self._ot_last_valid_target_mag
                     else:
                         _target_mag = 0.0
-                # 2026-08-07追加(Fix B、design_docs...20260806.md §2.3-1): 並走中
-                #   (縦オーバーラップ中)はtarget_magをopp_lat_predのノイズで縮小
-                #   させない。既存のコリドー崩壊フリーズ処理(直前)より後、
-                #   lateral_target確定(直後)より前で呼ぶ(今周期のcorr_bound値を
-                #   利用するため)。
-                _target_mag = self._apply_overlap_floor(
-                    _target_mag, _opp_ds_now, _corr_bound)
+                # 2026-08-07追加(Fix B、design_docs...20260806.md §2.3-1、
+                #   §14で再設計): OVERTAKING中はtarget_magをopp_lat_predの
+                #   ノイズで縮小させない。既存のコリドー崩壊フリーズ処理
+                #   (直前)より後、lateral_target確定(直後)より前で呼ぶ
+                #   (今周期のcorr_bound値を利用するため)。判定はdsベースでは
+                #   なくself._ot_state=="OVERTAKING"(§14、オフライン検証で
+                #   ds閾値が動機事例に一度も到達しないと判明したため)。
+                _target_mag = self._apply_overlap_floor(_target_mag, _corr_bound)
                 self._mpc.lateral_target = float(self._ot_side) * _target_mag
                 _lat_active_side = self._ot_side
             # 2026-07-22追加(160節続報、issue⑤①: STOPPING中の能動的空き確保、issue⑤
@@ -7161,11 +7188,12 @@ class MPCController(Node):
                 _target_mag = self._ot_proactive_bias_max
                 if np.isfinite(_corr_bound):
                     _target_mag = min(_target_mag, max(0.0, _corr_bound))
-                # 2026-08-07追加(Fix B、design_docs...20260806.md §2.3-2): STOPPING/
-                #   proactive-bias分岐でも同様に適用。対象車のds値は既存の
-                #   _scan["fwd_ds"](_fwd_ds、新規計算なし)を再利用する。
-                _target_mag = self._apply_overlap_floor(
-                    _target_mag, _fwd_ds, _corr_bound)
+                # 2026-08-07修正(Fix B、§14で再設計): Fix Bの床は
+                #   self._ot_state=="OVERTAKING"限定のためこの分岐(STOPPING)
+                #   では適用しない。この分岐のtarget_magはopp_lat_predを
+                #   一切参照しない固定小値+corr_boundクランプのみで構成され
+                #   (Fix Bが対処すべきノイズ源がそもそも存在しない、外部AI
+                #   [Gemini]レビューで確認済み)、床を適用する意味がない。
                 self._mpc.lateral_target = float(_eval.plan_side) * _target_mag
                 _a_target = 1.0
                 _lat_active_side = _eval.plan_side

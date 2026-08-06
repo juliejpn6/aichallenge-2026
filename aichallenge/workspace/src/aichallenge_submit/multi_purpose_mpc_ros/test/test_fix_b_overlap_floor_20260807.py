@@ -1,18 +1,26 @@
-"""Fix B(並走中オフセット床、2026-08-07)。
+"""Fix B(OVERTAKING中オフセット床、2026-08-07、§14で再設計)。
 
-背景: design_docs/opp_lat_pred_overlap_guard_design_20260806.md §2。
+背景: design_docs/opp_lat_pred_overlap_guard_design_20260806.md §2/§14。
 Fix A'(opp_lat_pred根本修正)だけでは解決しない残存ノイズ・正当な相手の
-急な横移動等に対する物理的な安全網として、並走中(縦方向オーバーラップ中)
-はtarget_magを縮小させないオフセット床を追加する。ただしコリドー実測(壁)
-は常に優先する(床がコリドーを突き破ることは原理的に発生しない)。
+急な横移動等に対する物理的な安全網として、target_magを縮小させない
+オフセット床を追加する。ただしコリドー実測(壁)は常に優先する(床が
+コリドーを突き破ることは原理的に発生しない)。
 
-外部AIレビュー(6.9節・§2.2)で発見されたmust-fix 1(床は専用の新規状態
-_ot_overlap_floor_magを使う、168節の既存フリーズ値_ot_last_valid_target_mag
-と混同しない)を反映済みの設計をそのまま実装した。
+**§14での再設計(2026-08-07)**: 当初はds(対象車との縦距離)ベースの
+ヒステリシス判定(_update_overlap_state())で「並走中」を検知していたが、
+CLAUDE.md §1.4準拠のオフライン反実仮想検証で、Fix Bを正当化した2つの
+動機事例(18節衝突事例・0805-07慢性未達事例、計45サンプル)全てで
+dsが3〜13m台に分布し、footprint_risk由来の閾値(2.5〜3.0m)には一度も
+到達しないことが判明した(スコープ取り違え、外部AI[Gemini]レビューで
+確認・裏付け済み)。実際の不具合はENGAGE直後の「接近しながらオフセットを
+広げている」段階全体で起きていたため、判定をself._ot_state==
+"OVERTAKING"全体(側が確定してから離脱するまでの全期間)へ広げた。
+dsベース判定(_update_overlap_state())は撤去せずFix C(未実装、離脱保留、
+「本当に真横にいる」という物理的近接性が本質)専用として温存する。
 
 configゲート`overtake.overlap_floor_enabled`(既定false)でON/OFF切替、
-OFF時は_update_overlap_state()の呼び出しも含め早期returnし現行と完全に
-ビット等価(段階導入、Fix Aとは独立ゲート)。
+OFF時は状態チェックも含め早期returnし現行と完全にビット等価
+(段階導入、Fix Aとは独立ゲート)。
 
 mpc_controller.pyはrclpy依存で直接importできないため、既存の同種テストと
 同じ「ソーステキスト構造検証」+「ロジックのミラー実装による数値検証」の
@@ -49,7 +57,8 @@ def test_state_vars_declared_with_safe_defaults():
 
 
 # ---------------------------------------------------------------------------
-# ②_update_overlap_state: ヒステリシス判定、データ欠損時は直前状態を維持
+# ②_update_overlap_state: Fix C専用として温存(dsベースヒステリシス判定)
+#   本体はFix Bからはもう呼ばれないが、ロジック自体の健全性は維持確認する
 # ---------------------------------------------------------------------------
 
 def _overlap_state_block():
@@ -58,17 +67,17 @@ def _overlap_state_block():
     return _SRC[idx:idx_end]
 
 
+def test_update_overlap_state_reserved_for_fix_c():
+    """§14改訂: Fix Bはこの判定を使わなくなった旨がdocstringに明記されて
+    いることを確認する(将来の実装者が誤ってFix Bへ再結線しないため)。"""
+    snippet = _overlap_state_block()
+    assert "Fix C専用として温存" in snippet
+
+
 def test_update_overlap_state_uses_hysteresis():
     snippet = _overlap_state_block()
     assert "enter_thr = self._along_min_length + self._ot_overlap_margin_m" in snippet
     assert "exit_thr = self._along_min_length + self._ot_overlap_margin_m * 2.0" in snippet
-
-
-def test_update_overlap_state_reuses_along_min_length_no_new_distance_constant():
-    """footprint_risk判定と同じ物理的下限(along_min_length)を再利用し、
-    新規の距離定数を導入しないことを確認する。"""
-    snippet = _overlap_state_block()
-    assert "self._along_min_length" in snippet
 
 
 def test_update_overlap_state_none_input_preserves_prior_state():
@@ -92,14 +101,10 @@ def _update_overlap_state_mirror(overlapping, opp_ds_now, along_min_length=2.0, 
 def test_hysteresis_mirror_enter_narrower_than_exit():
     """侵入判定(enter)より解除判定(exit)を広く取り、境界でのチャタリングを
     防ぐことを数値的に確認する(along_min_length=2.0, margin=0.5前提:
-    enter_thr=2.5m, exit_thr=3.0m)。"""
-    # 未オーバーラップ状態でenter_thr未満に入るとTrueへ
+    enter_thr=2.5m, exit_thr=3.0m)。Fix C実装時に再利用される想定。"""
     assert _update_overlap_state_mirror(False, 2.4) is True
-    # 未オーバーラップ状態でenter_thr以上exit_thr未満(境界帯)はまだFalseのまま
     assert _update_overlap_state_mirror(False, 2.7) is False
-    # 一度オーバーラップに入った後は、同じ2.7mでもexit_thr未満なのでTrue継続
     assert _update_overlap_state_mirror(True, 2.7) is True
-    # exit_thr以上になって初めて解除される
     assert _update_overlap_state_mirror(True, 3.1) is False
 
 
@@ -110,7 +115,7 @@ def test_hysteresis_mirror_missing_data_preserves_state():
 
 # ---------------------------------------------------------------------------
 # ③_apply_overlap_floor: ゲートOFF時はビット等価、専用状態変数を使用、
-#   corr_boundで再キャップ
+#   corr_boundで再キャップ、判定はself._ot_state=="OVERTAKING"
 # ---------------------------------------------------------------------------
 
 def _apply_overlap_floor_block():
@@ -119,12 +124,37 @@ def _apply_overlap_floor_block():
     return _SRC[idx:idx_end]
 
 
+def test_signature_no_longer_takes_opp_ds_now():
+    """§14改訂: dsベース判定を撤去したため、引数からopp_ds_nowが消えて
+    いることを確認する(回帰防止、旧シグネチャの復活を検知する)。"""
+    assert "def _apply_overlap_floor(self, target_mag: float, corr_bound: float) -> float:" in _SRC
+
+
 def test_gate_off_early_return_unchanged():
     snippet = _apply_overlap_floor_block()
     idx = snippet.index("if not self._ot_overlap_floor_enabled:")
     idx_end = snippet.index("\n", idx + 60)
     body = snippet[idx:idx_end]
     assert "return target_mag" in body
+
+
+def test_scope_is_overtaking_state_not_ds_based():
+    """§14の核心的な変更: 判定がself._ot_state=="OVERTAKING"であること。
+    dsベースの_update_overlap_state()はもう呼ばれない。"""
+    snippet = _apply_overlap_floor_block()
+    assert 'if self._ot_state != "OVERTAKING":' in snippet
+    assert "self._update_overlap_state(" not in snippet
+
+
+def test_floor_reset_when_leaving_overtaking():
+    """OVERTAKING以外の状態では床(_ot_overlap_floor_mag)をNoneへ戻し、
+    次回エンゲージ時に前回エピソードの高い床値を持ち越さないことを
+    確認する。"""
+    snippet = _apply_overlap_floor_block()
+    idx = snippet.index('if self._ot_state != "OVERTAKING":')
+    idx_end = snippet.index("return target_mag", idx)
+    body = snippet[idx:idx_end]
+    assert "self._ot_overlap_floor_mag = None" in body
 
 
 def test_uses_dedicated_floor_variable_not_last_valid_target_mag():
@@ -141,15 +171,12 @@ def test_floor_recapped_against_current_corr_bound():
     assert "floor = min(floor, corr_bound - self._ot_overlap_corr_margin_m)" in snippet
 
 
-def test_calls_update_overlap_state_internally():
-    snippet = _apply_overlap_floor_block()
-    assert "overlapping = self._update_overlap_state(opp_ds_now)" in snippet
-
-
-def _apply_overlap_floor_mirror(target_mag, overlapping, floor_state, corr_bound,
+def _apply_overlap_floor_mirror(target_mag, ot_state, floor_state, corr_bound,
                                  corr_margin=0.1):
-    """_apply_overlap_floor()のミラー実装(ゲートON・overlapping=True前提の
-    コア計算部分のみ、数値検証用)。"""
+    """_apply_overlap_floor()の1:1ミラー実装(ゲートON前提、数値検証用)。
+    §14改訂後: 判定はot_state=="OVERTAKING"かどうかのみ。"""
+    if ot_state != "OVERTAKING":
+        return target_mag, None
     floor_state = max(floor_state or 0.0, target_mag)
     floor = floor_state
     if corr_bound == corr_bound and corr_bound > 0.0:  # not NaN
@@ -157,14 +184,13 @@ def _apply_overlap_floor_mirror(target_mag, overlapping, floor_state, corr_bound
     return max(target_mag, floor), floor_state
 
 
-def test_floor_monotonic_non_decreasing_within_episode():
-    """不変条件①: 床は同一並走エピソード内で単調非減少(下がらない)。"""
+def test_floor_monotonic_non_decreasing_within_overtaking_episode():
+    """不変条件①: 床は同一OVERTAKINGエピソード内で単調非減少(下がらない)。"""
     floor_state = None
-    result1, floor_state = _apply_overlap_floor_mirror(1.5, True, floor_state, 10.0)
-    result2, floor_state = _apply_overlap_floor_mirror(0.8, True, floor_state, 10.0)
-    # target_magが1.5→0.8へ下がっても、床が1.5を記憶しているため結果は1.5のまま
+    result1, floor_state = _apply_overlap_floor_mirror(1.5, "OVERTAKING", floor_state, 10.0)
+    result2, floor_state = _apply_overlap_floor_mirror(0.8, "OVERTAKING", floor_state, 10.0)
     assert result1 == 1.5
-    assert result2 == 1.5
+    assert result2 == 1.5  # target_magが1.5→0.8へ下がっても床が記憶している
 
 
 def test_floor_never_punches_through_current_corridor_wall():
@@ -172,7 +198,7 @@ def test_floor_never_punches_through_current_corridor_wall():
     以下(床がコリドーの壁を突き破ることは原理的に発生しない)。"""
     floor_state = 2.5  # 過去の広いコリドーで積み上がった高い床
     corr_bound_now = 1.0  # 今周期、コリドーが実際に狭まった
-    result, _ = _apply_overlap_floor_mirror(0.3, True, floor_state, corr_bound_now,
+    result, _ = _apply_overlap_floor_mirror(0.3, "OVERTAKING", floor_state, corr_bound_now,
                                              corr_margin=0.1)
     assert result <= corr_bound_now - 0.1 + 1e-9
 
@@ -181,39 +207,50 @@ def test_floor_only_raises_never_lowers_target_mag():
     """床は「増やす」方向にのみ効く(target_magを本来の値未満へは絶対に
     下げない)ことを確認する。"""
     floor_state = 0.5
-    result, _ = _apply_overlap_floor_mirror(1.2, True, floor_state, 10.0)
+    result, _ = _apply_overlap_floor_mirror(1.2, "OVERTAKING", floor_state, 10.0)
     assert result >= 1.2
 
 
+def test_floor_inactive_outside_overtaking_state_mirror():
+    """不変条件③: NORMAL/STOPPING等OVERTAKING以外の状態では床が一切
+    働かず、target_magは無変更で返り、床状態もリセットされる。"""
+    for state in ("NORMAL", "STOPPING"):
+        result, floor_state = _apply_overlap_floor_mirror(0.3, state, 5.0, 10.0)
+        assert result == 0.3
+        assert floor_state is None
+
+
 # ---------------------------------------------------------------------------
-# ④呼び出し箇所: OVERTAKING分岐・STOPPING/proactive-bias分岐の2箇所で、
-#   lateral_target確定の直前に呼ばれていること
+# ④呼び出し箇所: OVERTAKING分岐の1箇所のみ(STOPPING分岐からは撤去、
+#   §14: opp_lat_predを参照しないためFix Bのノイズ対策が不要と判明)
 # ---------------------------------------------------------------------------
 
 def test_called_before_overtaking_lateral_target_assignment():
     idx_call = _SRC.index(
-        "_target_mag = self._apply_overlap_floor(\n"
-        "                    _target_mag, _opp_ds_now, _corr_bound)")
+        "_target_mag = self._apply_overlap_floor(_target_mag, _corr_bound)")
     idx_assign = _SRC.index(
         "self._mpc.lateral_target = float(self._ot_side) * _target_mag", idx_call)
     assert 0 < idx_assign - idx_call < 200
 
 
-def test_called_before_stopping_lateral_target_assignment():
-    idx_call = _SRC.index(
-        "_target_mag = self._apply_overlap_floor(\n"
-        "                    _target_mag, _fwd_ds, _corr_bound)")
-    idx_assign = _SRC.index(
-        "self._mpc.lateral_target = float(_eval.plan_side) * _target_mag", idx_call)
-    assert 0 < idx_assign - idx_call < 200
+def test_not_called_from_stopping_proactive_bias_branch():
+    """§14改訂: STOPPING/proactive-bias分岐のtarget_magはopp_lat_predを
+    一切参照しない固定小値+corr_boundクランプのみで構成され、Fix Bが
+    対処すべきノイズ源が存在しないため、この分岐からは呼ばれなくなった
+    ことを確認する(外部AI[Gemini]レビューで指摘・確認済み)。"""
+    idx_stopping = _SRC.index('elif (self._ot_state == "STOPPING" and _eval is not None')
+    idx_end = _SRC.index(
+        "self._mpc.lateral_target = float(_eval.plan_side) * _target_mag", idx_stopping)
+    snippet = _SRC[idx_stopping:idx_end]
+    assert "self._apply_overlap_floor(" not in snippet
 
 
-def test_total_call_count_matches_two_known_sites():
+def test_total_call_count_matches_single_known_site():
     n_calls = _SRC.count("self._apply_overlap_floor(")
-    assert n_calls == 2, (
-        f"想定していた2箇所(OVERTAKING分岐・STOPPING分岐)から数が変わっている"
-        f"(現在{n_calls}箇所)。新しい適用箇所が追加/削除された場合はこの"
-        "テスト自体の更新も必要。")
+    assert n_calls == 1, (
+        f"想定していた1箇所(OVERTAKING分岐のみ)から数が変わっている"
+        f"(現在{n_calls}箇所)。新しい適用箇所が追加/削除された場合は"
+        "このテスト自体の更新も必要。")
 
 
 # ---------------------------------------------------------------------------
