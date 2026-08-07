@@ -145,6 +145,59 @@ def fit_fopdt(steering_cmd, steering_act, sample_hz=40.0,
     return {'L_s': best[0], 'tau_s': best[1], 'resid_deg': best[2], 'n_samples': len(grid)}
 
 
+def fit_fopdt_with_gain(steering_cmd, steering_act, sample_hz=40.0,
+                         L_candidates=None, tau_candidates=None):
+    """L・tauのグリッドサーチにゲインKを同時推定する拡張版(2026-08-07)。
+
+    既存のfit_fopdt()はFOPDTモデルの定常応答が指令値へ完全収束する
+    (ゲイン=1)ことを暗黙に仮定しているが、クリーンなステップ応答テスト
+    (mpc_controller停止、振幅5°/15°どちらでも)でゲイン≈0.6が振幅非依存で
+    再現されたため、ゲイン=1仮定のままではどのL・tauを選んでもフィット
+    不能(残差が下がらない)という問題が生じていた。
+
+    FOPDTのODEは入力に対して線形なため、L・tauを固定した際の単位ゲイン
+    応答y_unit(t)に対し、最適ゲインK(最小二乗、原点通過回帰)は
+    K = Σ(y_unit・act) / Σ(y_unit²) で解析的に求まる。既存のL・tau
+    2次元グリッドサーチはそのまま維持し、各格子点でKを同時に求める形で
+    3パラメータ同時フィットを実現する(計算量の増加なし)。
+    """
+    if L_candidates is None:
+        L_candidates = DEFAULT_L_CANDIDATES
+    if tau_candidates is None:
+        tau_candidates = DEFAULT_TAU_CANDIDATES
+
+    cmd_t = np.array([p[0] for p in steering_cmd])
+    cmd_v = np.degrees(np.array([p[1] for p in steering_cmd]))
+    act_t = np.array([p[0] for p in steering_act])
+    act_v = np.degrees(np.array([p[1] for p in steering_act]))
+
+    t_lo = max(cmd_t[0], act_t[0]) + max(L_candidates)
+    t_hi = min(cmd_t[-1], act_t[-1])
+    if t_hi <= t_lo:
+        return None
+    grid = np.arange(t_lo, t_hi, 1.0 / sample_hz)
+    if len(grid) < 10:
+        return None
+    act_i = np.interp(grid, act_t, act_v)
+
+    best = None
+    for L in L_candidates:
+        for tau in tau_candidates:
+            y_unit = fopdt_predict(cmd_t, cmd_v, grid, L, tau)
+            denom = float(np.dot(y_unit, y_unit))
+            if denom < 1e-9:
+                continue
+            gain = float(np.dot(y_unit, act_i) / denom)
+            y_pred = gain * y_unit
+            resid = float(np.sqrt(np.mean((y_pred - act_i) ** 2)))
+            if best is None or resid < best[3]:
+                best = (float(L), float(tau), gain, resid)
+    if best is None:
+        return None
+    return {'L_s': best[0], 'tau_s': best[1], 'gain': best[2],
+            'resid_deg': best[3], 'n_samples': len(grid)}
+
+
 def detect_edges(cmd_t, cmd_v, threshold_deg=EDGE_THRESHOLD_DEG, min_gap_s=EDGE_MIN_GAP_S):
     """指令の急激な変化(1周期あたりthreshold_deg超)をエッジとして検出する。
     min_gap_s未満で連続するエッジは最初の1個のみ採用する。"""
