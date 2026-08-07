@@ -79,13 +79,16 @@ def equal_sections(wp_rows, n_sections):
 
 
 def time_windows_for_section(wp_rows, wp_lo, wp_hi, margin_s=0.5):
-    """セクション内(wp_lo<=wp<=wp_hi)にいた時刻区間を連続塊ごとに返す
-    (周回で複数回訪れる場合は複数区間になる)。前後にmargin_sだけ余裕を持たせる。"""
+    """セクション内にいた時刻区間を連続塊ごとに返す(周回で複数回訪れる
+    場合は複数区間になる)。前後にmargin_sだけ余裕を持たせる。
+    wp_lo > wp_hi の場合は周回のラップアラウンド区間(例: wp340-40は
+    wp>=340 or wp<=40)として扱う(トラックはcircular=true)。"""
+    wrap = wp_lo > wp_hi
     windows = []
     cur_start = None
     prev_t = None
     for t, wp, _k in wp_rows:
-        inside = wp_lo <= wp <= wp_hi
+        inside = (wp >= wp_lo or wp <= wp_hi) if wrap else (wp_lo <= wp <= wp_hi)
         if inside and cur_start is None:
             cur_start = t
         elif not inside and cur_start is not None:
@@ -157,6 +160,7 @@ def analyze_sections(bag_path, log_path, sections):
     for wp_lo, wp_hi, label in sections:
         windows = time_windows_for_section(wp_rows, wp_lo, wp_hi)
         lags = []
+        corrs = []
         total_n = 0
         for w_lo, w_hi in windows:
             c_idx = [i for i, t in enumerate(cmd_t) if w_lo <= t <= w_hi]
@@ -170,10 +174,12 @@ def analyze_sections(bag_path, log_path, sections):
             r = cross_correlation_lag(sub_cmd_t, sub_cmd_v, sub_act_t, sub_act_v)
             if r is not None:
                 lags.append(r["lag_ms"])
+                corrs.append(r["corr"])
                 total_n += r["n"]
         if lags:
             results.append({
                 "label": label, "wp_range": (wp_lo, wp_hi),
+                "corr_mean": float(np.mean(corrs)), "corr_min": float(np.min(corrs)),
                 "n_windows": len(windows), "n_valid": len(lags),
                 "lag_mean_ms": float(np.mean(lags)), "lag_std_ms": float(np.std(lags)),
                 "n_samples": total_n,
