@@ -51,12 +51,29 @@ bicycle_model:
   use_curvature_bias_correction: false
   curvature_bias_slope: 0.772
   curvature_bias_intercept: 0.016
-  # actuator_gain: delta_actual状態が定常収束する先を指令deltaの何倍にするか(既定1.0)。
-  #   2026-08-03、ローカル実走行でgain=0.67を試したところ「切りすぎ(過剰操舵)」が
-  #   目視で確認され、estimate_gain_continuousの実測(0.67)自体が振動信号への回帰に
-  #   よる過小評価アーティファクトだった疑いが強まったため、1.0(無効)へ復元。
-  #   design_docs/axis06_gain_correction_design_20260803.md参照(再検証要)。
-  actuator_gain: 1.0
+  # actuator_gain: delta_actual状態が定常収束する先を指令deltaの何倍にするか。
+  #   2026-08-03、ローカル実走行でgain=0.67を試したところ「切りすぎ」が目視確認され、
+  #   estimate_gain_continuousの実測(0.67)が振動信号への回帰による過小評価
+  #   アーティファクトだった疑いから1.0(無効)へ一旦復元していた
+  #   (design_docs/axis06_gain_correction_design_20260803.md)。
+  #   2026-08-07再検証(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+  #   §30-32): mpc_controller停止・純粋オープンループのステップ応答テスト(振幅
+  #   5°/15°の2回)+自然走行データ1回、計3点でgain=0.595-0.688に収束。
+  #   閉ループ振動信号への回帰でない証拠(オープンループ2回)が揃ったため、
+  #   「アーティファクト」判断を覆し0.6へ変更する。n=3のためCLAUDE.md §2 rule 1に
+  #   照らしさらなる検証が望ましい。
+  actuator_gain: 0.6
+  # actuator_lag_tau_s: delta_actual状態(第4状態)の一次遅れ時定数。既定はコード内
+  #   (spatial_bicycle_models.py、config非公開)で190ms→160msと変遷したが、いずれも
+  #   gain=1固定を暗黙に仮定した旧フィット手法(fit_fopdt)による測定だったことが
+  #   2026-08-07に判明(§30)。gain込み同時フィット(fit_fopdt_with_gain)による
+  #   再測定で、旧tau=160msは同一の自然走行データで完全再現されたが、実際は
+  #   L(むだ時間、現行モデル未実装)60-110msとgain不足0.6-0.7の埋め合わせが
+  #   単純合算以上に歪んで混入した値だったと確認(§32)。gain込み測定3点
+  #   (クリーンステップ2回+自然走行1回)は50-80msに収束。n=3のためさらなる
+  #   検証が望ましいが、フィット品質が最良だった15°ステップテスト(resid=0.16°)
+  #   の80msを採用する。
+  actuator_lag_tau_s: 0.08
 
 mpc:
   N: 20

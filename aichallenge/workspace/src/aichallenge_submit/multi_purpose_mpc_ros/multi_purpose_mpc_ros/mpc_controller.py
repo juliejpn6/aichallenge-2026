@@ -580,6 +580,7 @@ class MPCController(Node):
                 cfg_model.width,
                 1.0 / self._cfg.mpc.control_rate, # type: ignore
                 actuator_gain=float(getattr(cfg_model, "actuator_gain", 1.0)),
+                actuator_lag_tau_s=float(getattr(cfg_model, "actuator_lag_tau_s", 0.16)),
                 use_curvature_bias_correction=bool(
                     getattr(cfg_model, "use_curvature_bias_correction", False)),
                 curvature_bias_slope=float(
