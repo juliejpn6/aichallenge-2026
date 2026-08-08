@@ -1509,6 +1509,14 @@ class MPCController(Node):
             #   自体がwaypointごとにどう推移したかを検証できなかった。ENGAGE時のみ
             #   [ENGAGE]ログへ窓内トレースを追加出力する(判定ロジックは無変更)。
             self._dbg_plan_trace = []
+            # 2026-08-08追加(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+            #   §42.7-42.8、タスク#300): ENGAGE時点のk_corner veto窓内トレース
+            #   (self._dbg_plan_traceのスナップショット)を保持し、後でgiveupが
+            #   起きた際に「ENGAGE時に見積もっていたコーナー前空き幅」と「giveupを
+            #   引き起こした実際の状況」を突き合わせられるようにする(診断専用、
+            #   判定ロジックには一切使わない)。
+            self._ot_engage_trace = []
+            self._ot_engage_wp = None
             self._dbg_n_dynobs = 0
             self._ot_max_width = float(self._cfg.reference_path.max_width)     # コース最大幅
             self._ot_half_w = 0.5 * self._ot_max_width                          # （診断/フィルタ用）半幅
@@ -6798,6 +6806,16 @@ class MPCController(Node):
                                 f"dlat_v_ema={_lat_dec.dlat_v_ema:.3f} "
                                 f"dlat_shrink_run={_lat_dec.dlat_shrink_run} "
                                 f"dlat_trend_reset_reason={_lat_dec.dlat_trend_reset_reason}")
+                            # 2026-08-08追加(§42.7-42.8、タスク#300、診断専用・判定へ無関与):
+                            #   ENGAGE時に_plan_pass(k_corner veto)が見積もっていた窓内トレース
+                            #   (self._ot_engage_trace、engage_wp=そのwaypoint)を、実際にgiveupが
+                            #   起きた地点(現在のwp)と突き合わせてログへ残す。§42.7で判明した
+                            #   「ENGAGE時推定 vs giveup時実態」の乖離を、今後の予選・dev3ログから
+                            #   直接分析できるようにする(制御へは一切影響しない)。
+                            self.get_logger().warn(
+                                f"[ENGAGE-GIVEUP-TRACE] engage_wp={self._ot_engage_wp} "
+                                f"giveup_wp={self._mpc.model.wp_id} "
+                                f"engage_trace={self._ot_engage_trace}")
                         # 断念(相手が速い) or 側消失(持続) → 追従へ。無効と判明した側は持ち越さず、
                         #   クールダウン中は再エンゲージしない(0.2秒debounceだけで反対側に飛ぶ
                         #   エピソード間スイングの抑制。仕切り直してICCで詰め直す)。
@@ -6940,6 +6958,11 @@ class MPCController(Node):
                         _prev_locked = self._ot_side_locked
                         self._ot_side = _eval.plan_side
                         self._ot_side_locked = _eval.plan_side
+                        # 2026-08-08追加(§42.7-42.8、タスク#300、診断専用): このENGAGEを
+                        #   引き起こした_plan_passの窓内トレース(k_corner veto計算過程)を
+                        #   スナップショットとして保持する。判定ロジックには一切使わない。
+                        self._ot_engage_trace = list(self._dbg_plan_trace)
+                        self._ot_engage_wp = int(self._mpc.model.wp_id)
                         # 2026-07-20追加(131-6節④、対象車の一意性): _plan_passが実際に
                         #   計画対象とした相手車ID(scan["fwd_vid"]、_plan_pass冒頭2241行目
                         #   のvidと同一値)をエンゲージのたびに記録する。オフセット復帰判定

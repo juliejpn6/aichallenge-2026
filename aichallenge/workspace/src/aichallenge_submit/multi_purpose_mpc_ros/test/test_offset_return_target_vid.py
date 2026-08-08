@@ -81,9 +81,12 @@ def test_exact_zero_ds_does_not_block():
 
 def test_target_vid_captured_at_engage_commit_reusing_existing_scan():
     """②非冗長性: エンゲージ確定時にscan["fwd_vid"]をそのまま_ot_target_vidへ
-    複製するだけで、新規スキャン処理を追加していないことを確認する。"""
+    複製するだけで、新規スキャン処理を追加していないことを確認する。
+    2026-08-08(§42.7-42.8、タスク#300)追加のENGAGE時トレーススナップショット
+    (self._ot_engage_trace/_ot_engage_wp、診断専用)の分だけ窓を700→1000へ拡大
+    (検証内容自体は変更なし)。"""
     idx = _SRC.index("self._ot_side = _eval.plan_side")
-    snippet = _SRC[idx:idx + 700]
+    snippet = _SRC[idx:idx + 1000]
     assert 'self._ot_target_vid = _scan.get("fwd_vid")' in snippet
 
 
