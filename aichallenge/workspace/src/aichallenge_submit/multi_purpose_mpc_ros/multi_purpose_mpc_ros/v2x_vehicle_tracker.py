@@ -51,6 +51,14 @@ class V2XVehicleTracker:
             else self._v_max_safety)
         self._last_valid_velocity: Dict[str, Tuple[float, float]] = {}
         self._last_valid_time: Dict[str, float] = {}
+        # 2026-08-09追加(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+        #   §45、タスク#300): 直近update()でこの車両の速度がクランプ(v_max_safety超過
+        #   →フォールバック値へ差し替え)されたかどうかを、clamp_hold_enabledの設定に
+        #   関わらず判定できるようにする。mpc_controller側のfootprint_risk自己ロック
+        #   解除ガード(「相手が停止扱い」に見えても実はV2X異常でクランプされた走行中の
+        #   相手ではないか)に使う。既存のクランプ判定分岐(update()内)へフラグを
+        #   1行足すだけで、クランプ処理自体(_clamp_fallback_velocity)は無変更。
+        self._clamped: Dict[str, bool] = {}
 
     def update(self, msg) -> None:
         active: List[str] = []
@@ -86,6 +94,7 @@ class V2XVehicleTracker:
                     vy = (y1 - y0) / dt
                     if math.hypot(vx, vy) > self._v_max_safety:
                         self._velocities[vid] = self._clamp_fallback_velocity(vid, t)
+                        self._clamped[vid] = True
                         self._warn(
                             f"V2X: velocity for vehicle '{vid}' exceeds "
                             f"{self._v_max_safety} m/s — clamped to zero")
@@ -93,6 +102,7 @@ class V2XVehicleTracker:
                         self._velocities[vid] = (vx, vy)
                         self._last_valid_velocity[vid] = (vx, vy)
                         self._last_valid_time[vid] = t
+                        self._clamped[vid] = False
                 else:
                     self._velocities[vid] = (0.0, 0.0)
             active.append(vid)
@@ -115,6 +125,12 @@ class V2XVehicleTracker:
 
     def velocity(self, vehicle_id: str) -> Tuple[float, float]:
         return self._velocities.get(vehicle_id, (0.0, 0.0))
+
+    def is_speed_clamped(self, vehicle_id: str) -> bool:
+        """2026-08-09追加(§45、タスク#300): 直近update()でこの車両の速度が
+        v_max_safety超過によりクランプされたか(clamp_hold_enabledの設定に
+        関わらず判定可能)。未追跡の車両はFalse(クランプなし、安全側デフォルト)。"""
+        return bool(self._clamped.get(vehicle_id, False))
 
     def is_settled(self, vehicle_id: str) -> bool:
         """速度推定が落ち着いているか(窓が満杯=平滑が効いている)。速度マップの採否に使う。"""

@@ -116,8 +116,12 @@ def test_force_rescue_switch_reset_set_matches_branch_a_dlat_success_path():
 # ---------------------------------------------------------------------------
 
 def _rescue_block_snippet():
+    """2026-08-09改訂(§45.3): 終端アンカーが`_side_blocked = _lat_dec.force_giveup
+    or _room_exhausted`から`_side_blocked = ((_lat_dec.force_giveup and not
+    _selflock_escape_override) or _room_exhausted)`へ変わった(自己ロック解除
+    エスケープ、configゲート既定OFF時はビット等価)。"""
     idx = _SRC.index("if _room_exhausted and self._ot_room_exhausted_count == self._ot_giveup_cycles:")
-    idx_end = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
+    idx_end = _SRC.index("_side_blocked = ((_lat_dec.force_giveup and not _selflock_escape_override)")
     return _SRC[idx:idx_end]
 
 

@@ -143,8 +143,11 @@ def test_total_call_count_matches_seven_known_sites():
     """新しい壁基準空き幅計算箇所が追加/削除された場合はこのテスト自体の更新も必要。
     7箇所×呼び出し数(_scan_traffic:2, K-CHECK:1, _opponent_room_ahead:1,
     _plan_pass lf0/rf0:2, _plan_pass 窓内ループ:2, _plan_pass steps.append:2,
-    along_lat:1)=合計11回。"""
+    along_lat:1)=合計11回。2026-08-09追加(§45、タスク#300):
+    _evaluate_engage_readinessの自己ロック解除must-fix3(予測post-offset dlat)で
+    8箇所目・12回目の呼び出しを追加(_plan_passと同じヘルパーの再利用、新規計算式
+    ではない)。"""
     n_calls = _SRC.count("self._room_to_wall(")
-    assert n_calls == 11, (
-        f"想定していた7箇所・計11回の呼び出しから数が変わっている(現在{n_calls}回)。"
+    assert n_calls == 12, (
+        f"想定していた8箇所・計12回の呼び出しから数が変わっている(現在{n_calls}回)。"
         "新しい壁基準空き幅計算箇所が追加/削除された場合はこのテスト自体の更新も必要。")

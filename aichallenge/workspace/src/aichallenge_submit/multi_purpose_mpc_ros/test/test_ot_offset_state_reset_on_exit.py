@@ -89,9 +89,10 @@ def test_called_from_ordinary_exit_clear():
 
 def test_called_from_infeasibility_forced_exit():
     """infeasibility強制STOPPING(5053行目付近、0728-04 wp243の実事例)で
-    呼ばれていることを確認する。"""
+    呼ばれていることを確認する。2026-08-09追加(§45.3)のselflock_escape_active
+    リセット行の分だけ窓を600→700へ拡大(検証内容自体は変更なし)。"""
     idx = _SRC.index("if self._mpc.infeasibility_counter == self._ot_infeasible_stop:")
-    idx_end = idx + 600
+    idx_end = idx + 700
     snippet = _SRC[idx:idx_end]
     assert 'self._ot_state = "STOPPING"' in snippet
     assert "self._reset_ot_offset_state()" in snippet

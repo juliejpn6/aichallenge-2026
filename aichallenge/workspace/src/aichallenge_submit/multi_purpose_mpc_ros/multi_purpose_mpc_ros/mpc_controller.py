@@ -892,6 +892,21 @@ class MPCController(Node):
             self._ot_pending_disengage_max_cycles = self._rate_scaled_cycles(
                 "pending_disengage_max_cycles",
                 int(_otget("pending_disengage_max_cycles", 80)))
+            # 2026-08-09追加(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+            #   §45、タスク#300): footprint_risk自己ロック解除の総合ゲート。既定false。
+            self._ot_selflock_release_enabled = bool(
+                _otget("selflock_release_enabled", False))
+            # 自己ロック解除でENGAGEした直後、force_giveup(footprint_risk由来のみ)を
+            # 有限時間だけ猶予するための状態(§45.3、Gemini指摘のチャタリング対策)。
+            # 猶予時間はENGAGE時の横移動フェーズ想定時間(t_lateral、既存定数)を再利用し
+            # 新規マジックナンバーを増やさない(下で_ot_t_lateralを読み込み後に確定)。
+            self._ot_selflock_escape_active = False
+            self._ot_selflock_escape_vid = None
+            self._ot_selflock_escape_side = 0
+            self._ot_selflock_escape_best_dlat = None
+            self._ot_selflock_escape_cycle = 0
+            self._ot_selflock_escape_cap_cycles = 0  # t_lateral読込後に設定
+            self._ot_selflock_release_logged = False
             self._ot_max_consider = float(_otget("max_consider", 40.0))  # [m] 前方弧長の上限
             self._ot_v_cap = float(_otget("v_cap", 6.0))            # [m/s] 追い越し中の速度上限
             self._ot_exit_clear = int(_otget("exit_clear", 3))
@@ -986,6 +1001,12 @@ class MPCController(Node):
             self._ot_footprint_risk_clear_count = 0  # footprint_risk条件が連続で不成立の周期数
             self._ot_fp_clear_logged = False  # [FP-COOLDOWN-CLEAR]の多重ログ防止(エッジ検知用)
             self._ot_t_lateral = float(_otget("t_lateral", 3.0))                  # [s] 横移動フェーズ時間(engage→cl実測3s。この間closing≈0)
+            # 2026-08-09追加(§45.3): 自己ロック解除エスケープの猶予周期数。既存の
+            # t_lateral(横移動フェーズの想定所要時間)をそのまま流用し新規定数は
+            # 増やさない(_rate_scaled_cyclesで制御周波数に追従、既存慣用句と同型)。
+            self._ot_selflock_escape_cap_cycles = self._rate_scaled_cycles(
+                "selflock_escape_cap",
+                int(round(self._ot_t_lateral * self._RATE_SCALE_REFERENCE_HZ)))
             self._ot_pass_block_kappa = float(_otget("pass_block_kappa", 0.10))   # [1/m] 内側可否判定のきついコーナー閾値(R≤10m)
             self._ot_pass_clear = float(_otget("pass_clear", 3.0))                # [m] 「抜き切り」= 相手の前にこれだけ出る
             self._ot_pass_t_max = float(_otget("pass_t_max", 8.0))                # [s] パス所要時間の予算(超過=追従の方が速い)
@@ -3447,6 +3468,72 @@ class MPCController(Node):
             self._dbg_plan_rf = float('nan')
 
         _dlat_ttc_veto = opp_sit.is_closing_trend
+        # 2026-08-09追加(design_docs opp_lat_pred_overlap_guard_design_20260806.md
+        #   §45、タスク#300): footprint_risk由来のis_closing_trend(常時True、
+        #   _dlat_closing_trend参照)が、まさにfootprint_riskを解消する側(=
+        #   _plan_passが物理的な空き幅[along_min_width基準]まで検証済みの側)への
+        #   ENGAGEまでブロックし続ける「自己ロック」を実測で確認した(127件、
+        #   footprint_risk giveup後30秒以内STUCKの67%)。「離れる方向の移動」を
+        #   「近づく方向の移動」と区別せず一律vetoしていたのが原因。
+        #   停止/低速の相手(footprint_riskは元々近接前提のため、走行中の相手の
+        #   場合はこの自己ロックが起きにくい=対象を絞ることで退行リスクを抑える)
+        #   かつ_plan_passが物理的に妥当な側を既に見つけている場合に限り、
+        #   「footprint_risk起因ではない本来のトレンド判定」(_dlat_closing_trendを
+        #   footprint_risk=Falseで再評価、新規計算ロジックの追加はしない)が
+        #   Falseであれば、このENGAGEゲートに限りvetoを解除する。
+        #   G2-RELEASE(_g2_release_ready)・force_include_vid(ICC近接除外)は
+        #   このメソッド外のローカル計算のため無変更(退行防止、共有元関数
+        #   _dlat_closing_trend自体にも一切手を入れない)。
+        # 2026-08-09追加(外部AIレビュー[Gemini・別Claude]must-fix反映): 安全判定の
+        #   緩和方向の変更のため、以下を全て満たす場合のみ解除する:
+        #   ①総合configゲート(既定false)、②実トレンド非該当、③相手が停止/低速かつ
+        #   V2X速度クランプ中でなく追跡が鮮度化済み(must-fix2、V2X異常でfwd_vopp=0
+        #   クランプされた走行中の相手を「停止」と誤認しない)、④計画側へオフセット
+        #   完了後に予測されるdlatがfootprint発火閾値+ヒステリシスを明確に超える
+        #   (must-fix3、_plan_passと同一の_room_to_wallヘルパー・既存定数のみ使用、
+        #   振動防止)。
+        if (self._ot_selflock_release_enabled and _dlat_ttc_veto
+                and _plan_ok and _plan_side != 0):
+            _real_trend_veto = self._dlat_closing_trend(
+                opp_sit.fwd_dlat, lat_dec.dlat_v_ema, lat_dec.dlat_shrink_run,
+                footprint_risk=False)
+            _v2x_trustworthy = True
+            if self._v2x_tracker is not None and opp_sit.fwd_vid is not None:
+                _v2x_trustworthy = (
+                    not self._v2x_tracker.is_speed_clamped(opp_sit.fwd_vid)
+                    and self._v2x_tracker.is_settled(opp_sit.fwd_vid))
+            _opponent_stopped = (opp_sit.fwd_vopp is not None
+                                  and opp_sit.fwd_vopp < self._opp_obstacle_speed
+                                  and _v2x_trustworthy)
+            _predicted_dlat = None
+            _predicted_dlat_ok = False
+            try:
+                _wps = self._reference_path.waypoints
+                _wp_now = _wps[int(self._mpc.model.wp_id) % len(_wps)]
+                _fwd_lat_now = scan.get("fwd_lat")
+                if _fwd_lat_now is not None:
+                    _predicted_dlat = self._room_to_wall(
+                        _wp_now, _fwd_lat_now, want_left=(_plan_side > 0), clamp=True)
+                    _predicted_dlat_ok = (
+                        _predicted_dlat
+                        > self._along_min_width + self._ot_overlap_margin_m)
+            except Exception:
+                _predicted_dlat_ok = False
+            if not _real_trend_veto and _opponent_stopped and _predicted_dlat_ok:
+                _dlat_ttc_veto = False
+                self._ot_selflock_escape_active = True
+                self._ot_selflock_escape_vid = opp_sit.fwd_vid
+                self._ot_selflock_escape_side = _plan_side
+                self._ot_selflock_escape_best_dlat = opp_sit.fwd_dlat
+                self._ot_selflock_escape_cycle = 0
+                self.get_logger().info(
+                    f"[DLAT-TTC-VETO-SELFLOCK-RELEASE] footprint_risk起因の"
+                    f"veto(実トレンドは非該当)を停止相手への離脱ENGAGEに限り解除 "
+                    f"plan_side={_plan_side} fwd_vid={opp_sit.fwd_vid} "
+                    f"fwd_vopp={opp_sit.fwd_vopp} fwd_dlat={opp_sit.fwd_dlat} "
+                    f"predicted_dlat={_predicted_dlat} "
+                    f"cap_cycles={self._ot_selflock_escape_cap_cycles} "
+                    f"wp={self._mpc.model.wp_id}")
         if _plan_ok and _dlat_ttc_veto:
             self._dbg_plan_reason = "dlat_ttc"
         _can_engage = _cheap_ok and _plan_ok and not _dlat_ttc_veto
@@ -6716,7 +6803,55 @@ class MPCController(Node):
                                 f"corr_bound={_room_ahead_locked:.3f} "
                                 f"count={self._ot_room_exhausted_count} -> giveup合流 "
                                 f"wp={self._mpc.model.wp_id}")
-                    _side_blocked = _lat_dec.force_giveup or _room_exhausted
+                    # 2026-08-09追加(design_docs opp_lat_pred_overlap_guard_design_
+                    #   20260806.md §45.3、タスク#300、外部AIレビュー[Gemini]反映):
+                    #   自己ロック解除でENGAGEした直後、footprint_riskは自車が
+                    #   まだ物理的に離れていない(1周期=25ms前と同じ状況)ため即座に
+                    #   再発火し、force_giveup経由でSTOPPINGへ即座に押し戻される
+                    #   ——ENGAGE/giveupの40Hzチャタリングになる、という指摘を
+                    #   コードで確認した(lateral_ttc_monitor.py: footprint_risk=True
+                    #   は毎周期無条件force_giveup、Fix Cの保留対象からも除外済み)。
+                    #   「安全反応の遅延は厳禁」(82/83節)原則は破らず、force_giveup
+                    #   自体は毎周期評価し続ける——ただしfootprint_risk起因かつ
+                    #   §45.2の自己ロック解除エピソード中(同一対象車・猶予周期内・
+                    #   実測dlatが悪化していない)に限り、その1周期分だけ側維持を
+                    #   認める。少しでも条件が崩れたら即座に通常のforce_giveupへ
+                    #   復帰する(フェイルクローズ、無期限の抑制は行わない)。
+                    _selflock_escape_override = False
+                    if self._ot_selflock_escape_active:
+                        _escape_ok = (
+                            _lat_dec.footprint_risk_triggered
+                            and _opp_sit.fwd_vid == self._ot_selflock_escape_vid
+                            and _locked == self._ot_selflock_escape_side
+                            and self._ot_selflock_escape_cycle
+                                < self._ot_selflock_escape_cap_cycles
+                            and (self._ot_selflock_escape_cycle == 0
+                                 or _lat_dec.dlat_v_ema >= 0.0))
+                        if _escape_ok:
+                            _selflock_escape_override = True
+                            self._ot_selflock_escape_cycle += 1
+                            if (self._ot_selflock_escape_best_dlat is None
+                                    or (_opp_sit.fwd_dlat is not None
+                                        and _opp_sit.fwd_dlat
+                                            > self._ot_selflock_escape_best_dlat)):
+                                self._ot_selflock_escape_best_dlat = _opp_sit.fwd_dlat
+                            self.get_logger().info(
+                                f"[SELFLOCK-ESCAPE] cycle={self._ot_selflock_escape_cycle}/"
+                                f"{self._ot_selflock_escape_cap_cycles} "
+                                f"fwd_dlat={_opp_sit.fwd_dlat} "
+                                f"dlat_v_ema={_lat_dec.dlat_v_ema:.3f} "
+                                f"side={_locked} wp={self._mpc.model.wp_id}")
+                        else:
+                            self.get_logger().info(
+                                f"[SELFLOCK-ESCAPE-ABORT] cycle={self._ot_selflock_escape_cycle} "
+                                f"footprint_risk={_lat_dec.footprint_risk_triggered} "
+                                f"vid_match={_opp_sit.fwd_vid == self._ot_selflock_escape_vid} "
+                                f"side_match={_locked == self._ot_selflock_escape_side} "
+                                f"dlat_v_ema={_lat_dec.dlat_v_ema:.3f} "
+                                f"wp={self._mpc.model.wp_id}")
+                            self._ot_selflock_escape_active = False
+                    _side_blocked = ((_lat_dec.force_giveup and not _selflock_escape_override)
+                                      or _room_exhausted)
                     _giveup_now = (self._ot_giveup_count >= self._ot_giveup_cycles
                                     or _locked == 0 or _side_blocked)
                     # 2026-08-07追加(Fix C、design_docs opp_lat_pred_overlap_guard_
@@ -6827,6 +6962,9 @@ class MPCController(Node):
                         self._ot_side = 0
                         self._ot_side_locked = 0
                         self._ot_giveup_count = 0
+                        # 2026-08-09追加(§45.3): giveup合流につき自己ロック解除エスケープの
+                        #   エピソード状態も必ず終了させる(次回の無関係なENGAGEへ持ち越さない)。
+                        self._ot_selflock_escape_active = False
                         # 2026-07-20追加(138-5節②、停止車への繰り返しENGAGE失敗の是正):
                         #   実測(0720-04 wp240-243)で、完全停止した相手車の狭所にegoが
                         #   3回以上ENGAGEを試み、いずれもfootprint_riskで0.5〜1秒以内に
@@ -6999,6 +7137,7 @@ class MPCController(Node):
                     self._ot_worth_count = 0
                     self._ot_giveup_count = 0
                     self._ot_cleared = False
+                    self._ot_selflock_escape_active = False  # 2026-08-09追加(§45.3)
                     self._reset_ot_offset_state()
 
             # 一時的な infeasible では完全停止せず OVERTAKING を維持（後段のクリープで前進）。
@@ -7020,6 +7159,7 @@ class MPCController(Node):
                     self._ot_side_locked = 0   # A: 恒久失敗（実際に通れない）→ 側コミット解除して次で再選択
                     self._ot_giveup_count = 0
                     self._ot_cleared = False
+                    self._ot_selflock_escape_active = False  # 2026-08-09追加(§45.3)
                     self._reset_ot_offset_state()
 
             # 2026-07-22追加(160節続報、issue⑤①): 155節のRAMP-BYPASS判定・下記の新規

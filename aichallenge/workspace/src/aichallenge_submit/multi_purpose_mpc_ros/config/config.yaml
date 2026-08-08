@@ -413,6 +413,13 @@ overtake:
   #   (Fix A/Bとは独立ゲート、段階導入)。
   pending_disengage_enabled: true  # 2026-08-07: §19 force_giveup修正後、dev3ローカル検証(Phase 2)n=1本目。Fix A' ON+Fix B ON土台
   pending_disengage_max_cycles: 80  # [周期] giveup_cycles(40)*2≈2秒。無期限保留を禁止する必須の安全弁
+  # 2026-08-09追加(design_docs opp_lat_pred_overlap_guard_design_20260806.md §45、
+  #   タスク#300、外部AIレビュー[Gemini・別Claude]反映): footprint_risk由来の
+  #   is_closing_trend(常時True)が、footprint_riskを解消する側(=_plan_passが
+  #   物理的に検証済みの空き側)へのENGAGEまでブロックし続ける自己ロックの解除。
+  #   実測127件(footprint_risk giveup後30秒以内STUCKの67%)で確認済み。安全判定の
+  #   緩和方向の変更のため既定false=現行のままビット等価(段階導入、実地検証後にtrue化)。
+  selflock_release_enabled: false
   max_consider: 20.0      # [m] この弧長より遠い前方他車は判断に使わない
   v_cap: 6.0              # [m/s] 追い越し中の速度上限
   exit_clear: 3           # 前方クリアがこの回数連続で OVERTAKING→NORMAL 復帰(ヒステリシス)

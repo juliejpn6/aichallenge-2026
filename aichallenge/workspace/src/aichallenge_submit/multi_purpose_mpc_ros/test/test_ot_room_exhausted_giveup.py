@@ -132,7 +132,14 @@ def test_room_exhausted_reuses_existing_giveup_cycles_debounce():
 
 
 def test_side_blocked_folds_in_room_exhausted_alongside_force_giveup():
-    idx = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
+    """2026-08-09改訂(§45.3、自己ロック解除エスケープ): 式が
+    `_lat_dec.force_giveup or _room_exhausted`から
+    `(_lat_dec.force_giveup and not _selflock_escape_override) or _room_exhausted`
+    へ変わった。selflock_escape_activeが常にFalse(configゲート既定OFF、または
+    エスケープ条件不成立)の間は`_selflock_escape_override`も常にFalseのため
+    `not False`=Trueとなり、元の式とビット等価(退行なし)。"""
+    idx = _SRC.index("_side_blocked = ((_lat_dec.force_giveup and not _selflock_escape_override)\n"
+                      "                                      or _room_exhausted)")
     assert idx > 0
 
 
@@ -159,7 +166,7 @@ def test_ot_room_exhausted_verification_log_present():
     # _side_blocked合流行より前であることで確認する(guardとの直接近接は保証しない)。
     idx_guard = _SRC.index("if _room_exhausted and self._ot_room_exhausted_count == self._ot_giveup_cycles:")
     idx_log = _SRC.index('"[OT-ROOM-EXHAUSTED] side={_locked} "')
-    idx_side_blocked = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
+    idx_side_blocked = _SRC.index("_side_blocked = ((_lat_dec.force_giveup and not _selflock_escape_override)")
     assert idx_guard < idx_log < idx_side_blocked
     assert "if _room_rescued:" in _SRC[idx_guard:idx_side_blocked]
 
@@ -179,9 +186,12 @@ def test_room_exhausted_does_not_introduce_a_new_state_transition_path():
     20260806.md §3): 元の条件式はそのまま_giveup_now変数へ代入されるよう
     リファクタされた(Fix Cが並走中のみ_giveup_nowをFalseへ上書きできる
     ようにするための構造変更)。ブール式自体(3条件のOR)は一切変更していない
-    ことを確認する。"""
-    idx = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
-    idx_end = idx + 400
+    ことを確認する。2026-08-09改訂(§45.3): force_giveup項に
+    `and not _selflock_escape_override`が追加されたが、configゲート既定OFF時は
+    常にFalseでビット等価(上のtest_side_blocked_folds_in_room_exhausted_
+    alongside_force_giveup参照)。窓も400→500へ拡大(式が2行になった分)。"""
+    idx = _SRC.index("_side_blocked = ((_lat_dec.force_giveup and not _selflock_escape_override)")
+    idx_end = idx + 500
     snippet = _SRC[idx:idx_end]
     assert ("_giveup_now = (self._ot_giveup_count >= self._ot_giveup_cycles\n"
             "                                    or _locked == 0 or _side_blocked)") in snippet

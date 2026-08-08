@@ -38,7 +38,11 @@ with open(_CFG_PATH) as _f:
 
 
 def _giveup_block():
-    idx = _SRC.index("_side_blocked = _lat_dec.force_giveup or _room_exhausted")
+    """2026-08-09改訂(§45.3): 開始アンカーが`_side_blocked = _lat_dec.force_giveup
+    or _room_exhausted`から`_side_blocked = ((_lat_dec.force_giveup and not
+    _selflock_escape_override) or _room_exhausted)`へ変わった(自己ロック解除
+    エスケープ、configゲート既定OFF時はビット等価)。"""
+    idx = _SRC.index("_side_blocked = ((_lat_dec.force_giveup and not _selflock_escape_override)")
     idx_end = _SRC.index("else:\n                        self._ot_side = _locked", idx)
     return _SRC[idx:idx_end]
 
