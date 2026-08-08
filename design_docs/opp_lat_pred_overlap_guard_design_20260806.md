@@ -3090,3 +3090,113 @@ n=4の時点で蛇行の絶対値自体は致命的ではない(20km/hの1.2-2�
 通り、次段階として全体のバランス調整(§38と同型のフルキャンペーン:
 steer_low_pass_gain・r_delta_swing_boost・r_drateを25km/h向けに
 再スイープ)に着手する。
+
+## 45. footprint_risk自己ロックの発見・外部AIレビュー・must-fix実装(2026-08-09)
+
+### 45.1 発見の経緯
+
+予選ログ`autoware(0808-05).log`の2周目wp280前後を目視確認したところ、
+前方に停止車2台がいる場面で、自車が**左側は終始広く空いている
+(Lfree=3.6-3.96m)にもかかわらず18.5秒間完全停止し続け**、最終的に
+STUCK(バック復帰)に陥っていることが判明した。
+
+原因を追跡した結果、`_dlat_closing_trend()`(横間隔のトレンド判定)が
+`footprint_risk=True`の間はトレンド計算を無視して常にTrueを返す設計
+(2026-07-22追加、意図は「既に物理的接触リスクがある間は保守的に振る舞う」)
+であり、footprint_risk自体は「相手との現在の間隔が物理的最小幅未満」で
+発火することを確認した。停止車の真後ろで完全停止している間はfootprint_risk
+が継続的にTrueのままになり、**「危険を解消する唯一の動作(空いている側へ
+避ける)を、危険を理由に禁止し続ける」自己ロック**になっていると判断した。
+
+### 45.2 実測による裏付け
+
+過去2週間分(2026-07-24〜2026-08-08)のdev3ログ209本+予選ログ6本を
+横断スキャンした結果:
+
+- footprint_risk起因のgiveup直後(30秒以内)にSTUCKが発生した事例: **190件**
+- そのうち「片側のLfree/Rfreeが明確に広く(>2.5m)、もう片側が狭い(<1.5m)」
+  =幾何的には明らかに逃げ場があった事例: **127件(67%)**
+
+場所はwp278-286帯に多いが、wp6-9・wp52-70・wp114-186・wp265・wp296・
+wp327など全域で発生しており、局所的な地形問題ではなく一般的な制御ロジックの
+欠陥と判断した。
+
+### 45.3 外部AIレビュー(Gemini・別Claude)
+
+`docs/superpowers/specs/2026-08-09-dlat-ttc-veto-selflock-fix-consultation-
+prompt.md`で外部AIへレビューを依頼した(初回実装後)。
+
+**Gemini指摘(最重要): チャタリング懸念**——「ENGAGEゲートを解除しても、
+footprint_risk自体は毎周期評価され続けるため、OVERTAKING遷移直後に即座に
+再発火し、STOPPINGへ押し戻される(40Hzチャタリング)のではないか」。
+コードで検証したところ**完全に妥当な指摘**だった: `lateral_ttc_monitor.py`
+の`footprint_risk=True`分岐は「トレンドの蓄積を待たず最優先で強制giveup」
+(force_giveup=True)を毎周期無条件に発火させ、これはENGAGEゲート
+(`_dlat_ttc_veto`)とは完全に別経路であり、Fix C(並走中giveupの有限保留)
+からも明示的に除外されている(「安全反応系の遅延は厳禁」、82/83節の教訓)。
+初回実装はENGAGEゲートしか解除しておらず、**実際には機能しない
+(チャタリングするだけの)修正だった**。
+
+Gemini指摘②(幾何学的死角): `_plan_pass`の`along_min_width`は静的な平行幅
+判定であり、停止車の真後ろから斜めに発進する際の車体後部振り出し等の
+スイープボリュームは考慮していない。既存`_plan_pass`自体を変更する対応は
+リスクが高いため、本節では対処せず残課題とした(45.6参照)。
+
+**別Claude指摘(must-fix)**:
+1. configゲート追加(`overtake.selflock_release_enabled`、既定false)
+2. fwd_voppの有効性ガード(V2X速度クランプ中でない・鮮度内であること)
+3. (推奨→実装) オフセット後予測dlatが閾値+ヒステリシスを超えるかの確認
+   (振動防止)
+
+### 45.4 実装した修正(3層)
+
+**層1: ENGAGEゲート解除**(`_evaluate_engage_readiness`内`_dlat_ttc_veto`)——
+以下4条件AND成立時のみ解除:
+1. configゲート`selflock_release_enabled`(既定false)
+2. `footprint_risk=False`で`_dlat_closing_trend`を再評価した「本来のトレンド
+   判定」がFalse
+3. 相手が停止/低速(`fwd_vopp < opp_obstacle_speed`)かつV2X速度クランプ中
+   でなく追跡が鮮度化済み(`V2XVehicleTracker.is_speed_clamped()`新設・
+   `is_settled()`既存を再利用)
+4. `_plan_pass`が既に物理的に妥当な側を見つけており(`_plan_side != 0`)、
+   その側へオフセット完了後に予測されるdlba(`_room_to_wall`を`_plan_pass`と
+   同一の引数で再利用、新規計算式なし)が`along_min_width + overlap_margin_m`
+   (いずれも既存定数)を超える
+
+**層2: OVERTAKING遷移直後のforce_giveupエスケープ猶予**(Gemini指摘への
+対処、チャタリング防止)——層1で解除・ENGAGEした直後、footprint_risk由来の
+force_giveupに限り、以下5条件が**毎周期**成立する間だけ側維持を認める:
+同一対象車・同一側・猶予周期内(既存`t_lateral`定数を周期数へ換算、新規
+マジックナンバーなし)・`dlat_v_ema>=0`(悪化していない)。**1つでも崩れたら
+即座に通常のforce_giveupへ復帰**(フェイルクローズ、無期限の抑制はしない、
+「安全反応の遅延は厳禁」原則を破らない設計)。
+
+**層3: 状態クリーンアップ**——OVERTAKING離脱の3経路(giveup合流・通過完了・
+infeasible恒久失敗)すべてでエスケープ状態を確実にクリアし、次回の無関係な
+ENGAGEへ持ち越さない。
+
+`v2x_vehicle_tracker.py`には`is_speed_clamped(vid)`を新設(既存の
+クランプ処理分岐へフラグを1行追加するのみ、`clamp_hold_enabled`の設定に
+関わらず判定可能)。
+
+### 45.5 検証状況
+
+- 単体回帰3236件+新規テスト20件(`test_selflock_release_20260809.py`、
+  configゲートOFF等価・V2Xクランプ/未鮮度での不発・予測dlat不足での不発・
+  エスケープ5条件・3経路でのクリーンアップ・トラッカーのクランプ検出)、
+  合計3256件PASS。
+- configゲートは既定`false`のため、現時点では**挙動ビット等価**(退行なし)。
+- **Phase 2(反実仮想検証、127件への陽性適用・走行中相手/V2Xクランプ共起
+  事例への陰性確認)は未実施**。
+- **Phase 3(dev3・予選での実地検証)も未実施**。configをtrueにする前に
+  必須。
+
+### 45.6 残課題
+
+- Gemini指摘②(幾何学的死角、斜め発進のスイープボリューム未考慮)への
+  対処は未着手。`_plan_pass`自体の変更はリスクが高く、本節のスコープ外と
+  した。
+- 別Claude指摘のPhase 0検証事項のうち、「両者停止中のEMA意味論
+  (dlat_shrink_run/dlat_v_emaが正しくリセット/減衰されるか)」は未確認。
+- Phase 2(反実仮想検証)・Phase 3(実地検証計画・実施)は次回セッションで
+  着手する。configゲートをtrueにするのはPhase 2・3が完了してから。
