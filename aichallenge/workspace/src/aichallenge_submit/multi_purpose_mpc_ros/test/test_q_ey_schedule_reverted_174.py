@@ -120,9 +120,12 @@ def test_overtake_and_pit_q_ey_overrides_still_intact():
     無関係の既存機能であり、このA/Bテストで意図せず巻き込まれていないことを確認する。
     2026-08-05更新(293節続報): q_ey_overtakeの値自体は5,000,000->330,000へ意図的に
     変更された(旧基準Q[e_y]=3M時代の比率が現行200k基準に追従していなかった不整合の
-    是正、CLAUDE.md §3の確定結論変更に該当しない通常のチューニング)。本テストの主眼は
-    「機構自体が本節の変更で消えていないこと」であり、具体的な数値までは固定しない。"""
-    assert "q_ey_overtake: 330000.0" in _YAML_SRC
-    assert "q_ey_pit: 50000000.0" in _YAML_SRC
+    是正、CLAUDE.md §3の確定結論変更に該当しない通常のチューニング)。
+    2026-08-08更新(タスク#308・#311): Q[e_y]ベース値が200,000→250,000へ更新されたのに
+    伴い、比率(base×1.65/base×250)を保ったまま412,500/62,500,000へ追従。本テストの
+    主眼は「機構自体が本節の変更で消えていないこと」であり、具体的な数値までは
+    固定しない。"""
+    assert "q_ey_overtake: 412500.0" in _YAML_SRC
+    assert "q_ey_pit: 62500000.0" in _YAML_SRC
     assert "self._ot_q_ey = float(_otget(\"q_ey_overtake\"" in _SRC
     assert "self._pit_q_ey = float(getattr(_pit, \"q_ey_pit\"" in _SRC
