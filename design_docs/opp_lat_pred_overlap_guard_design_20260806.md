@@ -3191,6 +3191,33 @@ ENGAGEへ持ち越さない。
 - **Phase 3(dev3・予選での実地検証)も未実施**。configをtrueにする前に
   必須。
 
+### 45.6a Phase 2反実仮想検証: 完了
+
+過去2週間分のdev3ログ209本+予選ログ6本から、既存の`[DLAT-TTC-VETO]`ログ
+(`_dlat_ttc_veto_effective = _plan_ok and _dlat_ttc_veto`の瞬間に発火、
+fwd_dlat・dlat_v_ema・shrink_run・footprint_risk・wpを含む)を直接読み取り、
+最寄りの`[OT]`ログ(side・Lfree/Rfree・vopp)、V2Xクランプ警告ログと突き合わせて
+解除条件を機械的に再現した(新規ヒューリスティックではなく、実装した4条件を
+そのままログから再計算)。
+
+| 指標 | 値 |
+|---|---|
+| footprint_risk由来`[DLAT-TTC-VETO]`(plan_ok成立=自己ロック該当)総数 | 298件 |
+| **would_release(4条件全て成立)** | **101件(33.9%)** |
+| **陰性チェックA: 走行中相手(vopp≥6km/h)なのに解除** | **0件** |
+| 陰性チェックB: V2Xクランプ中なのに解除 | 0件(構造的に必ず0) |
+| V2Xクランプ共起footprint_risk-veto件数 | 0件(本データセットには非発生) |
+| real_trend_veto=True(本来のトレンドでも危険) | 20/298件 |
+| opponent_stopped=False | 8/298件 |
+| predicted_ok=False(予測post-offset dlat不足) | 182/298件(61%、最大の絞り込み要因) |
+
+**陽性: 約34%の救済率、陰性: 0件**。must-fix3(予測post-offset dlat)が
+最も保守的に効いており(61%を弾く)、残る事例の大半は「解除しても実際には
+十分に離れられない」と判定して見送っている。走行中の相手への誤解除は
+データセット中0件(4条件の設計が機能している)。V2Xクランプ共起事例は
+本データセットには存在しなかったため、must-fix2の実効性は「構造的に
+安全」であることの確認にとどまり、実データでの発火は未確認。
+
 ### 45.6 残課題
 
 - Gemini指摘②(幾何学的死角、斜め発進のスイープボリューム未考慮)への
@@ -3198,5 +3225,6 @@ ENGAGEへ持ち越さない。
   した。
 - 別Claude指摘のPhase 0検証事項のうち、「両者停止中のEMA意味論
   (dlat_shrink_run/dlat_v_emaが正しくリセット/減衰されるか)」は未確認。
-- Phase 2(反実仮想検証)・Phase 3(実地検証計画・実施)は次回セッションで
-  着手する。configゲートをtrueにするのはPhase 2・3が完了してから。
+  外部AIへ再度相談予定(`docs/superpowers/specs/`へプロンプト作成)。
+- Phase 3(dev3・予選での実地検証)は次回セッションで着手する。configゲートを
+  trueにするのはPhase 3が完了してから。
