@@ -2911,7 +2911,14 @@ giveup判定自体(`OVERTAKING→STOPPING`の閾値)を緩めたり`cleared`判�
   大きい時だけ様子見(要並走距離を若干積み増す等)」という**局所的で
   可逆性の高い**対策を設計し、10秒締め出し問題の再発有無・ニアミス率
   改善の両方をdev3で計測してから採否判断する。
-- 本節の時点ではコード変更は一切行っていない。
+
+**実装済み(コミット`8d2ae88`)**: ENGAGE確定時に`_plan_pass`の窓内
+トレース(`self._dbg_plan_trace`)を`self._ot_engage_trace`/
+`_ot_engage_wp`へスナップショットし、giveup時(`[LAT-TTC-ACT]`と同一
+箇所)に`[ENGAGE-GIVEUP-TRACE]`として再ログする診断専用の追加を行った。
+既存の判定ロジック(giveup条件・k_corner veto閾値等)は無変更、回帰
+3236件PASS。次に必要なデータ(ENGAGE時推定 vs giveup時実態の乖離)は
+今後のdev3・予選走行で自然に蓄積される。
 
 ### 42.9 現時点の判断
 
