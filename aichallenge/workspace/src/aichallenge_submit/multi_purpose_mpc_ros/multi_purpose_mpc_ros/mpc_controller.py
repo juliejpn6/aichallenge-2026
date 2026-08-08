@@ -6010,7 +6010,14 @@ class MPCController(Node):
             self._handle_stuck_recovery(now, pose)
             return
         # 自動衝突検知(2026-07-10追加): 1周期での実速度の急落を監視。閾値の根拠は__init__参照。
-        if (self._collision_check_v_prev is not None
+        # 2026-08-08(design_docs opp_lat_pred_overlap_guard_design_20260806.md §41.4):
+        #   予選ログ0808-01のwp284イベント(obs=0 fwd=0で相手を1台も検知していないのに
+        #   MPCコリドー実行不可能[infeas=18]による自滅的減速をCOLLISION-SUSPECTEDと誤検知)
+        #   を受け、診断ログの精度改善として相手を1台も追跡していない(self._dbg_n_dynobs
+        #   ==0)周期は対象から除外する。あくまで警告ログの発火条件のみの変更であり、
+        #   衝突検知そのものの安全側判定(制御コマンド)には一切影響しない。
+        _collision_check_has_opponent = self._dbg_n_dynobs > 0
+        if (_collision_check_has_opponent and self._collision_check_v_prev is not None
                 and (v - self._collision_check_v_prev) < -self._collision_suspect_dv):
             self.get_logger().warn(
                 f"[COLLISION-SUSPECTED] v drop {self._collision_check_v_prev:.2f}"
@@ -6022,10 +6029,11 @@ class MPCController(Node):
         self._collision_v_window.append(v)
         if len(self._collision_v_window) == self._collision_v_window.maxlen:
             _cum_drop = max(self._collision_v_window) - v
-            if _cum_drop >= self._collision_suspect_cum_dv:
+            if _collision_check_has_opponent and _cum_drop >= self._collision_suspect_cum_dv:
                 self.get_logger().warn(
                     f"[COLLISION-SUSPECTED-CUM] v drop {_cum_drop:.2f} m/s over "
                     f"{self._collision_v_window.maxlen} cycles (window={list(self._collision_v_window)})")
+            if _cum_drop >= self._collision_suspect_cum_dv:
                 self._collision_v_window.clear()
         _v_odom_now = abs(v)
         # 起動猶予期間(2026-07-10追加): 過去の予選ログ実測で、START後の実発進まで
