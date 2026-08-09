@@ -3605,3 +3605,21 @@ r_delta_swing_boost=0確定を受け、steer_low_pass_gainの再検証(タスク
 (`DRI_PRIME=pci-0000_01_00_0`)へ切り替えて再検証する。real-time factor
 自体は概ね1.0近傍を維持していると見られ(§47参照予定)、データの
 有効性は保たれている可能性が高いが、念のため確認する。
+
+### 46.14 GPU誤選択問題の追加原因判明+tri_param_launch.sh修正
+
+§46.13末尾で触れたGPU誤選択(AMD内蔵GPU使用)について、`make dev3`
+(プレーンdocker-compose.yml)は正常だが、tri_param_launch.sh経由(COMPOSE_FILEに
+docker-compose.tri-param-experiment.ymlを含む)では再発するという、ユーザー
+指摘をきっかけに切り分け実験を実施。docker-compose.tri-param-experiment.ymlは
+`autoware`サービスのvolumesにのみ影響し`simulator`サービス定義は無変更のはずだが、
+COMPOSE_FILEにこのファイルを含めるだけでsimulatorのGPU選択がAMD側に変わる
+ことをA/B実験で再現性よく確認(原因は特定できず、実務的な回避策のみ適用)。
+
+**対策**: `tri_param_launch.sh`を修正し、simulatorの起動だけは常に
+`COMPOSE_FILE`未設定(プレーンdocker-compose.yml単体)で行い、D3/D2/D1/
+bag-recorderの起動時のみtri-param overrideを適用する順序へ変更。
+修正後、tri-param方式でもNVIDIA discrete GPU(使用率79%・クロック1530MHz)を
+安定して掴むことを実機確認、ユーザーからも「かんぺきです」と確認を得た。
+DRI_PRIME環境変数自体の修正(§46.11、コミット002cac5/f180562)とは別経路の
+同一症状であり、両方の対策が必要だった。
