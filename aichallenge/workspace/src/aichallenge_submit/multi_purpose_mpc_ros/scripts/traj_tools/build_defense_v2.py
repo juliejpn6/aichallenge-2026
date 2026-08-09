@@ -26,17 +26,23 @@ sys.path.insert(0, KALEIDO_DIR)
 from kaleidoscope import trajectory_clearance as tc  # noqa: E402
 
 BASE_DIR = "aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros"
-TRAJ_PATH = f"{BASE_DIR}/env/final_ver3/traj_mincurv.csv"
+# 2026-08-10: wp135-166を直線化した中間ベース(straighten_regions.py生成)から出発。
+# traj_mincurv.csv自体は無変更のまま(ユーザー指示通り)。
+TRAJ_PATH = f"{BASE_DIR}/env/final_ver3/traj_mincurv_straightened.csv"
 MAP_YAML = f"{BASE_DIR}/env/final_ver3/occupancy_grid_map.yaml"
 DEFENSE_OUT = f"{BASE_DIR}/env/final_ver3/traj_defense_25kmh.csv"
 
 INSIDE_GAP_M = 1.02
 
 TIGHT_CORNERS = [(224, 230), (247, 257)]
+# 2026-08-10: (158,164,"L")はwp135-166の直線化で吸収され消滅したため除外。
+# 2026-08-10: (34,35,"R")もwp26-41の直線化・Hermiteブレンドで吸収され消滅したため除外
+#   (これを残したままディフェンス生成すると、もう存在しないコーナーへ生バイアスが
+#   かかりkappa+0.17級の異常なスパイクが再発することを実測で確認)。
 GENTLE_CORNERS = [
-    (1, 9, "R"), (12, 21, "R"), (34, 35, "R"),
+    (1, 9, "R"), (12, 21, "R"),
     (64, 87, "R"), (109, 132, "L"),
-    (158, 164, "L"), (167, 190, "R"), (193, 195, "R"),
+    (167, 190, "R"), (193, 195, "R"),
     (200, 210, "L"), (215, 222, "R"),
     (232, 239, "R"), (242, 242, "L"),
     (259, 276, "L"), (281, 305, "R"), (307, 319, "R"),
@@ -55,6 +61,14 @@ def protected_points():
     # 追加の慎重さが正当化される。今回のディフェンスバイアスからは除外し原形を保つ。
     for i in list(range(320, 350)) + list(range(0, 10)):
         pts.add(i % 350)
+    # wp135-166は直線化済み(straighten_regions.py)。隣接コーナー(109-132,167-190)の
+    # バイアスtaperがこの直線区間へ滲み出すのを防ぐため、保護点として扱う。
+    for i in range(133, 168):
+        pts.add(i)
+    # 2026-08-10: wp20-46もHermite補間で直線化・接続済み(consolidate_corner.py等)。
+    # 同様に全体Laplacian平滑化から保護する。
+    for i in range(18, 48):
+        pts.add(i)
     return pts
 
 
