@@ -270,56 +270,22 @@ def main():
     )
     print(f"[offense] wrote {OFFENSE_OUT} (n={len(offense_rows)}, x,y unchanged)")
 
-    # --- DEFENSE: inside-bias のみ適用 ---
+    # --- DEFENSE: このスクリプトでの生成は廃止 ---
     # 2026-08-09、タイトコーナー拡幅(移動平均+raised-cosine taperブレンド)を試行したが、
     # taper境界付近でピーク曲率がむしろ悪化する箇所が複数発生(wp224の頂点|kappa|0.20が
     # 隣接wp225-228で0.24-0.26まで悪化)することを実測で確認、不採用とした。
     # 単純な座標移動平均は曲率単調減少を保証しないため、この用途には不適(2次元座標への
-    # box-filterは形状によってはピークをずらすだけで悪化させうる)。タイトコーナーの
-    # 曲率緩和には円弧フィット等のより厳密な幾何最適化、またはTUM
-    # global_racetrajectory_optimizationの再実行が必要(followup、design_docs記録予定)。
-    # よってタイトコーナー2箇所は原形のまま(オフェンスと同一)とし、確実に安全な
-    # イン側バイアスのみ適用する。
+    # box-filterは形状によってはピークをずらすだけで悪化させうる)。
+    #
+    # 2026-08-10重要な注意: 本スクリプトのDEFENSE生成コードは意図せずtraj_defense_25kmh.csv
+    # を上書きする事故を一度起こしている(build_defense_v2.pyで生成した正しい版を、この
+    # スクリプトの再実行が古いロジックの出力で上書きした)。DEFENSE版は必ず
+    # build_defense_v2.py(kaleidoscopeのclearance検証込み)を使うこと。このスクリプトは
+    # OFFENSE版生成専用として運用する(下記のapply_widen/apply_defense_biasは参考として
+    # 残置しているが呼び出さない)。
     apply_widen  # noqa: F401 (未使用、上記理由により無効化。関数自体は残置)
-    xs2, ys2 = apply_defense_bias(xs0, ys0, track_bounds, n, verbose=True)
-
-    defense_rows = [dict(r) for r in rows]
-    for i, r in enumerate(defense_rows):
-        r["x_m"] = xs2[i]
-        r["y_m"] = ys2[i]
-    recompute_geometry(defense_rows, closed=True)
-    write_traj(
-        DEFENSE_OUT, defense_rows,
-        header_comment=(
-            "traj_defense_25kmh.csv (2026-08-09生成)\n"
-            "25km/h(1位走行時の強制上限)でのディフェンス用トラジェクトリ。\n"
-            "(a) タイトコーナー2箇所(wp224-230,wp247-257)を実測トラック幅\n"
-            "    (global_racetrajectory_optimization/inputs/tracks/aic_2024.csv)の\n"
-            "    範囲内で平滑化し曲率緩和、ay_max=12.0での到達速度を引き上げ。\n"
-            "(b) ゆるいコーナー17区間でイン側へ実車幅0.7台分(1.02m)のギャップを残す\n"
-            "    ブロッキングライン(方向[L/R]考慮、境界クリアランス1.2m以上を保証)。\n"
-            "s_m/psi_rad/kappa_radpm/vx_mps/ax_mps2は幾何再計算値(参考、実行時は未使用)。\n"
-            "ay_max/ay_profile=12.0、Q/R等はこのジオメトリ変更を前提に別途再チューニング要\n"
-            "(design_docs opp_lat_pred_overlap_guard_design_20260806.md §47系に記録予定)。"
-        ),
-    )
-    print(f"[defense] wrote {DEFENSE_OUT} (n={len(defense_rows)})")
-
-    report_corner_speeds(xs0, ys0, xs2, ys2, n, "defense")
-
-    # クリアランス総点検
-    print("\n=== defense: 全点クリアランス確認(安全マージン{}m) ===".format(SAFETY_MARGIN_M))
-    worst = (999, None)
-    for i in range(n):
-        br, bl = dist_to_bound((xs2[i], ys2[i]), track_bounds)
-        m = min(br, bl)
-        if m < worst[0]:
-            worst = (m, i)
-    print(f"  最小クリアランス: {worst[0]:.2f}m @ wp{worst[1]}  ({'OK' if worst[0] >= SAFETY_MARGIN_M else 'NG!!'})")
-
-    # 総移動量サマリ(offense=0のはず、defenseの最大変位)
-    max_disp = max(math.hypot(xs2[i] - xs0[i], ys2[i] - ys0[i]) for i in range(n))
-    print(f"  defense最大変位(元線からの距離): {max_disp:.2f}m")
+    apply_defense_bias  # noqa: F401 (未使用。build_defense_v2.pyへ移行済み)
+    track_bounds  # noqa: F401 (DEFENSE生成廃止に伴い本スクリプト内では未使用、参考として残置)
 
 
 if __name__ == "__main__":

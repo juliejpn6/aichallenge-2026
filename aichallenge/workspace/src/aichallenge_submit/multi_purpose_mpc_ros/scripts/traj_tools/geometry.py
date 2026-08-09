@@ -21,10 +21,17 @@ def read_traj(path):
 
 
 def write_traj(path, rows, header_comment=None):
+    """TUM形式CSVを書き出す。
+
+    2026-08-10重要な訂正: 以前は`header_comment`を`#`行としてCSV先頭に書き込んで
+    いたが、実際の消費側(`multi_purpose_mpc_ros/core/utils.py:load_ref_path`の
+    `pd.read_csv(csv_file_path)`)は`comment=`引数を指定していないため、`#`行が
+    あるとpandas.errors.ParserErrorで即座に読み込み失敗することが判明
+    (kaleidoscopeでの目視確認時に発覚)。よって`header_comment`は無視し、常に
+    ヘッダー行から始まる純粋なCSVのみを書き出す。由来・経緯は呼び出し側で
+    別途.mdファイル等に記録すること。
+    """
     with open(path, "w", newline="") as f:
-        if header_comment:
-            for line in header_comment.strip("\n").split("\n"):
-                f.write(f"# {line}\n")
         w = csv.writer(f)
         w.writerow(FIELDS)
         for row in rows:
