@@ -58,8 +58,12 @@ def test_params_declared_in_yaml_with_correct_defaults():
     0.19-0.85m)を確認し、他ホットスポット・対照区への悪影響なしを確認した上で
     採用した(config.yamlのr_delta_swing_boost行コメント参照)。
     2026-08-08(タスク#308、design_docs §38.7): gain=0.6/tau=0.05モデル向けに
-    0/400/800(旧)/1200/1600/2000を再スイープ、1600へ更新。"""
-    assert "r_delta_swing_boost: 1600.0" in _YAML_SRC
+    0/400/800(旧)/1200/1600/2000を再スイープ、1600へ更新。
+    2026-08-09(タスク#308、§46.7-46.12、25km/h再チューニング): Q[e_y]=400,000/
+    R[delta]=500ベースで0/100/200/400/800/1200/1600/2000の計6ラウンドを再スイープ、
+    直線層蛇行がswing_boost=0でn=3試行連続最小(平均8.67cm)と判明し0.0へ反転(§46.12)。
+    1600(20km/h時代の結論)から明確な逆転。"""
+    assert "r_delta_swing_boost: 0.0" in _YAML_SRC
     assert "r_delta_swing_kappa_lo: 0.12" in _YAML_SRC
     assert "r_delta_swing_kappa_hi: 0.30" in _YAML_SRC
     assert "r_delta_swing_lookahead_wp: 16" in _YAML_SRC
@@ -72,8 +76,9 @@ def test_boost_restored_after_ab_test_exonerated_it_178():
     固定)であり、本機構は処理落ちの原因ではないと判定された。400.0へ復帰した。
     2026-08-05(306節続報3): 別の実験(wp340-40帯対策)により400.0→800.0へ再改定。
     2026-08-08(タスク#308): gain=0.6/tau=0.05モデル向け再スイープにより800.0→1600.0へ
-    改定。テスト名は歴史的経緯を示す旧名のまま維持し、値のみ現行に追従する。"""
-    assert "r_delta_swing_boost: 1600.0" in _YAML_SRC
+    改定。2026-08-09(§46.12): 25km/h再チューニングでn=3試行連続最小の0.0へ反転。
+    テスト名は歴史的経緯を示す旧名のまま維持し、値のみ現行に追従する。"""
+    assert "r_delta_swing_boost: 0.0" in _YAML_SRC
 
 
 def test_base_r_array_unchanged_500():
