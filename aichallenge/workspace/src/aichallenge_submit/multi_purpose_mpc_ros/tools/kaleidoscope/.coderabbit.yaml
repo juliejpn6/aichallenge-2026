@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "ja-JP"
+early_access: false
+
+reviews:
+  # 細かなスタイル指摘を抑え、重要な問題を中心にレビューする
+  profile: "chill"
+
+  # CodeRabbitの指摘だけでPRをブロックしない
+  request_changes_workflow: false
+
+  high_level_summary: true
+  poem: true
+  review_status: true
+  review_details: false
+  in_progress_fortune: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+
+    # ドラフトを含む、すべてのPRを対象にする
+    drafts: true
+    base_branches:
+      - ".*"
+    labels: []
+
+chat:
+  auto_reply: true
