@@ -23,7 +23,18 @@ reference_path:
   update_by_topic: false # When true, 'circle' must be false
   # path from pkg share dir
   # csv_path: ""
-  csv_path: "env/final_ver3/traj_mincurv.csv"
+  # 2026-08-10: 25km/hディフェンス経路(1位走行時の強制25km/h上限を見越した
+  #   ブロッキングライン)へ切替。ゆるいコーナー8/17区間(タイトコーナー2箇所・
+  #   S字wp340-40帯・タイトコーナーに隙間6pt未満で近接する残り7区間は安全マージン
+  #   確保のため据え置き)にイン側バイアス(基準1.02m x 採用振幅0.40=約0.41m)を適用。
+  #   kaleidoscope(tools/kaleidoscope/、実occupancy_grid_map.yaml+実車体寸法での
+  #   clearance検証ツール、2026-08-10導入)でmin_clearance=0.60m確保を確認済み。
+  #   曲率悪化は最大0.226 rad/m(wp191)だがファイル全体の既存最大値0.273 rad/mは
+  #   超えていない。ローカルdev3・予選いずれも実地検証はまだ未実施。
+  #   旧traj_mincurv.csvは無変更のまま保持(オフェンス版のベースにも流用)、
+  #   35km/hオフェンス版はtraj_offense_35kmh.csv(現行ジオメトリのコピー)。
+  #   詳細はdesign_docs opp_lat_pred_overlap_guard_design_20260806.md §47系参照。
+  csv_path: "env/final_ver3/traj_defense_25kmh.csv"
   resolution: 0.6
   # 2→1(2026-07-05): 平滑窓は「点数」定義で、CSV1m間隔では±2点=実幅±2m → κ·a²/6≈0.11-0.16mの
   #   内側化(実測: 内部参照がCSV原線よりコーナーで中央+0.13m/最大+0.23m内側)。±1mで→約0.03mへ
