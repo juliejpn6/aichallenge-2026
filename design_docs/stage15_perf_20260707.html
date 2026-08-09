@@ -9525,6 +9525,35 @@ wp340-40帯は劇的に改善した一方、wp269-282帯は全く改善しなか
 今後さらにn数を積み増して確認する。
 </p>
 
+<h2>2026-08-08〜09: actuatorモデル全面更新+25km/h Q/R再チューニング+footprint_risk自己ロックバグ発見・修正+GPU/tri-param環境問題対応</h2>
+<p class="small">2026-08-06〜08-08の詳細な作業ログはdesign_docs/opp_lat_pred_overlap_guard_design_20260806.md(§27-46)に記録済み。本節はメインジャーナル(本ファイル)への要約合流。タスク#308「gain=0.6/tau=0.05モデル向けQ/R再チューニングキャンペーン」に該当。</p>
+
+<h3>actuatorモデル全面更新: gain実測バグ発見・tau=190ms→0.05・gain新設0.6(2026-08-08、タスク#311)</h3>
+<p class="small"><code>fit_fopdt</code>のgain推定が常にgain=1固定扱いになっていたバグを発見・修正。CSVスパイクも同時修正の上、真のアクチュエータゲイン≈0.6を初めて実測。<code>actuator_lag_tau_s</code>を旧190msから<b>0.05(50ms)</b>、新規パラメータ<code>actuator_gain=0.6</code>へ全面更新した。デプロイ直後はQ/R未再調整のまま198節と同型の悪化(wp280前後最大ekf_ey1.707m+衝突疑い2件)が発生し、一度gain=1.0/tau=0.16へ復元→Q/R再チューニングを前提に翌日改めて投入する運びとなった。<b>7月27日(201〜204節)に「確定・要保存」とラベル付けした旧tau=190msモデルは、このgain実測バグを前提にした結論であり、以後の全モデル・全Q/R値は本更新で刷新される</b>。</p>
+
+<h3>25km/h向けQ/R再チューニングキャンペーン(§46): Q[e_y]/Q[e_psi]/r_delta_swing_boostが軒並み反転更新(2026-08-09)</h3>
+<table>
+<tr><th>パラメータ</th><th>旧値(gain=1.0/tau=190ms時代)</th><th>新値(gain=0.6/tau=0.05)</th><th>根拠</th></tr>
+<tr><td>Q[e_y]</td><td class="wip">200,000(2026-08-04確定)</td><td class="ok"><b>400,000</b></td><td>§46.4、200k→250k(08-08)→400k(08-09)、n=2確認</td></tr>
+<tr><td>Q[e_psi]</td><td class="wip">1,000,000(2026-08-04確定)</td><td class="ok"><b>8,000,000</b></td><td>§46.15-46.18、500k〜20Mの9点探索+n=2確認、8M付近で頭打ち</td></tr>
+<tr><td>r_delta_swing_boost</td><td class="wip">1600.0(2026-08-08確定)</td><td class="ok"><b>0.0</b></td><td>§46.12、0/100/200/400/800/1200/1600/2000の6ラウンドでn=3試行連続最小</td></tr>
+<tr><td>R[delta]</td><td class="num">500</td><td class="num">500(維持)</td><td>§46.5、n=2再確認</td></tr>
+<tr><td>Q[t]</td><td class="num">200,000</td><td class="wip">50k付近が良好、確定せず</td><td>§46.19-46.21、n=1間で矛盾する結果あり保留中</td></tr>
+</table>
+<p class="small">全ラウンド、ハード制約(STUCK/COLLISION-SUSPECTED/GHOST-BLOCK/FAILSAFE)は全PASSを確認した上でソフト指標(直線層蛇行cm)を比較する§2ルール4の方法論を踏襲。r_delta_swing_boost=0確定でも直線層蛇行は平均8.67cm程度残存しておりゼロにはなっていない(ユーザー目視指摘と一致)。steer_low_pass_gain(0.35が明確に最悪と再確認、0.6 vs 0.8は保留)・r_drateは未着手のまま継続中。</p>
+
+<h3>footprint_risk自己ロックバグ発見・修正(§45): giveupの67%(127/190件)が解消可能な誤giveupと判明</h3>
+<p class="small">ユーザーが予選ログ(0808-05)2周目wp280前後で「左に十分な隙間があるのに18.5秒スタックする」事象を発見したことを起点に横断調査。<code>_dlat_closing_trend()</code>がfootprint_risk=True時に無条件Trueを返す設計により、ENGAGE gate(dlat_ttc_veto)とforce_giveupの両方が解除されず、「相手停止済み・実は間合い十分」なケースまで数十秒間ロックし続ける構造的欠陥と判明(190-5節で「基盤関数のため直接改修は見送り」としていた箇所が根源だった)。3層修正(①ENGAGE gate例外②force_giveup上書きの「escapeラチェット」③3箇所の状態クリーンアップ)をconfigゲート付き(既定<b>False</b>)で実装。Gemini・別Claudeの2ラウンド査読、単体テスト20件+既存回帰3256件全PASS、Phase2オフライン反実仮想検証(rescue率31.6%)まで完了。<span class="wip">Phase3実地検証(dev3で該当事象の再現)は2回試行したが該当事象が発生せず未確認のまま、config既定OFFで温存中。</span></p>
+
+<h3>GPU誤選択問題の発見・修正: DRI_PRIME環境変数+tri_param_launch.shのCOMPOSE_FILEマージ問題</h3>
+<p class="small">ユーザー報告「昨日PCを再起動してから重い(FPS50-60→25)」を受け調査。AWSIM(Unity/Mesa)が再起動後、NVIDIA discrete GPUでなくAMD内蔵GPU(Rembrandt iGPU)を誤って掴む事象を発見(<code>/proc/&lt;pid&gt;/fd</code>のrenderノード確認で特定)。①<code>docker-compose.yml</code>へ<code>DRI_PRIME=pci-0000_01_00_0</code>(PCIバスID指定)を追加、②さらにtri-param方式では<code>docker-compose.tri-param-experiment.yml</code>をCOMPOSE_FILEに含めるだけでsimulatorのGPU選択がAMD側に変わる別経路の同一症状をA/B実験で発見し、simulator起動だけは常にプレーンcompose(COMPOSE_FILE未設定)で行うよう<code>tri_param_launch.sh</code>を修正。両対策後、tri-param方式でもNVIDIA GPU(使用率79-96%・クロック1400-1600MHz)を安定して掴むことを実機確認し、ユーザーからも改善を確認済み。</p>
+
+<h3>コーナー過減速の調査: ay_max=7.0だけでなくay_profile=2.6という隠れた曲率速度制限を発見(検証中)</h3>
+<p class="small">ユーザー目視「コーナーで時速16km/hくらいまで落ちる」を受け調査。コース設計データ(env/final_ver3/traj_mincurv.csv)から最もタイトなコーナー(R=2.57m)を特定し、ay_max=7.0での理論許容速度が15.3km/h(観測値とほぼ一致)と確認。さらに<code>ay_profile: 2.6</code>という、ay_maxとは別に「現状の操舵系(遅れ200ms+チャタ)で追従できる横G予算」として2026-07-04にヘアピン壁接触対策で導入された、より厳しい曲率速度制限パラメータの存在を発見(コード内コメントに「チャタ/レート修正後に引き上げ余地あり」と明記)。今回のQ/Rチューニングでチャタ(蛇行)が大幅改善したことを踏まえ、ay_profileをay_maxと揃えて7.0へ引き上げた上で、ay_max自体を7.0/9.5/12.0でスイープする検証を<span class="wip">実施中(結果未確定)</span>。</p>
+
+<h3>複数Artifactドキュメントの更新</h3>
+<p class="small">今日の一連の変更を反映し、以下のArtifactを更新: 「MPC制御フロー」(actuator tau/gain・r_delta_swing_boost=0を反映)、「状態遷移図: _ot_state/_stuck_state」(shuffle_hard_limit修正[291節]・footprint_risk自己ロック解除機構を反映)、「理想のレーシングアルゴリズムvs現状」(AXIS06反転更新・footprint_risk自己ロック新発見を反映)、「オーバーテイク判定ロジック フローチャート」(dlat_ttc_veto例外パスを追記)、「課題棚卸し: MPC制御/センシング」(STUCKエスカレーション欠如ギャップのクローズ・旧tau=190ms確定カードの陳腐化明記・集計数値の実カウント補正[27/22/15/28→17/13/14/17、長期間の乖離が判明]を反映)。</p>
+
 </body>
 </html>
 
