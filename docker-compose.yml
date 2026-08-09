@@ -23,6 +23,10 @@ x-autoware-base: &autoware-base
     - HOST_GID=${HOST_GID:-}
     - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1}
     - LOG_DIR=${LOG_DIR:-}
+    # 2026-08-09追加: 再起動後、AWSIM(Unity/Mesa)が誤ってAMD内蔵GPU(Rembrandt iGPU)側の
+    #   renderD128を掴みFPSが50-60→25まで低下する事象を確認。DRI_PRIME=1でNVIDIA discrete
+    #   GPU(renderD129)を強制指定し復旧(クロック210MHz→1400MHz超、使用率100%)。
+    - DRI_PRIME=${DRI_PRIME:-1}
   volumes:
     - ./output:${OUTPUT_ROOT:-/output}
     - ./aichallenge:/aichallenge
