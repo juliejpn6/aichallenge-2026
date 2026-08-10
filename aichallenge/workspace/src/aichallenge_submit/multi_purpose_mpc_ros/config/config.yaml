@@ -465,7 +465,12 @@ overtake:
   #   物理的に検証済みの空き側)へのENGAGEまでブロックし続ける自己ロックの解除。
   #   実測127件(footprint_risk giveup後30秒以内STUCKの67%)で確認済み。安全判定の
   #   緩和方向の変更のため既定false=現行のままビット等価(段階導入、実地検証後にtrue化)。
-  selflock_release_enabled: false
+  # 2026-08-10有効化(タスク#300続報): 予選ログ0809-02のwp333で本事象そのものを実測
+  #   (footprint_risk giveup 6回連続・約115秒ロック、ラップ5が183.5秒[他ラップの約3倍]
+  #   に伸びた直接原因と確認、design_docs opp_lat_pred_overlap_guard_design_20260806.md
+  #   §49参照)。Phase3実地検証(dev3での事象再現)は2回とも空振りだったが、実データで
+  #   有効化の必要性が裏付けられたため先行してtrue化しdev3で検証する。
+  selflock_release_enabled: true
   max_consider: 20.0      # [m] この弧長より遠い前方他車は判断に使わない
   v_cap: 6.0              # [m/s] 追い越し中の速度上限
   exit_clear: 3           # 前方クリアがこの回数連続で OVERTAKING→NORMAL 復帰(ヒステリシス)

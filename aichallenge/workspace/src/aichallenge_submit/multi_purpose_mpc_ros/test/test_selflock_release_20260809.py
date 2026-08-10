@@ -40,8 +40,12 @@ with open(_YAML_PATH) as _f:
 # configゲート(must-fix 1): 既定false、退行防止
 # ---------------------------------------------------------------------------
 
-def test_config_gate_declared_default_false():
-    assert "selflock_release_enabled: false" in _YAML_SRC
+def test_config_gate_declared_enabled():
+    # 2026-08-10有効化(タスク#300続報): 予選ログ0809-02のwp333で本事象そのものを
+    # 実測(footprint_risk giveup 6回連続・約115秒ロック、ラップ5が183.5秒に伸びた
+    # 直接原因)、design_docs opp_lat_pred_overlap_guard_design_20260806.md §49参照。
+    # Phase3実地検証(dev3)は保留のまま先行してtrue化。
+    assert "selflock_release_enabled: true" in _YAML_SRC
 
 
 def test_state_vars_declared_and_default_safe():
