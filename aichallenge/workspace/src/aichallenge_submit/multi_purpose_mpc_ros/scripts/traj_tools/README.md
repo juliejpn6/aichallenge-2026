@@ -69,6 +69,27 @@ python3 aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/scrip
   別箇所に問題を移すだけだったため、この手法へ切替。詳細はdesign_docs
   opp_lat_pred_overlap_guard_design_20260806.md §47.9参照)
 
+## 2026-08-10さらに追記: wp170出口境界キンクの修正・オフェンス生成経路の是正
+
+ユーザーが実走行でWP170付近の「震え」を指摘。原本`traj_mincurv.csv`では
+なめらかだが、wp135-166直線化(`straighten()`、位置は一致させるが接線方向を
+考慮しない単純chord)の出口境界(wp166/167)で接線が不連続になり、その帳尻が
+数点先のwp170のスパイク(近傍比1.7倍)として現れていた。`fix_straighten_exit_kink.py`
+を新設し、wp164-172をHermite補間ブレンドで置き換えて解消(`build_defense_v3.py`と
+同じ技法)。**当初wp158-178の広いウィンドウを試したが、コーナー内側へ膨らみすぎ
+FOOTPRINT_COLLISIONを引き起こした**——taper/ブレンドの窓は広ければ良いわけではなく、
+壁との実クリアランスをkaleidoscopeで都度検証しながら狭める必要がある教訓。
+全区間スキャンで他に同種の欠陥(意図的に編集していない箇所の曲率変化)が
+無いことも確認済み。
+
+**もう一つの発見**: `build_two_trajectories.py`の`TRAJ_PATH`が`traj_mincurv.csv`
+(未編集の完全な原本)を指したままだった(2026-08-09時点のまま更新漏れ)。
+このスクリプトを実行すると当日の直線化・consolidate・Hermiteブレンドが
+全て失われる状態だったため、`traj_offense_35kmh.csv`は現在
+`traj_mincurv_straightened.csv`からの直接コピーで生成する運用に変更した
+(`build_two_trajectories.py`自体は修正せず現状のまま放置、次に使う際は
+TRAJ_PATHの更新が必須)。
+
 **重要な教訓**: `build_defense_v2.py`の`GENTLE_CORNERS`・`protected_points()`は、
 ベースジオメトリ(`traj_mincurv_straightened.csv`)を編集するたびに、消滅した
 コーナー(直線化で吸収された区間)をリストから外し、新しく直線化した区間を保護点に
