@@ -20,15 +20,27 @@ x,yのみから自前でリサンプリング・psi/kappa再計算・速度プ�
     そのままコピー、既存traj_mincurv.csvのvx_mpsが既にay_max~12設計だったため)。
   - タイトコーナー拡幅(移動平均+raised-cosine taper)は**3回とも失敗・不採用**
     (taper境界でピーク曲率がむしろ悪化)。関数は残置しているが呼び出していない。
-- `build_defense_v2.py`: ディフェンス版(`traj_defense_25kmh.csv`)生成の最終版
-  (2026-08-10)。`tools/kaleidoscope`(実occupancy_grid_map+実車体寸法での
-  clearance検証エンジン)を使い、以下を実装:
-  1. ゆるいコーナーのうちタイトコーナー2箇所・S字wp340-40帯に近接しすぎる区間
-     (隙間6pt未満)は丸ごとバイアス対象から除外。
-  2. 残った区間へtaperなしの生イン側バイアスを適用。
-  3. 全体にLaplacian平滑化(kaleidoscopeのsmooth_all_pointsと同一アルゴリズム)。
-  4. `kaleidoscope.trajectory_clearance.validate_clearance`で実マップに対し検証、
-     `is_safe`になるまで振幅を段階的に下げて2-4を再試行。
+- `build_defense_v2.py`: ディフェンス版生成の初期版(2026-08-10、**現在不使用、
+  経緯保存のため残置**)。taperなしの生イン側バイアス+全体への軽いLaplacian平滑化
+  で不連続を均す設計だったが、隣接コーナー間の隙間・単一コーナー境界で平滑化だけ
+  では吸収しきれない曲率スパイクが8箇所系統的に残ることが事後判明(design_docs
+  §51、うち1箇所はwp269-282帯のwp280で最重要ホットスポットに直撃)。
+- `build_defense_v3.py`: ディフェンス版(`traj_defense_25kmh.csv`)生成の**現行版**
+  (2026-08-10)。v2からの変更点:
+  1. 各ゆるいコーナー内部でバイアス振幅をsmoothstep(3t²-2t³)で0→最大→0とテーパー
+     (taper幅=コーナー長の1/3・最小4pt、taper余地が確保できないコーナーは
+     バイアス自体を見送る)。smoothstepは両端で導関数=0のため、隣接コーナーとの
+     隙間が数ptでも不連続を作らない。
+  2. (200,210,"L")は原本ピーク曲率0.146(R≈6.8m)と「ゆるい」というよりタイトな
+     部類で、内側オフセットカーブの曲率増幅(半径R・オフセットdで新曲率=1/(R-d))
+     と相性が悪くtaperでも境界で原本超えの曲率が残ったため、GENTLE_CORNERSから除外。
+  3. 全体Laplacian平滑化は「仕上げ」として残すが、実際にはalpha=0/passes=0
+     (平滑化なし)が最も良好な結果になった——taper自体が連続性を担保するため。
+  4. `kaleidoscope.trajectory_clearance.validate_clearance`によるclearance検証に
+     加え、原本ジオメトリに対する新規曲率スパイク検出(隣接点比1.6倍超)も
+     合否条件に追加(v2はclearanceのみでスパイクを見逃していた)。
+  詳細な発見経緯・検証結果はdesign_docs opp_lat_pred_overlap_guard_design_20260806.md
+  §51参照。
 
 ## 実行方法
 
@@ -38,7 +50,7 @@ x,yのみから自前でリサンプリング・psi/kappa再計算・速度プ�
 python3 aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/scripts/traj_tools/build_two_trajectories.py
 python3 aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/scripts/traj_tools/straighten_regions.py
 python3 aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/scripts/traj_tools/consolidate_corner.py
-python3 aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/scripts/traj_tools/build_defense_v2.py
+python3 aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/scripts/traj_tools/build_defense_v3.py
 ```
 
 いずれも`env/final_ver3/traj_mincurv.csv`は変更せず、`traj_offense_35kmh.csv`/
